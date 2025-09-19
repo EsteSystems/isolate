@@ -1,0 +1,35 @@
+# Example capability file for a web server
+
+user: auto
+
+# Resource limits appropriate for a web server
+memory: 512MB
+processes: 10
+files: 100
+cpu: 50
+
+# Network access
+network: tcp:8080:inbound
+network: tcp:443:inbound
+network: udp:53:outbound   # DNS lookups
+
+# File system access
+file: /var/www:r           # Document root
+file: /tmp/webapp:rw       # Temp files
+file: /var/log/webapp:w    # Log files
+file: /etc/ssl/certs:r     # SSL certificates
+file: /etc/resolv.conf:r   # DNS resolution
+
+# System libraries
+file: /lib:r
+file: /usr/lib:r
+file: /usr/local/lib:r
+
+# Environment
+env_clear: false           # Inherit most environment
+env: HOME=/tmp/webapp
+env: USER=webapp
+
+# Security
+network_default: deny
+filesystem_default: deny

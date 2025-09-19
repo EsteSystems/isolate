@@ -1,0 +1,27 @@
+# Example capability file for a simple hello world program
+
+# User context - "auto" creates ephemeral user
+user: auto
+
+# Resource limits
+memory: 64MB
+processes: 1
+files: 10
+
+# Network access - this program doesn't need network
+network: none
+
+# File system access
+file: /dev/stdout:w
+file: /dev/stderr:w
+file: /lib:r
+file: /usr/lib:r
+
+# Environment - clear and set minimal
+env_clear: true
+env: PATH=/usr/bin:/bin
+env: TERM=xterm
+
+# Security defaults
+network_default: deny
+filesystem_default: deny
