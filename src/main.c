@@ -93,14 +93,26 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     
+    // Set environment variable so freebsd.c can access the binary path
+    setenv("ISOLATE_TARGET_BINARY", target_binary, 1);
+    
     // Create isolation context
     if ((ret = create_isolation_context(&caps)) != 0) {
         fprintf(stderr, "Failed to create isolation context: %s\n", strerror(ret));
         return 1;
     }
     
-    // Execute target binary with remaining args
-    execv(target_binary, &argv[optind]);
+    // Extract just the binary name for execution inside jail
+    const char *binary_name = strrchr(target_binary, '/');
+    if (binary_name) {
+        binary_name++; // Skip the '/'
+    } else {
+        binary_name = target_binary;
+    }
+    
+    // Execute target binary with remaining args (using just the filename now)
+    argv[optind] = (char*)binary_name;  // Replace full path with just filename
+    execv(binary_name, &argv[optind]);
     
     // If we get here, execv failed
     fprintf(stderr, "Failed to execute %s: %s\n", target_binary, strerror(errno));

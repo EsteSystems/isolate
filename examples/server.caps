@@ -1,0 +1,28 @@
+# TCP Server capability file
+user: auto
+
+# Resource limits
+memory: 128MB
+processes: 2
+files: 20
+cpu: 25
+
+# Network access - allow TCP server on port 8080
+network: tcp:8080:inbound
+
+# File system access
+file: /dev/stdout:w
+file: /dev/stderr:w
+file: /dev/null:rw
+file: /lib:r
+file: /usr/lib:r
+file: /usr/local/lib:r
+
+# Environment
+env_clear: false
+env: HOME=/tmp
+env: PATH=/bin:/usr/bin
+
+# Security defaults
+network_default: deny
+filesystem_default: deny

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <errno.h>
 #include <ctype.h>
+#include <unistd.h>
 #include "common.h"
 
 void init_default_capabilities(struct capabilities *caps) {
@@ -285,7 +286,7 @@ void print_capabilities(const struct capabilities *caps) {
     
     printf("  Network rules: %d\n", caps->network_count);
     for (int i = 0; i < caps->network_count; i++) {
-        struct network_rule *rule = &caps->network[i];
+        const struct network_rule *rule = &caps->network[i];
         printf("    %s:", rule->protocol);
         if (rule->port > 0) printf("%d", rule->port);
         if (strlen(rule->address) > 0) printf("%s", rule->address);
@@ -294,7 +295,7 @@ void print_capabilities(const struct capabilities *caps) {
     
     printf("  File rules: %d\n", caps->file_count);
     for (int i = 0; i < caps->file_count; i++) {
-        struct file_rule *rule = &caps->files[i];
+        const struct file_rule *rule = &caps->files[i];
         printf("    %s (", rule->path);
         if (rule->permissions & R_OK) printf("r");
         if (rule->permissions & W_OK) printf("w");
