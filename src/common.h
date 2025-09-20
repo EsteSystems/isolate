@@ -7,6 +7,7 @@
 #define MAX_NETWORK_RULES 16
 #define MAX_FILE_RULES 32
 #define MAX_ENV_VARS 32
+#define MAX_CAPABILITY_HINTS 64
 
 /* Network access rule */
 struct network_rule {
@@ -64,12 +65,32 @@ struct capabilities {
     void *platform_data;
 };
 
+/* Capability detection structures */
+struct capability_hint {
+    char description[256];
+    char capability[512];
+    int confidence;  /* 0-100 */
+};
+
+struct detection_result {
+    struct capability_hint hints[MAX_CAPABILITY_HINTS];
+    int hint_count;
+};
+
 /* Function prototypes */
 
 /* Capability file parsing */
 int load_capabilities(const char *filename, struct capabilities *caps);
 void init_default_capabilities(struct capabilities *caps);
 void print_capabilities(const struct capabilities *caps);
+
+/* Capability detection */
+int detect_capabilities(const char *binary, const char *output_file);
+int analyze_binary_dependencies(const char *binary, struct detection_result *result);
+int analyze_binary_symbols(const char *binary, struct detection_result *result);
+int analyze_binary_strings(const char *binary, struct detection_result *result);
+int analyze_application_patterns(const char *binary, struct detection_result *result);
+int generate_capability_file(const char *binary, const char *output_file, struct detection_result *result);
 
 /* Platform abstraction */
 int create_isolation_context(const struct capabilities *caps);
