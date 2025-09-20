@@ -11,20 +11,48 @@ A lightweight alternative to containers using native FreeBSD jails for process i
 - **Network functionality** preserved within isolation
 - **Zero infrastructure** requirements (no daemons or orchestration)
 - **Capability-based configuration** via .caps files
+- **Automatic capability detection** for existing binaries
 - **Automatic cleanup** on process exit
 
 ## Quick Start
 
-```bash
+```sh
 # Build the project
 make
 
-# Run a simple isolated program
+# Generate capability file for any binary
+bin/isolate -d examples/hello
+
+# Run with auto-detected capabilities
 doas bin/isolate examples/hello
 
 # Run an isolated TCP server
 doas bin/isolate examples/server
 ```
+
+## Capability Detection
+
+The isolate system can automatically analyze binaries and generate appropriate capability files:
+
+```sh
+# Analyze a binary and generate .caps file
+bin/isolate -d /path/to/binary
+
+# Generate with custom output file
+bin/isolate -d /path/to/binary -o custom.caps
+
+# Review and edit the generated file
+cat binary.caps
+
+# Run with detected capabilities
+doas bin/isolate /path/to/binary
+```
+
+The detection system analyzes:
+- Library dependencies for system requirements
+- Dynamic symbols for network and file operations
+- Embedded strings for configuration paths and URLs
+- Application patterns for common service types
 
 ## Project Structure
 
@@ -51,8 +79,33 @@ isolate/
 - `make clean` - Remove build artifacts
 - `make install` - Install to system (default: /usr/local)
 - `make test` - Run basic functionality test
+- `make test-detect` - Test capability detection
 - `make debug` - Build with debug symbols
 - `make release` - Build optimized release version
+- `make help` - Show all available targets
+
+## Usage
+
+### Detection Mode
+```sh
+# Analyze a binary
+bin/isolate -d myapp
+
+# Run with generated capabilities
+doas bin/isolate myapp
+```
+
+### Execution Mode
+```sh
+# Run with specific capability file
+doas bin/isolate -c custom.caps myapp
+
+# Verbose output
+doas bin/isolate -v myapp
+
+# Dry run (test without execution)
+bin/isolate -n myapp
+```
 
 ## Capability Files
 
@@ -64,7 +117,25 @@ Programs are configured via `.caps` files that specify:
 - Filesystem access permissions
 - Environment variables
 
-See `examples/*.caps` for examples.
+Example capability file:
+```
+# User context
+user: auto
+
+# Resource limits
+memory: 128M
+processes: 5
+files: 256
+
+# Network access
+network: tcp:8080:inbound
+
+# Filesystem access
+filesystem: /tmp:rw
+filesystem: /etc/resolv.conf:r
+```
+
+See `examples/*.caps` for more examples.
 
 ## Security
 
@@ -75,6 +146,13 @@ This system provides container-level isolation using native OS primitives:
 - Resource limits prevent resource exhaustion
 - Minimal jail environments reduce attack surface
 - No shell or system utilities available within isolation
+
+## Workflow
+
+1. **Detect** - Analyze existing binaries for capability requirements
+2. **Review** - Edit generated .caps files as needed
+3. **Execute** - Run applications with appropriate isolation
+4. **Monitor** - Observe resource usage and security boundaries
 
 ## License
 
