@@ -1,16 +1,17 @@
 # isolate - Infrastructureless Container System
 
-A lightweight alternative to containers using native FreeBSD jails for process isolation without requiring container runtimes, orchestration, or registries.
+A lightweight, cross-platform alternative to containers using native OS isolation primitives. Currently implemented for FreeBSD jails with planned support for Linux namespaces/cgroups and other platforms. Provides process isolation without requiring container runtimes, orchestration, or registries.
 
 ## Features
 
-- **Process isolation** via FreeBSD jails
+- **Cross-platform design** - Native OS isolation on each platform
+- **Process isolation** via FreeBSD jails (Linux namespaces planned)
 - **User isolation** with ephemeral user creation
-- **Filesystem isolation** with minimal jail environments
-- **Resource limits** enforced through rctl (memory, processes, files)
-- **Network functionality** preserved within isolation
+- **Filesystem isolation** with minimal container-like environments
+- **Resource limits** enforced through platform-native mechanisms (rctl, cgroups)
+- **Network functionality** preserved within isolation boundaries
 - **Zero infrastructure** requirements (no daemons or orchestration)
-- **Capability-based configuration** via .caps files
+- **Capability-based configuration** via portable .caps files
 - **Automatic capability detection** for existing binaries
 - **Automatic cleanup** on process exit
 
@@ -68,10 +69,15 @@ isolate/
 
 ## Requirements
 
+### Current Platform (FreeBSD)
 - FreeBSD system with jail support
 - clang compiler
 - Root privileges (for jail creation and user management)
 - rctl enabled in kernel (optional, for resource limits)
+
+### Planned Platforms
+- **Linux** - namespaces, cgroups, seccomp-bpf
+- **Other UNIX systems** - platform-specific isolation primitives
 
 ## Build Targets
 
@@ -146,6 +152,67 @@ This system provides container-level isolation using native OS primitives:
 - Resource limits prevent resource exhaustion
 - Minimal jail environments reduce attack surface
 - No shell or system utilities available within isolation
+
+## Why isolate Instead of Direct Jails or Orchestration?
+
+### Compared to Direct FreeBSD Jails
+
+**Manual jail management is complex and error-prone:**
+- Creating jail filesystems requires understanding nullfs, devfs, and mount points
+- User management across jail boundaries is manual and fragile
+- Resource limits via rctl require understanding complex rule syntax
+- No automatic cleanup leads to resource leaks and orphaned jails
+- Path resolution between host and jail contexts is confusing
+- Security hardening requires deep FreeBSD expertise
+
+**isolate provides a clean abstraction:**
+- Automatic jail filesystem creation with minimal required mounts
+- Ephemeral user lifecycle tied to application lifetime
+- Simple capability-based resource limit specification
+- Guaranteed cleanup on process exit or crash
+- Path abstraction eliminates host/jail confusion
+- Security-by-default configuration
+
+### Compared to Container Orchestration (Docker, Podman, etc.)
+
+**Container platforms add unnecessary complexity:**
+- Require daemon processes consuming system resources
+- Introduce image registries and complex networking overlays
+- Add multiple abstraction layers reducing performance
+- Require learning container-specific tooling and concepts
+- Create vendor lock-in through platform-specific APIs
+- Complicate debugging with additional virtualization layers
+
+**isolate eliminates infrastructure overhead:**
+- Zero daemon processes - direct process execution
+- No image management or registry dependencies  
+- Single binary with no external dependencies
+- Native OS performance without virtualization penalty
+- Standard POSIX process model for familiar debugging
+- Portable capability files work across platforms and environments
+
+### Compared to 3rd Party Jail Orchestrators
+
+**Existing jail orchestrators solve the wrong problems:**
+- Focus on multi-host orchestration when single-host isolation suffices
+- Require complex configuration management systems
+- Introduce additional failure points and operational complexity
+- Assume infrastructure teams rather than application developers
+- Provide container-like abstractions over native FreeBSD primitives
+
+**isolate focuses on developer productivity:**
+- Designed for application developers, not infrastructure teams
+- Capability detection eliminates manual configuration
+- Single command workflow from analysis to execution
+- Gradual adoption path - use on individual applications
+- Leverages native OS security primitives without abstraction overhead
+- Portable .caps files work across supported platforms
+
+### The Core Philosophy
+
+**Infrastructure should be invisible.** Applications need isolation, not infrastructure. By using native OS primitives directly and providing developer-friendly tooling, isolate delivers container-level security with UNIX-level simplicity.
+
+Most isolation needs don't require the complexity of container orchestration or manual jail management. They need a simple command that says "run this application safely" - which is exactly what isolate provides.
 
 ## Workflow
 
