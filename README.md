@@ -90,6 +90,72 @@ isolate/
 - `make release` - Build optimized release version
 - `make help` - Show all available targets
 
+## Workspace-Based Isolation
+
+isolate supports persistent workspace directories for applications that need configuration files, data storage, or multi-tenant deployments.
+
+### Basic Workspace Usage
+
+```sh
+# Create and populate workspace (any location, any structure)
+mkdir -p /some/path/myapp
+cp config.conf /some/path/myapp/
+
+# Run application with workspace
+doas isolate -w /some/path/myapp myapp --config /workspace/config.conf
+
+# Application sees workspace mounted at /workspace inside jail
+# Host path /some/path/myapp/ appears as /workspace/ in jail
+```
+
+### Multi-Tenant Deployments
+
+Each workspace becomes an isolated instance:
+
+```sh
+# Setup multiple instances (operator chooses locations)
+mkdir -p /srv/nginx-frontend /var/app/nginx-api
+cp frontend.conf /srv/nginx-frontend/nginx.conf
+cp api.conf /var/app/nginx-api/nginx.conf
+
+# Run isolated instances
+doas isolate -w /srv/nginx-frontend nginx -c /workspace/nginx.conf
+doas isolate -w /var/app/nginx-api nginx -c /workspace/nginx.conf
+
+# Each instance is completely isolated with its own workspace
+```
+
+### Workspace Management
+
+isolate is completely agnostic about workspace organization. The operator controls:
+- Location on filesystem (any path the operator chooses)
+- Directory structure (flat, nested, or any layout)
+- File organization (config, data, logs mixed or separated)
+- Naming conventions
+
+Applications configure themselves to use `/workspace` paths based on their needs and the operator's workspace layout.
+
+### Operational Benefits
+
+- **Persistence**: Workspaces survive application restarts
+- **Isolation**: Each workspace is completely separate
+- **Management**: Standard filesystem operations for deployment
+- **Backup**: Simple directory-based backup strategies
+- **Multi-tenancy**: Natural through multiple workspaces
+- **Flexibility**: Any workspace structure and location the operator designs
+
+### Network Isolation
+
+For complete multi-tenancy, combine workspaces with network isolation:
+
+```sh
+# Each instance gets isolated network + workspace
+doas isolate -w /path/to/tenant1 -c tenant1.caps myapp
+doas isolate -w /different/path/tenant2 -c tenant2.caps myapp
+
+# tenant1.caps and tenant2.caps specify different ports/networks
+```
+
 ## Usage
 
 ### Detection Mode
@@ -105,6 +171,9 @@ doas bin/isolate myapp
 ```sh
 # Run with specific capability file
 doas bin/isolate -c custom.caps myapp
+
+# Run with workspace
+doas bin/isolate -w /path/to/workspace myapp
 
 # Verbose output
 doas bin/isolate -v myapp
