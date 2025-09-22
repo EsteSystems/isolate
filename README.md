@@ -27,8 +27,29 @@ bin/isolate -d examples/hello
 # Run with auto-detected capabilities
 doas bin/isolate examples/hello
 
-# Run an isolated TCP server
-doas bin/isolate examples/server
+# Run an isolated web server with workspace
+mkdir /tmp/nginx-workspace
+cat > /tmp/nginx-workspace/nginx.conf << 'EOF'
+error_log /workspace/error.log;
+pid /tmp/nginx.pid;
+events { worker_connections 1024; }
+http {
+    access_log /workspace/access.log;
+    client_body_temp_path /workspace/client_body;
+    server {
+        listen 8080;
+        location / {
+            return 200 "Hello from isolated nginx!";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+EOF
+
+doas bin/isolate -w /tmp/nginx-workspace /usr/local/sbin/nginx -c /workspace/nginx.conf -g "daemon off;"
+
+# Test the isolated web server
+curl http://localhost:8080
 ```
 
 ## Capability Detection
@@ -137,12 +158,12 @@ Applications configure themselves to use `/workspace` paths based on their needs
 
 ### Operational Benefits
 
-- **Persistence**: Workspaces survive application restarts
-- **Isolation**: Each workspace is completely separate
-- **Management**: Standard filesystem operations for deployment
-- **Backup**: Simple directory-based backup strategies
-- **Multi-tenancy**: Natural through multiple workspaces
-- **Flexibility**: Any workspace structure and location the operator designs
+**Persistence**: Workspaces survive application restarts
+**Isolation**: Each workspace is completely separate  
+**Management**: Standard filesystem operations for deployment
+**Backup**: Simple directory-based backup strategies
+**Multi-tenancy**: Natural through multiple workspaces
+**Flexibility**: Any workspace structure and location the operator designs
 
 ### Network Isolation
 
