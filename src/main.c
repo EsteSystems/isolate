@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include "common.h"
 
 static void usage(const char *prog) {
@@ -17,6 +18,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Execution Options:\n");
     fprintf(stderr, "  -c <file>    Capability file (default: <binary>.caps)\n");
+    fprintf(stderr, "  -w <dir>     Workspace directory (mounted as /workspace in jail)\n");
     fprintf(stderr, "  -v           Verbose output\n");
     fprintf(stderr, "  -n           No isolation (dry run)\n");
     fprintf(stderr, "\n");
@@ -31,8 +33,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  # Generate capability file for an application\n");
     fprintf(stderr, "  %s -d ./myapp\n", prog);
     fprintf(stderr, "\n");
-    fprintf(stderr, "  # Generate capability file with custom output\n");
-    fprintf(stderr, "  %s -d ./myapp -o custom.caps\n", prog);
+    fprintf(stderr, "  # Run with workspace directory\n");
+    fprintf(stderr, "  doas %s -w /path/to/workspace ./myapp\n", prog);
     fprintf(stderr, "\n");
     fprintf(stderr, "  # Run application with auto-detected capabilities\n");
     fprintf(stderr, "  %s -d ./myapp && doas %s ./myapp\n", prog, prog);
@@ -47,19 +49,23 @@ int main(int argc, char *argv[]) {
     const char *caps_file = NULL;
     const char *target_binary = NULL;
     const char *output_file = NULL;
+    const char *workspace_dir = NULL;
     int verbose = 0;
     int dry_run = 0;
     int detect_mode = 0;
     int opt;
     
     // Parse options
-    while ((opt = getopt(argc, argv, "c:o:dvnh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:o:w:dvnh")) != -1) {
         switch (opt) {
             case 'c':
                 caps_file = optarg;
                 break;
             case 'o':
                 output_file = optarg;
+                break;
+            case 'w':
+                workspace_dir = optarg;
                 break;
             case 'd':
                 detect_mode = 1;
@@ -122,11 +128,31 @@ int main(int argc, char *argv[]) {
         printf("=========================\n");
         printf("Target binary: %s\n", target_binary);
         printf("Capability file: %s\n", caps_file);
+        if (workspace_dir) {
+            printf("Workspace directory: %s\n", workspace_dir);
+        }
         printf("Arguments: ");
         for (int i = optind + 1; i < argc; i++) {
             printf("%s ", argv[i]);
         }
         printf("\n\n");
+    }
+    
+    // Validate workspace directory if specified
+    if (workspace_dir) {
+        struct stat st;
+        if (stat(workspace_dir, &st) != 0) {
+            fprintf(stderr, "Error: Workspace directory %s does not exist\n", workspace_dir);
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Error: %s is not a directory\n", workspace_dir);
+            return 1;
+        }
+        if (access(workspace_dir, R_OK | W_OK) != 0) {
+            fprintf(stderr, "Error: No read/write access to workspace directory %s\n", workspace_dir);
+            return 1;
+        }
     }
     
     // Load capabilities
@@ -147,6 +173,12 @@ int main(int argc, char *argv[]) {
         }
         // Initialize with default (no isolation) capabilities
         init_default_capabilities(&caps);
+    }
+    
+    // Set workspace path if specified
+    if (workspace_dir) {
+        strncpy(caps.workspace_path, workspace_dir, sizeof(caps.workspace_path) - 1);
+        caps.workspace_path[sizeof(caps.workspace_path) - 1] = '\0';
     }
     
     if (verbose) {

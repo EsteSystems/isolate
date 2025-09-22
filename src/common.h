@@ -43,6 +43,9 @@ struct capabilities {
     char username[64];      /* "auto" for auto-generation */
     int create_user;        /* 1 if user should be created */
     
+    /* Workspace */
+    char workspace_path[PATH_MAX];  /* Host path to mount as /workspace */
+    
     /* Network access */
     int network_count;
     struct network_rule network[MAX_NETWORK_RULES];

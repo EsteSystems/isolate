@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <pwd.h>
 #include <grp.h>
+#include <sys/stat.h>
 #include <sys/param.h>
 #include <sys/jail.h>
 #include <sys/rctl.h>
@@ -214,7 +215,7 @@ static int switch_to_user(const char *username) {
                             fclose(passwd_file);
                             return -1;
                         }
-                        
+                        setenv("LD_LIBRARY_PATH", "/usr/local/lib:/usr/lib:/lib", 1);
                         fclose(passwd_file);
                         return 0;
                     }
@@ -250,6 +251,9 @@ static int switch_to_user(const char *username) {
     setenv("USER", pw->pw_name, 1);
     setenv("HOME", pw->pw_dir, 1);
     setenv("SHELL", pw->pw_shell, 1);
+
+    // Set the library path for dynamic linker
+    setenv("LD_LIBRARY_PATH", "/usr/local/lib:/usr/lib:/lib", 1);
     
     return 0;
 }
@@ -310,7 +314,7 @@ static int setup_network_isolation(const struct network_rule *rules, int count) 
     return 0;
 }
 
-static int setup_filesystem_isolation(const struct file_rule *rules, int count, const char *jail_path, const char *target_binary) {
+static int setup_filesystem_isolation(const struct capabilities *caps, const char *jail_path, const char *target_binary) {
     char cmd[512];
     int ret;
     
@@ -334,6 +338,34 @@ static int setup_filesystem_isolation(const struct file_rule *rules, int count, 
     snprintf(cmd, sizeof(cmd), "mkdir -p %s/etc", jail_path);
     system(cmd);
     
+    printf("Creating standard application directories...\n");
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/var/log", jail_path);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/var/tmp", jail_path);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/var/run", jail_path);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "chmod 1777 %s/tmp", jail_path);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "chmod 755 %s/var/log %s/var/tmp %s/var/run", 
+	     jail_path, jail_path, jail_path);
+    system(cmd);
+
+    // Mount workspace directory if specified
+    if (strlen(caps->workspace_path) > 0) {
+	printf("Setting up workspace: %s -> /workspace\n", caps->workspace_path);
+	snprintf(cmd, sizeof(cmd), "mkdir -p %s/workspace", jail_path);
+	system(cmd);
+
+	snprintf(cmd, sizeof(cmd), "mount -t nullfs -o rw %s %s/workspace", 
+		 caps->workspace_path, jail_path);
+	ret = system(cmd);
+	if (ret != 0) {
+	    fprintf(stderr, "Failed to mount workspace directory %s\n", caps->workspace_path);
+	    return -1;
+	}
+	printf("Workspace mounted successfully\n");
+    }
     // Copy target binary into jail
     char binary_name[256];
     const char *slash = strrchr(target_binary, '/');
@@ -362,31 +394,41 @@ static int setup_filesystem_isolation(const struct file_rule *rules, int count, 
     
     // Mount essential system directories (read-only)
     printf("Mounting system directories...\n");
-    
-    snprintf(cmd, sizeof(cmd), "mount -t nullfs -o ro /lib %s/lib", jail_path);
-    ret = system(cmd);
-    if (ret != 0) {
-        fprintf(stderr, "Warning: Failed to mount /lib\n");
-    }
-    
-    snprintf(cmd, sizeof(cmd), "mount -t nullfs -o ro /usr/lib %s/usr/lib", jail_path);
-    ret = system(cmd);
-    if (ret != 0) {
-        fprintf(stderr, "Warning: Failed to mount /usr/lib\n");
-    }
-    
-    // Mount libexec for the dynamic linker
-    snprintf(cmd, sizeof(cmd), "mount -t nullfs -o ro /libexec %s/libexec", jail_path);
-    ret = system(cmd);
-    if (ret != 0) {
-        fprintf(stderr, "Warning: Failed to mount /libexec\n");
-    }
-    
+      
     // Mount devfs for stdout/stderr/null access
     snprintf(cmd, sizeof(cmd), "mount -t devfs devfs %s/dev", jail_path);
     ret = system(cmd);
     if (ret != 0) {
         fprintf(stderr, "Warning: Failed to mount devfs\n");
+    }
+
+    printf("Processing capability filesystem rules...\n");
+    for (int i = 0; i < caps->file_count; i++) {
+	const struct file_rule *rule = &caps->files[i];
+
+	// Only mount directories that exist and are readable
+	if (rule->permissions & R_OK) {
+	    struct stat st;
+	    if (stat(rule->path, &st) == 0 && S_ISDIR(st.st_mode)) {
+		char mount_point[PATH_MAX];
+		snprintf(mount_point, sizeof(mount_point), "%s%s", jail_path, rule->path);
+
+		// Create mount point
+		snprintf(cmd, sizeof(cmd), "mkdir -p %s", mount_point);
+		system(cmd);
+
+		// Mount the directory
+		const char *mount_opts = (rule->permissions & W_OK) ? "rw" : "ro";
+		snprintf(cmd, sizeof(cmd), "mount -t nullfs -o %s %s %s", 
+			 mount_opts, rule->path, mount_point);
+
+		printf("Mounting %s -> %s (%s)\n", rule->path, mount_point, mount_opts);
+		ret = system(cmd);
+		if (ret != 0) {
+		    fprintf(stderr, "Warning: Failed to mount %s\n", rule->path);
+		}
+	    }
+	}
     }
     
     // Set permissions on tmp
@@ -453,7 +495,7 @@ int freebsd_create_isolation(const struct capabilities *caps) {
     }
     
     // Set up filesystem isolation (now that user exists)
-    ret = setup_filesystem_isolation(caps->files, caps->file_count, jail_root_path, target_binary);
+    ret = setup_filesystem_isolation(caps, jail_root_path, target_binary);
     if (ret != 0) {
         cleanup_jail();
         return ret;
