@@ -42,7 +42,9 @@ struct capabilities {
     /* User context */
     char username[64];      /* "auto" for auto-generation */
     int create_user;        /* 1 if user should be created */
-    
+    uid_t target_uid;       /* UID to run as (0 = not set) */
+    gid_t target_gid;       /* GID to run as (0 = not set) */
+
     /* Workspace */
     char workspace_path[PATH_MAX];  /* Host path to mount as /workspace */
     
@@ -97,14 +99,23 @@ int generate_capability_file(const char *binary, const char *output_file, struct
 
 /* Platform abstraction */
 int create_isolation_context(const struct capabilities *caps);
+void cleanup_isolation_context(void);
 
 /* Platform-specific implementations */
 #ifdef __FreeBSD__
 int freebsd_create_isolation(const struct capabilities *caps);
+void freebsd_cleanup_isolation(void);
+void freebsd_set_jail_id(int jid);
+void freebsd_set_username(const char *username);
+void freebsd_set_jail_path(const char *path);
+int freebsd_get_jail_id(void);
+const char* freebsd_get_username(void);
+const char* freebsd_get_jail_path(void);
 #endif
 
 #ifdef __linux__
 int linux_create_isolation(const struct capabilities *caps);
+void linux_cleanup_isolation(void);
 #endif
 
 /* Utility functions */

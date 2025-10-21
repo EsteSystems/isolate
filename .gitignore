@@ -46,3 +46,6 @@ Thumbs.db
 # Runtime files
 *.core
 core.*
+
+# AI assistant documentation
+CLAUDE.md

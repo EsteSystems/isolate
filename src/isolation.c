@@ -16,3 +16,11 @@ int create_isolation_context(const struct capabilities *caps) {
     return ENOSYS;
 #endif
 }
+
+void cleanup_isolation_context(void) {
+#ifdef __FreeBSD__
+    freebsd_cleanup_isolation();
+#elif defined(__linux__)
+    linux_cleanup_isolation();
+#endif
+}

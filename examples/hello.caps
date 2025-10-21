@@ -1,7 +1,29 @@
-# Simple hello world capabilities
+# Auto-generated capability file for examples/hello
+# Generated on: 2025-10-21 23:40:17
+# Review and modify capabilities as needed
+# Remove or comment out unnecessary capabilities
+
+# User context - creates ephemeral user automatically
 user: auto
-memory: 64MB
-processes: 1
-network: none
-file: /dev/stdout:w
-file: /dev/stderr:w
+
+# Default resource limits (adjust based on application needs)
+memory: 128M    # Adjust based on application requirements
+processes: 5    # Adjust if application spawns child processes
+files: 256      # File descriptor limit
+
+# Detected capabilities (sorted by confidence)
+# Higher confidence suggestions are listed first
+
+# Confidence: 90-99%
+# Standard C library - basic filesystem access
+filesystem: /lib:r
+filesystem: /usr/lib:r
+filesystem: /libexec:r
+filesystem: /usr/local/lib:r
+
+
+# Additional capability examples (commented out):
+# network: udp:53:outbound     # DNS queries
+# filesystem: /home/user:rw    # User home directory
+# env: PATH=/usr/bin:/bin      # Custom environment
+# cpu: 50                      # CPU limit (percentage)

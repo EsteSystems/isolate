@@ -23,41 +23,74 @@
 
 static char ephemeral_username[64];
 static int created_jail_id = -1;
+static char jail_root_path[PATH_MAX];
 
-static int create_ephemeral_user(const char *username) {
+// Functions to set jail info from parent process
+void freebsd_set_jail_id(int jid) {
+    created_jail_id = jid;
+}
+
+void freebsd_set_username(const char *username) {
+    strncpy(ephemeral_username, username, sizeof(ephemeral_username) - 1);
+    ephemeral_username[sizeof(ephemeral_username) - 1] = '\0';
+}
+
+void freebsd_set_jail_path(const char *path) {
+    strncpy(jail_root_path, path, sizeof(jail_root_path) - 1);
+    jail_root_path[sizeof(jail_root_path) - 1] = '\0';
+}
+
+// Functions to get jail info for IPC
+int freebsd_get_jail_id(void) {
+    return created_jail_id;
+}
+
+const char* freebsd_get_username(void) {
+    return ephemeral_username;
+}
+
+const char* freebsd_get_jail_path(void) {
+    return jail_root_path;
+}
+
+static int create_ephemeral_user(const char *username, uid_t *out_uid, gid_t *out_gid) {
     struct passwd *pw;
     char cmd[256];
     int ret;
-    
+
     // Check if user already exists
     pw = getpwnam(username);
     if (pw != NULL) {
         printf("User %s already exists, using existing user\n", username);
+        if (out_uid) *out_uid = pw->pw_uid;
+        if (out_gid) *out_gid = pw->pw_gid;
         return 0;
     }
-    
+
     printf("Creating ephemeral user: %s\n", username);
-    
+
     // Create user with pw command
     // -n: name, -s: shell (nologin), -d: home dir, -c: comment
-    snprintf(cmd, sizeof(cmd), 
-             "pw useradd -n %s -s /usr/sbin/nologin -d /tmp -c 'Isolate ephemeral user' >/dev/null 2>&1", 
+    snprintf(cmd, sizeof(cmd),
+             "pw useradd -n %s -s /usr/sbin/nologin -d /tmp -c 'Isolate ephemeral user' >/dev/null 2>&1",
              username);
-    
+
     ret = system(cmd);
     if (ret != 0) {
         fprintf(stderr, "Failed to create user %s: %s\n", username, strerror(errno));
         return -1;
     }
-    
-    // Verify user was created
+
+    // Verify user was created and get UID/GID
     pw = getpwnam(username);
     if (pw == NULL) {
         fprintf(stderr, "User creation appeared to succeed but user not found\n");
         return -1;
     }
-    
-    printf("Created user %s with UID %d\n", username, pw->pw_uid);
+
+    printf("Created user %s with UID %d, GID %d\n", username, pw->pw_uid, pw->pw_gid);
+    if (out_uid) *out_uid = pw->pw_uid;
+    if (out_gid) *out_gid = pw->pw_gid;
     return 0;
 }
 
@@ -177,90 +210,31 @@ static int attach_to_jail(int jid) {
     return 0;
 }
 
-static int switch_to_user(const char *username) {
-    struct passwd *pw;
-    
-    // Try to find user in the jail's passwd file first
-    pw = getpwnam(username);
-    if (pw == NULL) {
-        fprintf(stderr, "User %s not found in jail passwd database\n", username);
-        
-        // Fallback: try to look up the user by parsing /etc/passwd manually
-        FILE *passwd_file = fopen("/etc/passwd", "r");
-        if (passwd_file) {
-            char line[1024];
-            while (fgets(line, sizeof(line), passwd_file)) {
-                if (strstr(line, username)) {
-                    printf("Found user %s in passwd file: %s", username, line);
-                    // Parse the line manually
-                    char *name = strtok(line, ":");
-                    strtok(NULL, ":");  // skip password
-                    char *uid_str = strtok(NULL, ":");
-                    char *gid_str = strtok(NULL, ":");
-                    
-                    if (name && uid_str && gid_str && strcmp(name, username) == 0) {
-                        uid_t uid = atoi(uid_str);
-                        gid_t gid = atoi(gid_str);
-                        
-                        printf("Switching to user %s (UID %d, GID %d) via manual parsing\n", username, uid, gid);
-                        
-                        if (setgid(gid) != 0) {
-                            fprintf(stderr, "Failed to set GID: %s\n", strerror(errno));
-                            fclose(passwd_file);
-                            return -1;
-                        }
-                        
-                        if (setuid(uid) != 0) {
-                            fprintf(stderr, "Failed to set UID: %s\n", strerror(errno));
-                            fclose(passwd_file);
-                            return -1;
-                        }
-                        setenv("LD_LIBRARY_PATH", "/usr/local/lib:/usr/lib:/lib", 1);
-                        fclose(passwd_file);
-                        return 0;
-                    }
-                    break;
-                }
-            }
-            fclose(passwd_file);
-        }
-        
-        return -1;
-    }
-    
-    printf("Switching to user %s (UID %d)\n", username, pw->pw_uid);
-    
-    // Set groups
-    if (setgid(pw->pw_gid) != 0) {
-        fprintf(stderr, "Failed to set GID: %s\n", strerror(errno));
-        return -1;
-    }
-    
-    if (initgroups(pw->pw_name, pw->pw_gid) != 0) {
-        fprintf(stderr, "Failed to initialize groups: %s\n", strerror(errno));
-        return -1;
-    }
-    
-    // Set user
-    if (setuid(pw->pw_uid) != 0) {
-        fprintf(stderr, "Failed to set UID: %s\n", strerror(errno));
-        return -1;
-    }
-    
-    // Set environment
-    setenv("USER", pw->pw_name, 1);
-    setenv("HOME", pw->pw_dir, 1);
-    setenv("SHELL", pw->pw_shell, 1);
+static int switch_to_user(uid_t uid, gid_t gid, const char *username_for_display) {
+    printf("Switching to user %s (UID %d, GID %d)\n",
+           username_for_display, uid, gid);
 
-    // Set the library path for dynamic linker
+    // Set GID first (must be done before dropping privileges)
+    if (setgid(gid) != 0) {
+        fprintf(stderr, "Failed to set GID %d: %s\n", gid, strerror(errno));
+        return -1;
+    }
+
+    // Set UID (drops privileges)
+    if (setuid(uid) != 0) {
+        fprintf(stderr, "Failed to set UID %d: %s\n", uid, strerror(errno));
+        return -1;
+    }
+
+    // Set minimal environment
+    setenv("USER", username_for_display, 1);
+    setenv("HOME", "/tmp", 1);
     setenv("LD_LIBRARY_PATH", "/usr/local/lib:/usr/lib:/lib", 1);
-    
+
     return 0;
 }
 
-static char jail_root_path[PATH_MAX];
-
-static void cleanup_jail(void) {
+void freebsd_cleanup_isolation(void) {
     char cmd[512];
     
     if (created_jail_id >= 0) {
@@ -314,12 +288,12 @@ static int setup_network_isolation(const struct network_rule *rules, int count) 
     return 0;
 }
 
-static int setup_filesystem_isolation(const struct capabilities *caps, const char *jail_path, const char *target_binary) {
+static int setup_filesystem_isolation(const struct capabilities *caps, const char *jail_path, const char *target_binary, uid_t target_uid, gid_t target_gid, const char *username) {
     char cmd[512];
     int ret;
-    
+
     printf("Setting up filesystem isolation in %s\n", jail_path);
-    
+
     // Create basic directory structure
     snprintf(cmd, sizeof(cmd), "mkdir -p %s/bin", jail_path);
     system(cmd);
@@ -385,12 +359,38 @@ static int setup_filesystem_isolation(const struct capabilities *caps, const cha
     // Make binary executable
     snprintf(cmd, sizeof(cmd), "chmod +x %s/%s", jail_path, binary_name);
     system(cmd);
-    
-    // Copy essential files for user resolution
-    snprintf(cmd, sizeof(cmd), "cp /etc/passwd %s/etc/", jail_path);
-    system(cmd);
-    snprintf(cmd, sizeof(cmd), "cp /etc/group %s/etc/", jail_path);
-    system(cmd);
+
+    // Create minimal passwd file for jail (only root and the isolated user)
+    char passwd_path[PATH_MAX];
+    snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd", jail_path);
+
+    FILE *passwd_file = fopen(passwd_path, "w");
+    if (passwd_file) {
+        fprintf(passwd_file,
+                "root:*:0:0:System Administrator:/root:/usr/sbin/nologin\n"
+                "%s:*:%u:%u:Isolated Application:/tmp:/usr/sbin/nologin\n",
+                username, target_uid, target_gid);
+        fclose(passwd_file);
+        printf("Created minimal passwd file in jail (uid=%u, gid=%u)\n", target_uid, target_gid);
+    } else {
+        fprintf(stderr, "Warning: Failed to create passwd file in jail\n");
+    }
+
+    // Create minimal group file
+    char group_path[PATH_MAX];
+    snprintf(group_path, sizeof(group_path), "%s/etc/group", jail_path);
+
+    FILE *group_file = fopen(group_path, "w");
+    if (group_file) {
+        fprintf(group_file,
+                "wheel:*:0:root\n"
+                "%s:*:%u:\n",
+                username, target_gid);
+        fclose(group_file);
+        printf("Created minimal group file in jail\n");
+    } else {
+        fprintf(stderr, "Warning: Failed to create group file in jail\n");
+    }
     
     // Mount essential system directories (read-only)
     printf("Mounting system directories...\n");
@@ -462,82 +462,94 @@ int freebsd_create_isolation(const struct capabilities *caps) {
     int ret;
     char jail_name[64];
     char username[64];
+    uid_t target_uid = 0;
+    gid_t target_gid = 0;
     const char *target_binary = getenv("ISOLATE_TARGET_BINARY");
-    
+
     if (!target_binary) {
         fprintf(stderr, "Target binary not specified\n");
         return -1;
     }
-    
+
     printf("Creating FreeBSD isolation context...\n");
-    
+
     // Generate unique jail name
     snprintf(jail_name, sizeof(jail_name), "isolate-%d", getpid());
-    
-    // Determine username and create user FIRST
+
+    // Determine username and create user FIRST, capture UID/GID
     if (caps->create_user && strcmp(caps->username, "auto") == 0) {
         snprintf(username, sizeof(username), "app-%d", getpid());
         strncpy(ephemeral_username, username, sizeof(ephemeral_username) - 1);
-        
-        ret = create_ephemeral_user(username);
+
+        ret = create_ephemeral_user(username, &target_uid, &target_gid);
         if (ret != 0) {
             return ret;
         }
     } else {
         strncpy(username, caps->username, sizeof(username) - 1);
+
+        // For non-auto users, look up UID/GID on host before entering jail
+        struct passwd *pw = getpwnam(caps->username);
+        if (pw == NULL) {
+            fprintf(stderr, "User %s not found\n", caps->username);
+            return -1;
+        }
+        target_uid = pw->pw_uid;
+        target_gid = pw->pw_gid;
+        printf("Using existing user %s (UID %d, GID %d)\n", username, target_uid, target_gid);
     }
     
     // Create isolated jail filesystem
     ret = create_jail_filesystem(jail_root_path, sizeof(jail_root_path), jail_name);
     if (ret != 0) {
-        cleanup_jail();
+        freebsd_cleanup_isolation();
         return ret;
     }
-    
-    // Set up filesystem isolation (now that user exists)
-    ret = setup_filesystem_isolation(caps, jail_root_path, target_binary);
+
+    // Set up filesystem isolation (now that user exists and UID/GID are known)
+    ret = setup_filesystem_isolation(caps, jail_root_path, target_binary, target_uid, target_gid, username);
     if (ret != 0) {
-        cleanup_jail();
+        freebsd_cleanup_isolation();
         return ret;
     }
-    
+
     // Create jail with isolated filesystem
     int jid = create_jail(jail_name, jail_root_path);
     if (jid < 0) {
-        cleanup_jail();
+        freebsd_cleanup_isolation();
         return -1;
     }
-    
+
     // Set resource limits
     ret = setup_resource_limits(jail_name, &caps->limits);
     if (ret != 0) {
-        cleanup_jail();
+        freebsd_cleanup_isolation();
         return ret;
     }
-    
+
     // Set up network isolation
     ret = setup_network_isolation(caps->network, caps->network_count);
     if (ret != 0) {
-        cleanup_jail();
+        freebsd_cleanup_isolation();
         return ret;
     }
-    
+
     // Attach to jail
     ret = attach_to_jail(jid);
     if (ret != 0) {
-        cleanup_jail();
+        freebsd_cleanup_isolation();
         return ret;
     }
-    
-    // Switch to target user
-    ret = switch_to_user(username);
+
+    // Switch to target user using pre-resolved UID/GID
+    ret = switch_to_user(target_uid, target_gid, username);
     if (ret != 0) {
-        cleanup_jail();
+        freebsd_cleanup_isolation();
         return ret;
     }
-    
-    // Register cleanup handler for normal exit
-    atexit(cleanup_jail);
+
+    // Register cleanup handler for normal exit in child process
+    atexit(freebsd_cleanup_isolation);
     
     printf("FreeBSD isolation context created successfully\n");
     printf("Running in jail %s as user %s\n", jail_name, username);

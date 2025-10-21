@@ -14,6 +14,8 @@ void init_default_capabilities(struct capabilities *caps) {
     memset(caps, 0, sizeof(*caps));
     strcpy(caps->username, "auto");
     caps->create_user = 1;
+    caps->target_uid = 0;
+    caps->target_gid = 0;
     caps->network_default_deny = 0;  /* Allow all by default */
     caps->fs_default_deny = 0;       /* Allow all by default */
     caps->env_clear = 0;             /* Inherit environment */

@@ -33,7 +33,7 @@ int analyze_binary_dependencies(const char *binary, struct detection_result *res
         
         if (strstr(line, "libc.so")) {
             strcpy(hint->description, "Standard C library - basic filesystem access");
-            strcpy(hint->capability, "filesystem: /lib:r\nfilesystem: /usr/lib:r");
+            strcpy(hint->capability, "filesystem: /lib:r\nfilesystem: /usr/lib:r\nfilesystem: /libexec:r\nfilesystem: /usr/local/lib:r");
             hint->confidence = 95;
             result->hint_count++;
         }

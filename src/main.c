@@ -213,31 +213,107 @@ int main(int argc, char *argv[]) {
     if (verbose) {
         printf("Creating isolation context...\n");
     }
-    
-    // Create isolation context
-    if ((ret = create_isolation_context(&caps)) != 0) {
-        fprintf(stderr, "Failed to create isolation context: %s\n", strerror(ret));
+
+    // Create pipes to communicate jail info from child to parent
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        fprintf(stderr, "Failed to create pipe: %s\n", strerror(errno));
         return 1;
     }
-    
-    if (verbose) {
-        printf("Isolation context created successfully.\n");
-        printf("Executing target binary...\n\n");
+
+    // Fork before entering jail, so parent can clean up
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "Failed to fork: %s\n", strerror(errno));
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return 1;
     }
-    
-    // Extract just the binary name for execution inside jail
-    const char *binary_name = strrchr(target_binary, '/');
-    if (binary_name) {
-        binary_name++; // Skip the '/'
+
+    if (pid == 0) {
+        // Child process: create isolation context and execute
+        close(pipefd[0]); // Close read end
+
+        if ((ret = create_isolation_context(&caps)) != 0) {
+            fprintf(stderr, "Failed to create isolation context: %s\n", strerror(ret));
+            close(pipefd[1]);
+            return 1;
+        }
+
+        // Send jail ID, username, and path to parent
+#ifdef __FreeBSD__
+        int jid = freebsd_get_jail_id();
+        const char* username = freebsd_get_username();
+        const char* jailpath = freebsd_get_jail_path();
+        write(pipefd[1], &jid, sizeof(jid));
+        write(pipefd[1], username, 64);
+        write(pipefd[1], jailpath, PATH_MAX);
+#endif
+        close(pipefd[1]);
+
+        if (verbose) {
+            printf("Isolation context created successfully.\n");
+            printf("Executing target binary...\n\n");
+        }
+
+        // Extract just the binary name for execution inside jail
+        const char *binary_name = strrchr(target_binary, '/');
+        if (binary_name) {
+            binary_name++; // Skip the '/'
+        } else {
+            binary_name = target_binary;
+        }
+
+        // Execute target binary with remaining args (using just the filename now)
+        argv[optind] = (char*)binary_name;  // Replace full path with just filename
+        execv(binary_name, &argv[optind]);
+
+        // If we get here, execv failed
+        fprintf(stderr, "Failed to execute %s: %s\n", target_binary, strerror(errno));
+        return 1;
     } else {
-        binary_name = target_binary;
+        // Parent process: read jail info from child, wait, then cleanup
+        close(pipefd[1]); // Close write end
+
+        // Read jail ID, username, and path from child
+#ifdef __FreeBSD__
+        int jid;
+        char username[64];
+        char jailpath[PATH_MAX];
+
+        read(pipefd[0], &jid, sizeof(jid));
+        read(pipefd[0], username, 64);
+        read(pipefd[0], jailpath, PATH_MAX);
+        close(pipefd[0]);
+
+        // Set these values so cleanup can use them
+        freebsd_set_jail_id(jid);
+        freebsd_set_username(username);
+        freebsd_set_jail_path(jailpath);
+#else
+        close(pipefd[0]);
+#endif
+
+        // Wait for child to complete
+        int status;
+        waitpid(pid, &status, 0);
+
+        if (verbose) {
+            printf("\nChild process exited, performing cleanup...\n");
+        }
+
+        // Cleanup jail and user
+        cleanup_isolation_context();
+
+        if (verbose) {
+            printf("Cleanup complete.\n");
+        }
+
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            return 128 + WTERMSIG(status);
+        }
+        return 1;
     }
-    
-    // Execute target binary with remaining args (using just the filename now)
-    argv[optind] = (char*)binary_name;  // Replace full path with just filename
-    execv(binary_name, &argv[optind]);
-    
-    // If we get here, execv failed
-    fprintf(stderr, "Failed to execute %s: %s\n", target_binary, strerror(errno));
-    return 1;
 }
