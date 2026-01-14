@@ -828,7 +828,7 @@ fn runIsolation(allocator: std.mem.Allocator, capability: *const caps.Capabiliti
             const jailpath_slice = std.mem.sliceTo(&jailpath, 0);
             const username_slice = std.mem.sliceTo(&username, 0);
 
-            reg.register(.{
+            var instance = registry.Instance{
                 .name = allocator.dupe(u8, name) catch name,
                 .pid = pid,
                 .jail_id = jid,
@@ -838,7 +838,10 @@ fn runIsolation(allocator: std.mem.Allocator, capability: *const caps.Capabiliti
                 .start_time = std.time.timestamp(),
                 .workspace_path = if (capability.workspace_path) |wp| allocator.dupe(u8, wp) catch null else null,
                 .allocator = allocator,
-            }) catch |err| {
+            };
+            defer instance.deinit();
+
+            reg.register(instance) catch |err| {
                 if (verbose) {
                     stderr.print("Warning: Failed to register instance: {}\n", .{err}) catch {};
                 }
@@ -860,7 +863,7 @@ fn runIsolation(allocator: std.mem.Allocator, capability: *const caps.Capabiliti
             freebsd.cleanupIsolation();
 
             // Unregister instance
-            reg.unregister(name);
+            reg.unregister(instance.name);
 
             if (verbose) {
                 stdout.print("Cleanup complete.\n", .{}) catch {};
