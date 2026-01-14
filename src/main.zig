@@ -1,0 +1,896 @@
+//! isolate - Infrastructureless container runner
+//!
+//! This is the main entry point for the isolate tool. It provides process
+//! isolation using native OS primitives (FreeBSD jails, Linux namespaces).
+//!
+//! Usage:
+//!   isolate <command> [options] [arguments]
+//!
+//! Commands:
+//!   run      Run a binary in isolation
+//!   detect   Detect and generate capability file
+//!   list     List running isolated instances
+//!   stop     Stop a running instance
+//!   clean    Clean up orphaned instances and data
+
+const std = @import("std");
+const builtin = @import("builtin");
+const c_api = @import("c_api.zig");
+const platform = @import("platform.zig");
+const caps = @import("caps.zig");
+const detect = @import("detect.zig");
+const registry = @import("registry.zig");
+
+// Platform-specific isolation modules
+const freebsd = if (builtin.os.tag == .freebsd) @import("freebsd.zig") else struct {};
+
+const c = c_api.c;
+
+/// Program version
+pub const version = "0.3.0-zig";
+
+/// Subcommands
+const Command = enum {
+    run,
+    detect,
+    list,
+    stop,
+    clean,
+    help,
+    version,
+};
+
+/// Run command options
+const RunOptions = struct {
+    caps_file: ?[]const u8 = null,
+    workspace_dir: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    verbose: bool = false,
+    dry_run: bool = false,
+    target_binary: ?[]const u8 = null,
+    binary_args: []const []const u8 = &.{},
+};
+
+/// Detect command options
+const DetectOptions = struct {
+    output_file: ?[]const u8 = null,
+    target_binary: ?[]const u8 = null,
+};
+
+/// Stop command options
+const StopOptions = struct {
+    force: bool = false,
+    name: ?[]const u8 = null,
+};
+
+/// Parsed arguments with owned memory
+const ParsedArgs = struct {
+    command: Command,
+    run_opts: RunOptions = .{},
+    detect_opts: DetectOptions = .{},
+    stop_opts: StopOptions = .{},
+    // Keep args alive for the lifetime of the options
+    _args: []const [:0]u8,
+    _allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ParsedArgs) void {
+        std.process.argsFree(self._allocator, self._args);
+    }
+};
+
+/// Parse command line arguments
+fn parseArgs(allocator: std.mem.Allocator) !ParsedArgs {
+    const args = try std.process.argsAlloc(allocator);
+    errdefer std.process.argsFree(allocator, args);
+
+    var result = ParsedArgs{
+        .command = .help,
+        ._args = args,
+        ._allocator = allocator,
+    };
+
+    if (args.len < 2) {
+        return result; // Default to help
+    }
+
+    // Parse command
+    const cmd_str = args[1];
+
+    // Handle legacy flags as commands
+    if (std.mem.eql(u8, cmd_str, "-h") or std.mem.eql(u8, cmd_str, "--help")) {
+        result.command = .help;
+        return result;
+    }
+    if (std.mem.eql(u8, cmd_str, "-V") or std.mem.eql(u8, cmd_str, "--version")) {
+        result.command = .version;
+        return result;
+    }
+    // Legacy detect mode
+    if (std.mem.eql(u8, cmd_str, "-d") or std.mem.eql(u8, cmd_str, "--detect")) {
+        result.command = .detect;
+        // Parse remaining args for detect
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.startsWith(u8, arg, "-")) {
+                if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+                    i += 1;
+                    if (i >= args.len) return error.MissingArgument;
+                    result.detect_opts.output_file = args[i];
+                }
+            } else {
+                if (result.detect_opts.target_binary == null) {
+                    result.detect_opts.target_binary = arg;
+                } else if (result.detect_opts.output_file == null) {
+                    result.detect_opts.output_file = arg;
+                }
+            }
+        }
+        return result;
+    }
+
+    // Parse subcommand
+    if (std.mem.eql(u8, cmd_str, "run")) {
+        result.command = .run;
+        try parseRunArgs(&result.run_opts, args[2..], allocator);
+    } else if (std.mem.eql(u8, cmd_str, "detect")) {
+        result.command = .detect;
+        try parseDetectArgs(&result.detect_opts, args[2..]);
+    } else if (std.mem.eql(u8, cmd_str, "list") or std.mem.eql(u8, cmd_str, "ls")) {
+        result.command = .list;
+    } else if (std.mem.eql(u8, cmd_str, "stop")) {
+        result.command = .stop;
+        try parseStopArgs(&result.stop_opts, args[2..]);
+    } else if (std.mem.eql(u8, cmd_str, "clean") or std.mem.eql(u8, cmd_str, "cleanup")) {
+        result.command = .clean;
+    } else if (std.mem.eql(u8, cmd_str, "help")) {
+        result.command = .help;
+    } else if (std.mem.eql(u8, cmd_str, "version")) {
+        result.command = .version;
+    } else {
+        // Legacy mode: treat first arg as binary path for 'run' command
+        result.command = .run;
+        try parseRunArgs(&result.run_opts, args[1..], allocator);
+    }
+
+    return result;
+}
+
+/// Parse run command arguments
+fn parseRunArgs(opts: *RunOptions, args: []const [:0]u8, allocator: std.mem.Allocator) !void {
+    var positional = std.ArrayList([]const u8).init(allocator);
+    defer positional.deinit();
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (std.mem.startsWith(u8, arg, "-")) {
+            if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--caps")) {
+                i += 1;
+                if (i >= args.len) return error.MissingArgument;
+                opts.caps_file = args[i];
+            } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--workspace")) {
+                i += 1;
+                if (i >= args.len) return error.MissingArgument;
+                opts.workspace_dir = args[i];
+            } else if (std.mem.eql(u8, arg, "-N") or std.mem.eql(u8, arg, "--name")) {
+                i += 1;
+                if (i >= args.len) return error.MissingArgument;
+                opts.name = args[i];
+            } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+                opts.verbose = true;
+            } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--dry-run")) {
+                opts.dry_run = true;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{arg});
+                return error.UnknownOption;
+            }
+        } else {
+            try positional.append(arg);
+        }
+    }
+
+    // First positional is target binary
+    if (positional.items.len > 0) {
+        opts.target_binary = positional.items[0];
+        if (positional.items.len > 1) {
+            opts.binary_args = try allocator.dupe([]const u8, positional.items[1..]);
+        }
+    }
+}
+
+/// Parse detect command arguments
+fn parseDetectArgs(opts: *DetectOptions, args: []const [:0]u8) !void {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (std.mem.startsWith(u8, arg, "-")) {
+            if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+                i += 1;
+                if (i >= args.len) return error.MissingArgument;
+                opts.output_file = args[i];
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{arg});
+                return error.UnknownOption;
+            }
+        } else {
+            if (opts.target_binary == null) {
+                opts.target_binary = arg;
+            } else if (opts.output_file == null) {
+                opts.output_file = arg;
+            }
+        }
+    }
+}
+
+/// Parse stop command arguments
+fn parseStopArgs(opts: *StopOptions, args: []const [:0]u8) !void {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (std.mem.startsWith(u8, arg, "-")) {
+            if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
+                opts.force = true;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{arg});
+                return error.UnknownOption;
+            }
+        } else {
+            if (opts.name == null) {
+                opts.name = arg;
+            }
+        }
+    }
+}
+
+/// Print main usage information
+fn printUsage() void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.print(
+        \\isolate - Infrastructureless container runner
+        \\
+        \\Usage: isolate <command> [options] [arguments]
+        \\
+        \\Commands:
+        \\  run      Run a binary in isolation (default)
+        \\  detect   Detect and generate capability file
+        \\  list     List running isolated instances
+        \\  stop     Stop a running instance
+        \\  clean    Clean up orphaned instances and data
+        \\
+        \\Run 'isolate <command> --help' for command-specific help.
+        \\
+        \\Examples:
+        \\  # Generate capability file for an application
+        \\  isolate detect ./myapp
+        \\
+        \\  # Run application in isolation
+        \\  doas isolate run ./myapp
+        \\
+        \\  # Run with workspace directory
+        \\  doas isolate run -w /path/to/data ./myapp
+        \\
+        \\  # List running instances
+        \\  isolate list
+        \\
+        \\  # Stop an instance
+        \\  doas isolate stop myapp-abc123
+        \\
+        \\  # Clean up orphaned instances
+        \\  doas isolate clean
+        \\
+        \\Options:
+        \\  -h, --help       Show this help
+        \\  -V, --version    Show version
+        \\
+    , .{}) catch {};
+}
+
+/// Print run command usage
+fn printRunUsage() void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.print(
+        \\Usage: isolate run [options] <binary> [args...]
+        \\
+        \\Run a binary in isolation using OS-native primitives.
+        \\
+        \\Options:
+        \\  -c, --caps <file>      Capability file (default: <binary>.caps)
+        \\  -w, --workspace <dir>  Workspace directory (mounted as /workspace)
+        \\  -N, --name <name>      Instance name (default: auto-generated)
+        \\  -v, --verbose          Verbose output
+        \\  -n, --dry-run          No isolation (dry run)
+        \\
+        \\Examples:
+        \\  doas isolate run ./myapp
+        \\  doas isolate run -c custom.caps ./myapp arg1 arg2
+        \\  doas isolate run -w /data/tenant1 -N tenant1-app ./myapp
+        \\
+    , .{}) catch {};
+}
+
+/// Print detect command usage
+fn printDetectUsage() void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.print(
+        \\Usage: isolate detect [options] <binary> [output.caps]
+        \\
+        \\Analyze a binary and generate a capability file.
+        \\
+        \\Options:
+        \\  -o, --output <file>    Output capability file (default: <binary>.caps)
+        \\
+        \\Examples:
+        \\  isolate detect ./myapp
+        \\  isolate detect -o custom.caps ./myapp
+        \\  isolate detect ./myapp ./myapp.caps
+        \\
+    , .{}) catch {};
+}
+
+/// Print version information
+fn printVersion() void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.print("isolate {s}\n", .{version}) catch {};
+    stdout.print("Platform: {s}\n", .{@tagName(builtin.os.tag)}) catch {};
+    stdout.print("Architecture: {s}\n", .{@tagName(builtin.cpu.arch)}) catch {};
+}
+
+// ============================================================================
+// Command Handlers
+// ============================================================================
+
+/// Handle 'detect' command
+fn cmdDetect(allocator: std.mem.Allocator, opts: DetectOptions) !u8 {
+    const stdout = std.io.getStdOut().writer();
+
+    if (opts.target_binary == null) {
+        std.debug.print("Error: No target binary specified for detection\n", .{});
+        printDetectUsage();
+        return 1;
+    }
+
+    try stdout.print("Isolate Capability Detection\n", .{});
+    try stdout.print("============================\n\n", .{});
+
+    // Use native Zig ELF detection
+    detect.detectCapabilities(allocator, opts.target_binary.?, opts.output_file) catch |err| {
+        std.debug.print("Detection failed: {}\n", .{err});
+        return 1;
+    };
+
+    try stdout.print("\nNext steps:\n", .{});
+    try stdout.print("1. Review the generated capability file\n", .{});
+    try stdout.print("2. Edit capabilities as needed\n", .{});
+    try stdout.print("3. Run: doas isolate run {s}\n", .{opts.target_binary.?});
+
+    return 0;
+}
+
+/// Handle 'run' command
+fn cmdRun(allocator: std.mem.Allocator, opts: RunOptions) !u8 {
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    if (opts.target_binary == null) {
+        try stderr.print("Error: No target binary specified\n", .{});
+        printRunUsage();
+        return 1;
+    }
+
+    const target_binary = opts.target_binary.?;
+
+    // Determine capability file
+    var caps_file_buf: [c_api.PATH_MAX]u8 = undefined;
+    const caps_file = if (opts.caps_file) |cf|
+        cf
+    else blk: {
+        const formatted = std.fmt.bufPrint(&caps_file_buf, "{s}.caps", .{target_binary}) catch {
+            try stderr.print("Error: Path too long\n", .{});
+            return 1;
+        };
+        break :blk formatted;
+    };
+
+    if (opts.verbose) {
+        try stdout.print("Isolate Process Isolation\n", .{});
+        try stdout.print("=========================\n", .{});
+        try stdout.print("Target binary: {s}\n", .{target_binary});
+        try stdout.print("Capability file: {s}\n", .{caps_file});
+        if (opts.workspace_dir) |ws| {
+            try stdout.print("Workspace directory: {s}\n", .{ws});
+        }
+        if (opts.name) |name| {
+            try stdout.print("Instance name: {s}\n", .{name});
+        }
+        try stdout.print("\n", .{});
+    }
+
+    // Validate workspace if specified
+    if (opts.workspace_dir) |ws| {
+        const stat = std.fs.cwd().statFile(ws) catch |err| {
+            try stderr.print("Error: Workspace directory {s} - {}\n", .{ ws, err });
+            return 1;
+        };
+        if (stat.kind != .directory) {
+            try stderr.print("Error: {s} is not a directory\n", .{ws});
+            return 1;
+        }
+    }
+
+    // Load capabilities using Zig-native parser
+    var parse_result: caps.ParseResult = undefined;
+
+    if (caps.load(allocator, caps_file)) |result| {
+        parse_result = result;
+    } else |err| {
+        if (opts.verbose or err != caps.ParseError.FileNotFound) {
+            try stderr.print("Warning: Could not load capabilities from {s}: {}\n", .{ caps_file, err });
+            try stderr.print("Suggestion: Run 'isolate detect {s}' to generate capability file\n", .{target_binary});
+            try stderr.print("Running without isolation.\n\n", .{});
+        }
+        // Use default capabilities
+        parse_result = .{
+            .caps = caps.Capabilities.init(allocator),
+            .warnings = std.ArrayList(caps.ParseResult.Warning).init(allocator),
+        };
+    }
+    defer parse_result.deinit();
+
+    // Print any warnings from parsing
+    if (parse_result.warnings.items.len > 0 and opts.verbose) {
+        for (parse_result.warnings.items) |warning| {
+            try stderr.print("Warning (line {}): {s}\n", .{ warning.line, warning.message });
+        }
+    }
+
+    // Set workspace path if specified
+    if (opts.workspace_dir) |ws| {
+        if (parse_result.caps.workspace_path) |old_wp| {
+            allocator.free(old_wp);
+        }
+        parse_result.caps.workspace_path = try allocator.dupe(u8, ws);
+    }
+
+    if (opts.verbose) {
+        try parse_result.caps.print(stdout);
+        try stdout.print("\n", .{});
+    }
+
+    if (opts.dry_run) {
+        try stdout.print("Dry run - would execute with the above isolation settings.\n", .{});
+        try stdout.print("Command would be: {s}", .{target_binary});
+        for (opts.binary_args) |arg| {
+            try stdout.print(" {s}", .{arg});
+        }
+        try stdout.print("\n", .{});
+        return 0;
+    }
+
+    // Check for root privileges
+    if (c.geteuid() != 0) {
+        try stderr.print("Error: Isolation requires root privileges\n", .{});
+        try stderr.print("Run with: doas isolate run {s}\n", .{target_binary});
+        return 1;
+    }
+
+    // Set environment variable for C code
+    _ = c.setenv("ISOLATE_TARGET_BINARY", @ptrCast(target_binary.ptr), 1);
+
+    if (opts.verbose) {
+        try stdout.print("Creating isolation context...\n", .{});
+    }
+
+    // Run isolation using native Zig implementation
+    return runIsolation(allocator, &parse_result.caps, target_binary, opts.binary_args, opts.name, opts.verbose);
+}
+
+/// Handle 'list' command
+fn cmdList(allocator: std.mem.Allocator) !u8 {
+    const stdout = std.io.getStdOut().writer();
+
+    var reg = registry.Registry.init(allocator);
+    var instances = try reg.list();
+    defer {
+        for (instances.items) |*inst| {
+            inst.deinit();
+        }
+        instances.deinit();
+    }
+
+    if (instances.items.len == 0) {
+        try stdout.print("No running instances found.\n", .{});
+        return 0;
+    }
+
+    // Print header
+    try stdout.print("{s:<20} {s:<8} {s:<8} {s:<10} {s}\n", .{ "NAME", "PID", "JAIL_ID", "STATE", "BINARY" });
+    try stdout.print("{s:-<20} {s:-<8} {s:-<8} {s:-<10} {s:-<30}\n", .{ "", "", "", "", "" });
+
+    // Print instances
+    for (instances.items) |inst| {
+        const state_str = switch (inst.state) {
+            .running => "running",
+            .stopped => "stopped",
+            .orphaned => "orphaned",
+        };
+
+        // Truncate binary path if too long
+        var binary_display: [30]u8 = undefined;
+        const binary_path = if (inst.binary_path.len > 29) blk: {
+            @memcpy(binary_display[0..27], inst.binary_path[inst.binary_path.len - 27 ..]);
+            binary_display[0] = '.';
+            binary_display[1] = '.';
+            binary_display[2] = '.';
+            break :blk binary_display[0..30];
+        } else inst.binary_path;
+
+        try stdout.print("{s:<20} {d:<8} {d:<8} {s:<10} {s}\n", .{
+            inst.name,
+            inst.pid,
+            inst.jail_id,
+            state_str,
+            binary_path,
+        });
+    }
+
+    return 0;
+}
+
+/// Handle 'stop' command
+fn cmdStop(allocator: std.mem.Allocator, opts: StopOptions) !u8 {
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    if (opts.name == null) {
+        try stderr.print("Error: No instance name specified\n", .{});
+        try stderr.print("Usage: isolate stop <name>\n", .{});
+        try stderr.print("Run 'isolate list' to see running instances.\n", .{});
+        return 1;
+    }
+
+    // Check for root privileges
+    if (c.geteuid() != 0) {
+        try stderr.print("Error: Stopping instances requires root privileges\n", .{});
+        try stderr.print("Run with: doas isolate stop {s}\n", .{opts.name.?});
+        return 1;
+    }
+
+    var reg = registry.Registry.init(allocator);
+
+    const inst_opt = try reg.get(opts.name.?);
+    if (inst_opt == null) {
+        try stderr.print("Error: Instance '{s}' not found\n", .{opts.name.?});
+        return 1;
+    }
+
+    var inst = inst_opt.?;
+    defer inst.deinit();
+
+    if (inst.state != .running and !opts.force) {
+        try stderr.print("Instance '{s}' is not running (state: {s})\n", .{
+            opts.name.?,
+            @tagName(inst.state),
+        });
+        try stderr.print("Use -f/--force to clean up anyway.\n", .{});
+        return 1;
+    }
+
+    try stdout.print("Stopping instance '{s}'...\n", .{opts.name.?});
+
+    // Send SIGTERM to the process
+    if (inst.state == .running) {
+        const kill_result = c.kill(inst.pid, c.SIGTERM);
+        if (kill_result < 0) {
+            try stderr.print("Warning: Failed to send SIGTERM to PID {d}\n", .{inst.pid});
+        } else {
+            try stdout.print("Sent SIGTERM to PID {d}\n", .{inst.pid});
+
+            // Wait a moment for graceful shutdown
+            std.time.sleep(500 * std.time.ns_per_ms);
+        }
+
+        // Check if still running
+        if (c.kill(inst.pid, 0) == 0) {
+            if (opts.force) {
+                try stdout.print("Process still running, sending SIGKILL...\n", .{});
+                _ = c.kill(inst.pid, c.SIGKILL);
+            } else {
+                try stderr.print("Process still running. Use -f/--force for SIGKILL.\n", .{});
+            }
+        }
+    }
+
+    // Remove from registry
+    reg.unregister(opts.name.?);
+    try stdout.print("Instance '{s}' stopped and unregistered.\n", .{opts.name.?});
+
+    return 0;
+}
+
+/// Handle 'clean' command
+fn cmdClean(allocator: std.mem.Allocator) !u8 {
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    // Check for root privileges (needed to clean jail directories)
+    if (c.geteuid() != 0) {
+        try stderr.print("Warning: Running without root. Some cleanup may be limited.\n", .{});
+    }
+
+    var reg = registry.Registry.init(allocator);
+
+    try stdout.print("Cleaning orphaned instances...\n", .{});
+
+    const cleaned = try reg.cleanOrphaned();
+
+    if (cleaned == 0) {
+        try stdout.print("No orphaned instances found.\n", .{});
+    } else {
+        try stdout.print("Cleaned {d} orphaned instance(s).\n", .{cleaned});
+    }
+
+    // Also clean any orphaned jail directories
+    if (builtin.os.tag == .freebsd and c.geteuid() == 0) {
+        try stdout.print("Checking for orphaned jail directories...\n", .{});
+
+        // Clean /tmp/isolate-* directories that don't have running jails
+        var dir = std.fs.openDirAbsolute("/tmp", .{ .iterate = true }) catch {
+            return 0;
+        };
+        defer dir.close();
+
+        var cleaned_dirs: u32 = 0;
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind == .directory and std.mem.startsWith(u8, entry.name, "isolate-")) {
+                // Check if there's a corresponding running instance
+                const inst_opt = try reg.get(entry.name["isolate-".len..]);
+                if (inst_opt == null) {
+                    // No instance, try to remove
+                    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    const path = std.fmt.bufPrint(&path_buf, "/tmp/{s}", .{entry.name}) catch continue;
+
+                    if (builtin.os.tag == .freebsd) {
+                        freebsd.rmrf(path) catch {};
+                        cleaned_dirs += 1;
+                    }
+                } else {
+                    var inst = inst_opt.?;
+                    inst.deinit();
+                }
+            }
+        }
+
+        if (cleaned_dirs > 0) {
+            try stdout.print("Removed {d} orphaned jail directory(s).\n", .{cleaned_dirs});
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// Isolation Implementation
+// ============================================================================
+
+/// Run isolation using native Zig implementation
+fn runIsolation(allocator: std.mem.Allocator, capability: *const caps.Capabilities, target_binary: []const u8, args: []const []const u8, instance_name: ?[]const u8, verbose: bool) u8 {
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    // FreeBSD-specific implementation
+    if (builtin.os.tag == .freebsd) {
+        // Generate instance name if not provided
+        var name_buf: [64]u8 = undefined;
+        const name = if (instance_name) |n|
+            n
+        else blk: {
+            // Extract binary basename
+            const basename = if (std.mem.lastIndexOf(u8, target_binary, "/")) |idx|
+                target_binary[idx + 1 ..]
+            else
+                target_binary;
+
+            // Generate random suffix
+            var random_bytes: [4]u8 = undefined;
+            std.crypto.random.bytes(&random_bytes);
+            const suffix = std.fmt.bytesToHex(random_bytes, .lower);
+
+            const formatted = std.fmt.bufPrint(&name_buf, "{s}-{s}", .{ basename, suffix }) catch "isolate-instance";
+            break :blk formatted;
+        };
+
+        // Create pipe for IPC (to pass jail info to parent for cleanup)
+        var pipefd: [2]c_int = undefined;
+        if (c.pipe(&pipefd) < 0) {
+            stderr.print("Failed to create pipe\n", .{}) catch {};
+            return 1;
+        }
+
+        const pid = c.fork();
+        if (pid < 0) {
+            stderr.print("Failed to fork\n", .{}) catch {};
+            _ = c.close(pipefd[0]);
+            _ = c.close(pipefd[1]);
+            return 1;
+        }
+
+        if (pid == 0) {
+            // Child process
+            _ = c.close(pipefd[0]);
+
+            // Create isolation context using native Zig implementation
+            freebsd.createIsolation(capability, target_binary) catch |err| {
+                stderr.print("Failed to create isolation context: {}\n", .{err}) catch {};
+                _ = c.close(pipefd[1]);
+                c._exit(1);
+            };
+
+            // Send jail info to parent for cleanup
+            const jid = freebsd.freebsd_get_jail_id();
+            var username: [64]u8 = undefined;
+            const username_ptr = freebsd.freebsd_get_username();
+            @memcpy(&username, @as([*]const u8, @ptrCast(username_ptr))[0..64]);
+
+            var jailpath: [freebsd.PATH_MAX]u8 = undefined;
+            const path_ptr = freebsd.freebsd_get_jail_path();
+            @memcpy(&jailpath, @as([*]const u8, @ptrCast(path_ptr))[0..freebsd.PATH_MAX]);
+
+            _ = c.write(pipefd[1], &jid, @sizeOf(c_int));
+            _ = c.write(pipefd[1], &username, 64);
+            _ = c.write(pipefd[1], &jailpath, freebsd.PATH_MAX);
+            _ = c.close(pipefd[1]);
+
+            if (verbose) {
+                stdout.print("Isolation context created successfully.\n", .{}) catch {};
+                stdout.print("Executing target binary...\n\n", .{}) catch {};
+            }
+
+            // Execute target binary
+            const binary_name = if (std.mem.lastIndexOf(u8, target_binary, "/")) |idx|
+                target_binary[idx + 1 ..]
+            else
+                target_binary;
+
+            // Build argv for execv
+            var argv_buf: [64]?[*:0]const u8 = [_]?[*:0]const u8{null} ** 64;
+            argv_buf[0] = @ptrCast(binary_name.ptr);
+
+            var argc: usize = 1;
+            for (args) |arg| {
+                if (argc >= argv_buf.len - 1) break;
+                argv_buf[argc] = @ptrCast(arg.ptr);
+                argc += 1;
+            }
+
+            _ = c.execv(@ptrCast(binary_name.ptr), @ptrCast(&argv_buf));
+
+            // If we get here, execv failed
+            stderr.print("Failed to execute {s}\n", .{target_binary}) catch {};
+            c._exit(1);
+        } else {
+            // Parent process
+            _ = c.close(pipefd[1]);
+
+            // Read jail info from child
+            var jid: c_int = undefined;
+            var username: [64]u8 = undefined;
+            var jailpath: [freebsd.PATH_MAX]u8 = undefined;
+
+            _ = c.read(pipefd[0], &jid, @sizeOf(c_int));
+            _ = c.read(pipefd[0], &username, 64);
+            _ = c.read(pipefd[0], &jailpath, freebsd.PATH_MAX);
+
+            freebsd.freebsd_set_jail_id(jid);
+            freebsd.freebsd_set_username(@ptrCast(&username));
+            freebsd.freebsd_set_jail_path(@ptrCast(&jailpath));
+            _ = c.close(pipefd[0]);
+
+            // Register instance
+            var reg = registry.Registry.init(allocator);
+            const jailpath_slice = std.mem.sliceTo(&jailpath, 0);
+            const username_slice = std.mem.sliceTo(&username, 0);
+
+            reg.register(.{
+                .name = allocator.dupe(u8, name) catch name,
+                .pid = pid,
+                .jail_id = jid,
+                .jail_path = allocator.dupe(u8, jailpath_slice) catch jailpath_slice,
+                .username = allocator.dupe(u8, username_slice) catch username_slice,
+                .binary_path = allocator.dupe(u8, target_binary) catch target_binary,
+                .start_time = std.time.timestamp(),
+                .workspace_path = if (capability.workspace_path) |wp| allocator.dupe(u8, wp) catch null else null,
+                .allocator = allocator,
+            }) catch |err| {
+                if (verbose) {
+                    stderr.print("Warning: Failed to register instance: {}\n", .{err}) catch {};
+                }
+            };
+
+            if (verbose) {
+                stdout.print("Instance '{s}' registered.\n", .{name}) catch {};
+            }
+
+            // Wait for child
+            var status: c_int = undefined;
+            _ = c.waitpid(pid, &status, 0);
+
+            if (verbose) {
+                stdout.print("\nChild process exited, performing cleanup...\n", .{}) catch {};
+            }
+
+            // Cleanup using native Zig implementation
+            freebsd.cleanupIsolation();
+
+            // Unregister instance
+            reg.unregister(name);
+
+            if (verbose) {
+                stdout.print("Cleanup complete.\n", .{}) catch {};
+            }
+
+            // Return appropriate exit code
+            if (c.WIFEXITED(status)) {
+                return @intCast(c.WEXITSTATUS(status));
+            } else if (c.WIFSIGNALED(status)) {
+                return @intCast(128 + c.WTERMSIG(status));
+            }
+            return 1;
+        }
+
+        return 0;
+    } else {
+        // Linux and other platforms - not yet implemented in Zig
+        stderr.print("Error: Native Zig isolation not yet implemented for this platform\n", .{}) catch {};
+        stderr.print("Use the C version or wait for Phase 4 (Linux support)\n", .{}) catch {};
+        return 1;
+    }
+}
+
+pub fn main() !u8 {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var parsed = parseArgs(allocator) catch |err| {
+        std.debug.print("Error parsing arguments: {}\n", .{err});
+        printUsage();
+        return 1;
+    };
+    defer parsed.deinit();
+
+    return switch (parsed.command) {
+        .help => {
+            printUsage();
+            return 0;
+        },
+        .version => {
+            printVersion();
+            return 0;
+        },
+        .detect => cmdDetect(allocator, parsed.detect_opts),
+        .run => cmdRun(allocator, parsed.run_opts),
+        .list => cmdList(allocator),
+        .stop => cmdStop(allocator, parsed.stop_opts),
+        .clean => cmdClean(allocator),
+    };
+}
+
+// Export main for use as library entry point
+pub const std_options = std.Options{
+    .log_level = .info,
+};
+
+// Tests
+test "parse args - help" {
+    // Basic test that parsing infrastructure works
+    // Full argument parsing tests would go here
+}
+
+test "version string" {
+    try std.testing.expect(version.len > 0);
+}
