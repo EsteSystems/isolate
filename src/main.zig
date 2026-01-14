@@ -20,6 +20,21 @@ const platform = @import("platform.zig");
 const caps = @import("caps.zig");
 const detect = @import("detect.zig");
 const registry = @import("registry.zig");
+const syscheck = if (builtin.os.tag == .freebsd) @import("syscheck.zig") else struct {
+    pub const SystemCapabilities = struct {
+        racct_enabled: bool,
+        vnet_available: bool,
+        jails_available: bool,
+        is_root: bool,
+        osreldate: u32,
+    };
+    pub fn detect() SystemCapabilities {
+        return .{ .racct_enabled = false, .vnet_available = false, .jails_available = false, .is_root = false, .osreldate = 0 };
+    }
+    pub fn printCheck(_: SystemCapabilities, writer: anytype) !void {
+        try writer.print("System check only available on FreeBSD\n", .{});
+    }
+};
 
 // Platform-specific isolation modules
 const freebsd = if (builtin.os.tag == .freebsd) @import("freebsd.zig") else struct {};
@@ -36,6 +51,7 @@ const Command = enum {
     list,
     stop,
     clean,
+    check,
     help,
     version,
 };
@@ -143,6 +159,8 @@ fn parseArgs(allocator: std.mem.Allocator) !ParsedArgs {
         try parseStopArgs(&result.stop_opts, args[2..]);
     } else if (std.mem.eql(u8, cmd_str, "clean") or std.mem.eql(u8, cmd_str, "cleanup")) {
         result.command = .clean;
+    } else if (std.mem.eql(u8, cmd_str, "check")) {
+        result.command = .check;
     } else if (std.mem.eql(u8, cmd_str, "help")) {
         result.command = .help;
     } else if (std.mem.eql(u8, cmd_str, "version")) {
@@ -260,6 +278,7 @@ fn printUsage() void {
         \\  list     List running isolated instances
         \\  stop     Stop a running instance
         \\  clean    Clean up orphaned instances and data
+        \\  check    Check system capabilities for isolation
         \\
         \\Run 'isolate <command> --help' for command-specific help.
         \\
@@ -673,6 +692,20 @@ fn cmdClean(allocator: std.mem.Allocator) !u8 {
     return 0;
 }
 
+/// Handle 'check' command
+fn cmdCheck() !u8 {
+    const stdout = std.io.getStdOut().writer();
+
+    const sys_caps = syscheck.detect();
+    try syscheck.printCheck(sys_caps, stdout);
+
+    // Return non-zero if critical features are missing
+    if (!sys_caps.jails_available) {
+        return 1;
+    }
+    return 0;
+}
+
 // ============================================================================
 // Isolation Implementation
 // ============================================================================
@@ -877,6 +910,7 @@ pub fn main() !u8 {
         .list => cmdList(allocator),
         .stop => cmdStop(allocator, parsed.stop_opts),
         .clean => cmdClean(allocator),
+        .check => cmdCheck(),
     };
 }
 

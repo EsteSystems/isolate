@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const caps = @import("caps.zig");
+const syscheck = @import("syscheck.zig");
 
 // Only compile on FreeBSD
 comptime {
@@ -448,17 +449,44 @@ pub fn lookupUser(username: []const u8) !struct { uid: u32, gid: u32 } {
 // rctl syscall wrapper - not available in standard headers
 extern fn rctl_add_rule(inbufp: [*]const u8, inbuflen: usize, outbufp: [*]u8, outbuflen: usize) c_int;
 
+// Cached system capabilities (detected once)
+var cached_sys_caps: ?syscheck.SystemCapabilities = null;
+
+fn getSystemCapabilities() syscheck.SystemCapabilities {
+    if (cached_sys_caps) |caps_val| {
+        return caps_val;
+    }
+    cached_sys_caps = syscheck.detect();
+    return cached_sys_caps.?;
+}
+
 pub fn setResourceLimits(jail_name: []const u8, limits: caps.ResourceLimits) void {
     const stdout = std.io.getStdOut().writer();
     var rule_buf: [256]u8 = undefined;
     var out_buf: [256]u8 = undefined;
+
+    // Check if any limits are actually requested
+    const has_limits = limits.memory_bytes != null or
+        limits.max_processes != null or
+        limits.max_files != null;
+
+    if (!has_limits) {
+        return;
+    }
+
+    // Check if racct is enabled
+    const sys_caps = getSystemCapabilities();
+    if (!sys_caps.racct_enabled) {
+        syscheck.warnIfRacctDisabled(sys_caps, stdout) catch {};
+        return;
+    }
 
     if (limits.memory_bytes) |mem| {
         if (std.fmt.bufPrint(&rule_buf, "jail:{s}:memoryuse:deny={d}\x00", .{ jail_name, mem })) |formatted| {
             stdout.print("Setting memory limit: {d} bytes\n", .{mem}) catch {};
             const ret = rctl_add_rule(&rule_buf, formatted.len, &out_buf, out_buf.len);
             if (ret != 0) {
-                stdout.print("Warning: Failed to set memory limit\n", .{}) catch {};
+                stdout.print("Warning: Failed to set memory limit (rctl error)\n", .{}) catch {};
             }
         } else |_| {}
     }
@@ -468,7 +496,7 @@ pub fn setResourceLimits(jail_name: []const u8, limits: caps.ResourceLimits) voi
             stdout.print("Setting process limit: {d}\n", .{procs}) catch {};
             const ret = rctl_add_rule(&rule_buf, formatted.len, &out_buf, out_buf.len);
             if (ret != 0) {
-                stdout.print("Warning: Failed to set process limit\n", .{}) catch {};
+                stdout.print("Warning: Failed to set process limit (rctl error)\n", .{}) catch {};
             }
         } else |_| {}
     }
@@ -478,7 +506,7 @@ pub fn setResourceLimits(jail_name: []const u8, limits: caps.ResourceLimits) voi
             stdout.print("Setting file descriptor limit: {d}\n", .{files}) catch {};
             const ret = rctl_add_rule(&rule_buf, formatted.len, &out_buf, out_buf.len);
             if (ret != 0) {
-                stdout.print("Warning: Failed to set file limit\n", .{}) catch {};
+                stdout.print("Warning: Failed to set file limit (rctl error)\n", .{}) catch {};
             }
         } else |_| {}
     }
