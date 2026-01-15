@@ -133,6 +133,26 @@ pub const ResourceLimits = struct {
     max_cpu_percent: ?u8 = null,
 };
 
+/// Network isolation mode
+pub const NetworkMode = enum {
+    inherit, // Share host network stack (default, current behavior)
+    none, // No network access at all
+    vnet, // VNET jail with isolated network stack
+
+    pub fn fromString(s: []const u8) ?NetworkMode {
+        if (std.mem.eql(u8, s, "inherit")) return .inherit;
+        if (std.mem.eql(u8, s, "none")) return .none;
+        if (std.mem.eql(u8, s, "vnet") or std.mem.startsWith(u8, s, "vnet:")) return .vnet;
+        return null;
+    }
+};
+
+/// Network isolation configuration
+pub const NetworkConfig = struct {
+    mode: NetworkMode = .inherit,
+    interface: ?[]const u8 = null, // Interface name for vnet mode
+};
+
 /// Complete capability specification
 pub const Capabilities = struct {
     allocator: Allocator,
@@ -146,7 +166,10 @@ pub const Capabilities = struct {
     // Workspace
     workspace_path: ?[]const u8 = null,
 
-    // Network access
+    // Network isolation mode
+    network_config: NetworkConfig = .{},
+
+    // Network access rules (for firewall-style rules, separate from isolation mode)
     network_rules: std.ArrayList(NetworkRule),
     network_default_deny: bool,
 
@@ -204,6 +227,11 @@ pub const Capabilities = struct {
             self.allocator.free(wp);
         }
 
+        // Free network interface if allocated
+        if (self.network_config.interface) |iface| {
+            self.allocator.free(iface);
+        }
+
         // Free username if it was allocated (not the default "auto")
         if (!std.mem.eql(u8, self.username, "auto")) {
             self.allocator.free(self.username);
@@ -227,6 +255,13 @@ pub const Capabilities = struct {
         if (self.limits.max_files) |files| {
             try writer.print("  Files: {}\n", .{files});
         }
+
+        // Network isolation mode
+        try writer.print("  Network mode: {s}", .{@tagName(self.network_config.mode)});
+        if (self.network_config.interface) |iface| {
+            try writer.print(" (interface: {s})", .{iface});
+        }
+        try writer.print("\n", .{});
 
         try writer.print("  Network rules: {}\n", .{self.network_rules.items.len});
         for (self.network_rules.items) |rule| {
@@ -554,6 +589,25 @@ pub fn loadFromReader(allocator: Allocator, reader: anytype) ParseError!ParseRes
             caps.fs_default_deny = std.mem.eql(u8, value, "deny");
         } else if (std.mem.eql(u8, key, "env_clear")) {
             caps.env_clear = std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1");
+        } else if (std.mem.eql(u8, key, "network_mode")) {
+            // Parse network isolation mode: inherit, none, or vnet:<interface>
+            if (std.mem.eql(u8, value, "inherit")) {
+                caps.network_config.mode = .inherit;
+            } else if (std.mem.eql(u8, value, "none")) {
+                caps.network_config.mode = .none;
+            } else if (std.mem.startsWith(u8, value, "vnet:")) {
+                caps.network_config.mode = .vnet;
+                const iface = value[5..]; // Skip "vnet:"
+                if (iface.len > 0) {
+                    caps.network_config.interface = try allocator.dupe(u8, iface);
+                }
+            } else if (std.mem.eql(u8, value, "vnet")) {
+                caps.network_config.mode = .vnet;
+                // No interface specified - will need --vnet CLI arg
+            } else {
+                const msg = try std.fmt.allocPrint(allocator, "Invalid network_mode: {s} (use inherit, none, or vnet:<interface>)", .{value});
+                try warnings.append(.{ .line = line_num, .message = msg });
+            }
         } else if (std.mem.eql(u8, key, "workspace")) {
             caps.workspace_path = try allocator.dupe(u8, value);
         } else {

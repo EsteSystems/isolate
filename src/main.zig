@@ -61,6 +61,7 @@ const RunOptions = struct {
     caps_file: ?[]const u8 = null,
     workspace_dir: ?[]const u8 = null,
     name: ?[]const u8 = null,
+    vnet_interface: ?[]const u8 = null,
     verbose: bool = false,
     dry_run: bool = false,
     target_binary: ?[]const u8 = null,
@@ -196,6 +197,10 @@ fn parseRunArgs(opts: *RunOptions, args: []const [:0]u8, allocator: std.mem.Allo
                 i += 1;
                 if (i >= args.len) return error.MissingArgument;
                 opts.name = args[i];
+            } else if (std.mem.eql(u8, arg, "--vnet")) {
+                i += 1;
+                if (i >= args.len) return error.MissingArgument;
+                opts.vnet_interface = args[i];
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
                 opts.verbose = true;
             } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--dry-run")) {
@@ -320,6 +325,7 @@ fn printRunUsage() void {
         \\  -c, --caps <file>      Capability file (default: <binary>.caps)
         \\  -w, --workspace <dir>  Workspace directory (mounted as /workspace)
         \\  -N, --name <name>      Instance name (default: auto-generated)
+        \\  --vnet <interface>     Use VNET jail with specified network interface
         \\  -v, --verbose          Verbose output
         \\  -n, --dry-run          No isolation (dry run)
         \\
@@ -327,6 +333,7 @@ fn printRunUsage() void {
         \\  doas isolate run ./myapp
         \\  doas isolate run -c custom.caps ./myapp arg1 arg2
         \\  doas isolate run -w /data/tenant1 -N tenant1-app ./myapp
+        \\  doas isolate run --vnet epair0b ./myapp
         \\
     , .{}) catch {};
 }
@@ -472,6 +479,15 @@ fn cmdRun(allocator: std.mem.Allocator, opts: RunOptions) !u8 {
             allocator.free(old_wp);
         }
         parse_result.caps.workspace_path = try allocator.dupe(u8, ws);
+    }
+
+    // Set VNET interface if specified via CLI (overrides caps file)
+    if (opts.vnet_interface) |iface| {
+        parse_result.caps.network_config.mode = .vnet;
+        if (parse_result.caps.network_config.interface) |old_iface| {
+            allocator.free(old_iface);
+        }
+        parse_result.caps.network_config.interface = try allocator.dupe(u8, iface);
     }
 
     if (opts.verbose) {

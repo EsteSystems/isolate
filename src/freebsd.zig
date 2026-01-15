@@ -517,7 +517,7 @@ pub fn setResourceLimits(jail_name: []const u8, limits: caps.ResourceLimits) voi
 // ============================================================================
 
 /// Create a FreeBSD jail
-pub fn createJail(jail_name: []const u8, jail_path: []const u8) !i32 {
+pub fn createJail(jail_name: []const u8, jail_path: []const u8, network_config: caps.NetworkConfig) !i32 {
     const stdout = std.io.getStdOut().writer();
 
     var name_buf: [64]u8 = undefined;
@@ -532,38 +532,76 @@ pub fn createJail(jail_name: []const u8, jail_path: []const u8) !i32 {
     @memcpy(path_buf[0..jail_path.len], jail_path);
     path_buf[jail_path.len] = 0;
 
-    // Set up jail parameters
-    var params: [8]c.struct_jailparam = undefined;
+    // Check VNET availability if requested
+    const use_vnet = switch (network_config.mode) {
+        .vnet => blk: {
+            const sys_caps = getSystemCapabilities();
+            if (!sys_caps.vnet_available) {
+                syscheck.warnIfVnetUnavailable(sys_caps, stdout) catch {};
+                break :blk false; // Fall back to inherit
+            }
+            break :blk true;
+        },
+        else => false,
+    };
 
-    _ = c.jailparam_init(&params[0], "name");
-    _ = c.jailparam_import(&params[0], &name_buf);
+    // Set up jail parameters - need more params for VNET
+    var params: [9]c.struct_jailparam = undefined;
+    var param_count: usize = 0;
 
-    _ = c.jailparam_init(&params[1], "path");
-    _ = c.jailparam_import(&params[1], &path_buf);
+    _ = c.jailparam_init(&params[param_count], "name");
+    _ = c.jailparam_import(&params[param_count], &name_buf);
+    param_count += 1;
 
-    _ = c.jailparam_init(&params[2], "persist");
-    _ = c.jailparam_import(&params[2], null);
+    _ = c.jailparam_init(&params[param_count], "path");
+    _ = c.jailparam_import(&params[param_count], &path_buf);
+    param_count += 1;
 
-    _ = c.jailparam_init(&params[3], "allow.raw_sockets");
-    _ = c.jailparam_import(&params[3], "false");
+    _ = c.jailparam_init(&params[param_count], "persist");
+    _ = c.jailparam_import(&params[param_count], null);
+    param_count += 1;
 
-    _ = c.jailparam_init(&params[4], "allow.socket_af");
-    _ = c.jailparam_import(&params[4], "true");
+    _ = c.jailparam_init(&params[param_count], "allow.raw_sockets");
+    _ = c.jailparam_import(&params[param_count], "false");
+    param_count += 1;
 
-    _ = c.jailparam_init(&params[5], "ip4");
-    _ = c.jailparam_import(&params[5], "inherit");
+    _ = c.jailparam_init(&params[param_count], "allow.socket_af");
+    _ = c.jailparam_import(&params[param_count], "true");
+    param_count += 1;
 
-    _ = c.jailparam_init(&params[6], "ip6");
-    _ = c.jailparam_import(&params[6], "inherit");
+    // Network configuration based on mode
+    if (use_vnet) {
+        stdout.print("Creating VNET jail (isolated network stack)\n", .{}) catch {};
+        _ = c.jailparam_init(&params[param_count], "vnet");
+        _ = c.jailparam_import(&params[param_count], "new");
+        param_count += 1;
+    } else if (network_config.mode == .none) {
+        stdout.print("Creating jail with no network access\n", .{}) catch {};
+        _ = c.jailparam_init(&params[param_count], "ip4");
+        _ = c.jailparam_import(&params[param_count], "disable");
+        param_count += 1;
+        _ = c.jailparam_init(&params[param_count], "ip6");
+        _ = c.jailparam_import(&params[param_count], "disable");
+        param_count += 1;
+    } else {
+        // inherit mode (default)
+        _ = c.jailparam_init(&params[param_count], "ip4");
+        _ = c.jailparam_import(&params[param_count], "inherit");
+        param_count += 1;
+        _ = c.jailparam_init(&params[param_count], "ip6");
+        _ = c.jailparam_import(&params[param_count], "inherit");
+        param_count += 1;
+    }
 
-    _ = c.jailparam_init(&params[7], "allow.sysvipc");
-    _ = c.jailparam_import(&params[7], "false");
+    _ = c.jailparam_init(&params[param_count], "allow.sysvipc");
+    _ = c.jailparam_import(&params[param_count], "false");
+    param_count += 1;
 
     stdout.print("Creating jail: {s} at {s}\n", .{ jail_name, jail_path }) catch {};
 
-    const jid = c.jailparam_set(&params, 8, c.JAIL_CREATE);
+    const jid = c.jailparam_set(&params, @intCast(param_count), c.JAIL_CREATE);
 
-    c.jailparam_free(&params, 8);
+    c.jailparam_free(&params, @intCast(param_count));
 
     if (jid < 0) {
         return error.JailCreateFailed;
@@ -572,7 +610,44 @@ pub fn createJail(jail_name: []const u8, jail_path: []const u8) !i32 {
     stdout.print("Created jail {s} with JID {d}\n", .{ jail_name, jid }) catch {};
     jail_state.setJailId(jid);
 
+    // Move interface into jail if VNET mode with interface specified
+    if (use_vnet) {
+        if (network_config.interface) |iface| {
+            stdout.print("Moving interface {s} into jail\n", .{iface}) catch {};
+            moveInterfaceToJail(jid, iface) catch |err| {
+                stdout.print("Warning: Failed to move interface {s} into jail: {}\n", .{ iface, err }) catch {};
+                // Don't fail jail creation, just warn
+            };
+        } else {
+            stdout.print("Note: VNET jail created but no interface specified (use --vnet <interface>)\n", .{}) catch {};
+        }
+    }
+
     return jid;
+}
+
+/// Move a network interface into a jail
+fn moveInterfaceToJail(jid: i32, ifname: []const u8) !void {
+    var ifname_buf: [64]u8 = undefined;
+    var jid_buf: [16]u8 = undefined;
+
+    if (ifname.len >= ifname_buf.len) return error.InvalidPath;
+
+    @memcpy(ifname_buf[0..ifname.len], ifname);
+    ifname_buf[ifname.len] = 0;
+
+    const jid_str = std.fmt.bufPrint(&jid_buf, "{d}", .{jid}) catch return error.InvalidPath;
+    jid_buf[jid_str.len] = 0;
+
+    const argv: [5]?[*:0]const u8 = .{
+        "/sbin/ifconfig",
+        @ptrCast(&ifname_buf),
+        "vnet",
+        @ptrCast(&jid_buf),
+        null,
+    };
+
+    safeExec("/sbin/ifconfig", &argv) catch return error.JailParamFailed;
 }
 
 /// Attach to a jail
@@ -913,7 +988,7 @@ pub fn createIsolation(capability: *const caps.Capabilities, target_binary: []co
     };
 
     // Create jail
-    const jid = createJail(jail_name, jail_path) catch {
+    const jid = createJail(jail_name, jail_path, capability.network_config) catch {
         cleanupIsolation();
         return error.JailCreateFailed;
     };
