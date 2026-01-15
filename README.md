@@ -13,11 +13,13 @@ Traditional containerization requires learning Docker, Kubernetes, registries, o
 ## Features
 
 - **Native OS Isolation**: Uses FreeBSD jails (Linux namespaces planned)
+- **VNET Network Isolation**: Isolated network stacks with user-provided interfaces
 - **Capability Detection**: Automatically analyzes binaries to determine required permissions
 - **Ephemeral Users**: Creates temporary users per instance for privilege separation
 - **Resource Limits**: Memory, process, and file descriptor limits via rctl
 - **Workspace Mounting**: Mount host directories for persistent application data
 - **Instance Management**: Track, list, stop, and clean up running instances
+- **System Capability Check**: Verify kernel features before deployment
 - **Zero Dependencies**: Single static binary, no runtime dependencies
 
 ## Quick Start
@@ -57,7 +59,7 @@ doas ./zig-out/bin/isolate clean
 
 ```sh
 # Clone the repository
-git clone https://github.com/yourusername/isolate.git
+git clone https://github.com/EsteSystems/isolate.git
 cd isolate
 
 # Build (debug)
@@ -112,6 +114,7 @@ Options:
 - `-c, --caps <file>`: Capability file (default: `<binary>.caps`)
 - `-w, --workspace <dir>`: Workspace directory mounted as `/workspace`
 - `-N, --name <name>`: Instance name (default: auto-generated)
+- `--vnet <interface>`: Use VNET isolation with specified interface
 - `-v, --verbose`: Verbose output
 - `-n, --dry-run`: Show configuration without executing
 
@@ -167,6 +170,22 @@ Clean up orphaned instances and jail directories.
 doas isolate clean
 ```
 
+#### `isolate check`
+
+Check system capabilities for isolation features.
+
+```sh
+isolate check
+# Output:
+# System Capabilities Check
+# ========================
+# racct/rctl (resource limits): available
+# VNET/VIMAGE (network isolation): available
+# Jails: available
+# Running as root: yes
+# FreeBSD version: 1500001
+```
+
 ### Capability File Format
 
 Capability files (`.caps`) define the isolation parameters:
@@ -179,7 +198,13 @@ user: auto                    # Create ephemeral user (recommended)
 # Resource limits
 memory: 256M                  # Memory limit (K, M, G suffixes)
 processes: 10                 # Maximum processes
-files: 512                    # File descriptor limit
+files: 512                    # File descriptor limit (minimum 512 for fork)
+
+# Network isolation mode
+network_mode: inherit         # Share host network (default)
+# network_mode: none          # No network access
+# network_mode: vnet:epair0b  # VNET with specified interface
+network_ip: 10.0.99.2/24      # IP to configure on VNET interface
 
 # Filesystem access (path:permissions)
 filesystem: /lib:r            # Read-only access to /lib
@@ -187,7 +212,7 @@ filesystem: /usr/lib:r        # Read-only access to /usr/lib
 filesystem: /tmp:rw           # Read-write access to /tmp
 filesystem: /data:rw          # Application data directory
 
-# Network access (protocol:port:direction)
+# Network access rules (firewall-style, separate from isolation mode)
 network: tcp:8080:inbound     # Listen on TCP port 8080
 network: tcp:443:outbound     # Connect to TCP port 443
 network: udp:53:outbound      # DNS queries
@@ -212,6 +237,55 @@ doas isolate run -w /data/tenant2 -N tenant2-app ./myapp
 ```
 
 Applications should be configured to use `/workspace` for persistent data.
+
+### VNET Network Isolation
+
+VNET provides complete network stack isolation. Each jail gets its own network stack with separate interfaces, routing tables, and firewall rules.
+
+**Setup:**
+```sh
+# Create epair interface pair (host side: epair0a, jail side: epair0b)
+ifconfig epair create
+ifconfig epair0a inet 10.0.99.1/24 up
+```
+
+**Capability file (myapp-vnet.caps):**
+```ini
+user: auto
+memory: 128M
+processes: 20
+files: 1024
+
+network_mode: vnet:epair0b
+network_ip: 10.0.99.2/24
+
+filesystem: /lib:r
+filesystem: /usr/lib:r
+filesystem: /libexec:r
+```
+
+**Run with VNET:**
+```sh
+doas isolate run --caps myapp-vnet.caps -w /data/myapp ./myapp
+
+# Access from host
+curl http://10.0.99.2:8080/
+```
+
+**Multi-tenant with separate networks:**
+```sh
+# Create separate network for each tenant
+ifconfig epair create  # epair0a/epair0b
+ifconfig epair create  # epair1a/epair1b
+ifconfig epair0a inet 10.0.99.1/24 up
+ifconfig epair1a inet 10.0.100.1/24 up
+
+# Run isolated tenants (each with own network)
+doas isolate run --caps tenant1.caps -w /data/tenant1 ./myapp  # 10.0.99.2
+doas isolate run --caps tenant2.caps -w /data/tenant2 ./myapp  # 10.0.100.2
+```
+
+Tenants on different subnets cannot communicate with each other.
 
 ## Examples
 
@@ -279,6 +353,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 | `caps.zig` | Capability file parsing and validation |
 | `detect.zig` | ELF binary analysis for capability detection |
 | `freebsd.zig` | FreeBSD jail implementation |
+| `syscheck.zig` | System capability detection (racct, VNET) |
 | `registry.zig` | Instance tracking and persistence |
 | `platform.zig` | Platform abstraction layer |
 | `c_api.zig` | C library bindings |
@@ -334,12 +409,30 @@ The process exited but cleanup didn't complete. Clean up with:
 doas isolate clean
 ```
 
+### VNET not available
+
+VNET requires VIMAGE support in the kernel:
+```sh
+# Check if VNET is available
+sysctl -n kern.features.vimage
+
+# If not available, rebuild kernel with VIMAGE option
+# or use a kernel that includes VIMAGE support
+```
+
+### Cannot bind to port 80
+
+Ports below 1024 require root privileges. Either:
+- Use a high port (8080, etc.)
+- Add `allow.reserved_ports` to jail parameters (requires code modification)
+
 ## Platform Support
 
 | Platform | Status | Implementation |
 |----------|--------|----------------|
 | FreeBSD 13+ | ✅ Supported | Jails, rctl, nullfs |
-| FreeBSD 14+ | ✅ Supported | Jails, rctl, nullfs |
+| FreeBSD 14+ | ✅ Supported | Jails, rctl, nullfs, VNET |
+| FreeBSD 15+ | ✅ Tested | Jails, rctl, nullfs, VNET |
 | Linux | 🚧 Planned | Namespaces, cgroups, seccomp |
 | macOS | ❌ Not planned | No native isolation primitives |
 | Windows | ❌ Not planned | No native isolation primitives |
@@ -366,7 +459,7 @@ Contributions are welcome! Please read the architecture documentation before sub
 
 BSD 2-Clause License
 
-Copyright (c) 2024, isolate contributors
+Copyright (c) 2025-2026, Este Systems
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
