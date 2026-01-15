@@ -87,6 +87,13 @@ pub const Registry = struct {
 
         var writer = file.writer();
 
+        // Format workspace_path to a stack buffer to avoid memory leak
+        var ws_buf: [512]u8 = undefined;
+        const ws_str: []const u8 = if (instance.workspace_path) |wp|
+            std.fmt.bufPrint(&ws_buf, "\"{s}\"", .{wp}) catch "null"
+        else
+            "null";
+
         try writer.print(
             \\{{
             \\  "name": "{s}",
@@ -106,7 +113,7 @@ pub const Registry = struct {
             instance.username,
             instance.binary_path,
             instance.start_time,
-            if (instance.workspace_path) |wp| try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{wp}) else "null",
+            ws_str,
         });
     }
 

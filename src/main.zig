@@ -91,6 +91,10 @@ const ParsedArgs = struct {
     _allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ParsedArgs) void {
+        // Free binary_args if it was allocated
+        if (self.run_opts.binary_args.len > 0) {
+            self._allocator.free(self.run_opts.binary_args);
+        }
         std.process.argsFree(self._allocator, self._args);
     }
 };
@@ -805,6 +809,15 @@ fn runIsolation(allocator: std.mem.Allocator, capability: *const caps.Capabiliti
             else
                 target_binary;
 
+            // Build the path inside the jail - binary is copied to jail root
+            var exec_path_buf: [256]u8 = undefined;
+            const exec_path = std.fmt.bufPrint(&exec_path_buf, "/{s}", .{binary_name}) catch {
+                stderr.print("Binary name too long\n", .{}) catch {};
+                c._exit(1);
+                unreachable;
+            };
+            exec_path_buf[exec_path.len] = 0; // Null terminate
+
             // Build argv for execv
             var argv_buf: [64]?[*:0]const u8 = [_]?[*:0]const u8{null} ** 64;
             argv_buf[0] = @ptrCast(binary_name.ptr);
@@ -816,7 +829,7 @@ fn runIsolation(allocator: std.mem.Allocator, capability: *const caps.Capabiliti
                 argc += 1;
             }
 
-            _ = c.execv(@ptrCast(binary_name.ptr), @ptrCast(&argv_buf));
+            _ = c.execv(@ptrCast(&exec_path_buf), @ptrCast(&argv_buf));
 
             // If we get here, execv failed
             stderr.print("Failed to execute {s}\n", .{target_binary}) catch {};

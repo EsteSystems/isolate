@@ -151,6 +151,7 @@ pub const NetworkMode = enum {
 pub const NetworkConfig = struct {
     mode: NetworkMode = .inherit,
     interface: ?[]const u8 = null, // Interface name for vnet mode
+    ip_address: ?[]const u8 = null, // IP address to configure on interface (e.g., "10.0.99.2/24")
 };
 
 /// Complete capability specification
@@ -230,6 +231,11 @@ pub const Capabilities = struct {
         // Free network interface if allocated
         if (self.network_config.interface) |iface| {
             self.allocator.free(iface);
+        }
+
+        // Free network IP if allocated
+        if (self.network_config.ip_address) |ip| {
+            self.allocator.free(ip);
         }
 
         // Free username if it was allocated (not the default "auto")
@@ -608,6 +614,9 @@ pub fn loadFromReader(allocator: Allocator, reader: anytype) ParseError!ParseRes
                 const msg = try std.fmt.allocPrint(allocator, "Invalid network_mode: {s} (use inherit, none, or vnet:<interface>)", .{value});
                 try warnings.append(.{ .line = line_num, .message = msg });
             }
+        } else if (std.mem.eql(u8, key, "network_ip")) {
+            // IP address to configure on VNET interface (e.g., "10.0.99.2/24")
+            caps.network_config.ip_address = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "workspace")) {
             caps.workspace_path = try allocator.dupe(u8, value);
         } else {

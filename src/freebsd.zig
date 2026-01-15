@@ -618,6 +618,16 @@ pub fn createJail(jail_name: []const u8, jail_path: []const u8, network_config: 
                 stdout.print("Warning: Failed to move interface {s} into jail: {}\n", .{ iface, err }) catch {};
                 // Don't fail jail creation, just warn
             };
+
+            // Configure IP address if specified
+            if (network_config.ip_address) |ip| {
+                stdout.print("Configuring IP address {s} on {s}\n", .{ ip, iface }) catch {};
+                configureJailInterface(jid, iface, ip) catch |err| {
+                    stdout.print("Warning: Failed to configure IP {s}: {}\n", .{ ip, err }) catch {};
+                };
+                // Also configure loopback
+                configureJailInterface(jid, "lo0", "127.0.0.1/8") catch {};
+            }
         } else {
             stdout.print("Note: VNET jail created but no interface specified (use --vnet <interface>)\n", .{}) catch {};
         }
@@ -648,6 +658,39 @@ fn moveInterfaceToJail(jid: i32, ifname: []const u8) !void {
     };
 
     safeExec("/sbin/ifconfig", &argv) catch return error.JailParamFailed;
+}
+
+/// Configure an interface inside a jail using jexec
+fn configureJailInterface(jid: i32, ifname: []const u8, ip: []const u8) !void {
+    var jid_buf: [16]u8 = undefined;
+    var ifname_buf: [64]u8 = undefined;
+    var ip_buf: [64]u8 = undefined;
+
+    if (ifname.len >= ifname_buf.len or ip.len >= ip_buf.len) return error.InvalidPath;
+
+    const jid_str = std.fmt.bufPrint(&jid_buf, "{d}", .{jid}) catch return error.InvalidPath;
+    jid_buf[jid_str.len] = 0;
+
+    @memcpy(ifname_buf[0..ifname.len], ifname);
+    ifname_buf[ifname.len] = 0;
+
+    @memcpy(ip_buf[0..ip.len], ip);
+    ip_buf[ip.len] = 0;
+
+    // Use jexec to run ifconfig inside the jail
+    // jexec <jid> /sbin/ifconfig <ifname> inet <ip> up
+    const argv: [8]?[*:0]const u8 = .{
+        "/usr/sbin/jexec",
+        @ptrCast(&jid_buf),
+        "/sbin/ifconfig",
+        @ptrCast(&ifname_buf),
+        "inet",
+        @ptrCast(&ip_buf),
+        "up",
+        null,
+    };
+
+    safeExec("/usr/sbin/jexec", &argv) catch return error.JailParamFailed;
 }
 
 /// Attach to a jail
