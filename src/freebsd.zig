@@ -73,6 +73,7 @@ var jail_state = struct {
     jail_id: i32 = -1,
     ephemeral_username: [64]u8 = [_]u8{0} ** 64,
     jail_root_path: [PATH_MAX]u8 = [_]u8{0} ** PATH_MAX,
+    instance_tmp_path: [PATH_MAX]u8 = [_]u8{0} ** PATH_MAX,
 
     pub fn setJailId(self: *@This(), jid: i32) void {
         self.jail_id = jid;
@@ -90,6 +91,12 @@ var jail_state = struct {
         self.jail_root_path[len] = 0;
     }
 
+    pub fn setInstanceTmpPath(self: *@This(), path: []const u8) void {
+        const len = @min(path.len, self.instance_tmp_path.len - 1);
+        @memcpy(self.instance_tmp_path[0..len], path[0..len]);
+        self.instance_tmp_path[len] = 0;
+    }
+
     pub fn getUsername(self: *const @This()) []const u8 {
         const len = std.mem.indexOfScalar(u8, &self.ephemeral_username, 0) orelse self.ephemeral_username.len;
         return self.ephemeral_username[0..len];
@@ -98,6 +105,11 @@ var jail_state = struct {
     pub fn getJailPath(self: *const @This()) []const u8 {
         const len = std.mem.indexOfScalar(u8, &self.jail_root_path, 0) orelse self.jail_root_path.len;
         return self.jail_root_path[0..len];
+    }
+
+    pub fn getInstanceTmpPath(self: *const @This()) []const u8 {
+        const len = std.mem.indexOfScalar(u8, &self.instance_tmp_path, 0) orelse self.instance_tmp_path.len;
+        return self.instance_tmp_path[0..len];
     }
 }{};
 
@@ -890,6 +902,41 @@ pub fn setupFilesystemIsolation(
     stdout.print("Processing capability filesystem rules...\n", .{}) catch {};
     for (capability.file_rules.items) |rule| {
         if (rule.permissions.read) {
+            // Security: Intercept /tmp mounts to use instance-specific directory
+            // This prevents cross-instance information leakage
+            if (std.mem.eql(u8, rule.path, "/tmp")) {
+                // Create instance-specific tmp directory on host
+                var instance_tmp_buf: [PATH_MAX]u8 = undefined;
+                const instance_tmp = std.fmt.bufPrint(&instance_tmp_buf, "/tmp{s}", .{jail_path}) catch continue;
+
+                stdout.print("Creating isolated tmp: {s}\n", .{instance_tmp}) catch {};
+                mkdirp(instance_tmp) catch {
+                    stdout.print("Warning: Failed to create instance tmp directory\n", .{}) catch {};
+                    continue;
+                };
+
+                // Set permissions on instance tmp (sticky bit + world writable)
+                {
+                    var tmp_buf: [PATH_MAX]u8 = undefined;
+                    @memcpy(tmp_buf[0..instance_tmp.len], instance_tmp);
+                    tmp_buf[instance_tmp.len] = 0;
+                    _ = c.chmod(&tmp_buf, 0o1777);
+                }
+
+                // Store path for cleanup
+                jail_state.setInstanceTmpPath(instance_tmp);
+
+                // Mount instance-specific tmp as /tmp in jail
+                const mount_path = std.fmt.bufPrint(&path_buf, "{s}/tmp", .{jail_path}) catch continue;
+                mkdirp(mount_path) catch continue;
+
+                stdout.print("Mounting {s} -> {s} (rw, isolated)\n", .{ instance_tmp, mount_path }) catch {};
+                mountNullfs(instance_tmp, mount_path, false) catch {
+                    stdout.print("Warning: Failed to mount isolated tmp\n", .{}) catch {};
+                };
+                continue;
+            }
+
             // Check if source path exists and is a directory
             var src_buf: [PATH_MAX]u8 = undefined;
             @memcpy(src_buf[0..rule.path.len], rule.path);
@@ -949,7 +996,7 @@ pub fn cleanupIsolation() void {
 
         // Unmount filesystems (best effort)
         const mount_points = [_][]const u8{
-            "/workspace", "/dev", "/bin", "/lib",
+            "/tmp", "/workspace", "/dev", "/bin", "/lib",
             "/libexec", "/usr/lib", "/usr/local/lib",
         };
 
@@ -963,6 +1010,14 @@ pub fn cleanupIsolation() void {
         rmrf(jail_path) catch {};
 
         jail_state.jail_root_path[0] = 0;
+    }
+
+    // Cleanup instance-specific tmp directory
+    const instance_tmp = jail_state.getInstanceTmpPath();
+    if (instance_tmp.len > 0) {
+        stdout.print("Cleaning up instance tmp: {s}\n", .{instance_tmp}) catch {};
+        rmrf(instance_tmp) catch {};
+        jail_state.instance_tmp_path[0] = 0;
     }
 
     // Cleanup ephemeral user
@@ -1128,8 +1183,12 @@ test "jail_state management" {
     jail_state.setJailPath("/tmp/test-jail");
     try std.testing.expectEqualStrings("/tmp/test-jail", jail_state.getJailPath());
 
+    jail_state.setInstanceTmpPath("/tmp/isolate-test-tmp");
+    try std.testing.expectEqualStrings("/tmp/isolate-test-tmp", jail_state.getInstanceTmpPath());
+
     // Reset
     jail_state.jail_id = -1;
     jail_state.ephemeral_username = [_]u8{0} ** 64;
     jail_state.jail_root_path = [_]u8{0} ** PATH_MAX;
+    jail_state.instance_tmp_path = [_]u8{0} ** PATH_MAX;
 }

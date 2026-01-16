@@ -742,18 +742,44 @@ fn runIsolation(allocator: std.mem.Allocator, capability: *const caps.Capabiliti
         const name = if (instance_name) |n|
             n
         else blk: {
-            // Extract binary basename
-            const basename = if (std.mem.lastIndexOf(u8, target_binary, "/")) |idx|
-                target_binary[idx + 1 ..]
-            else
-                target_binary;
+            // Try to derive a meaningful name:
+            // 1. Use workspace directory name if available
+            // 2. Otherwise use binary basename with common extensions stripped
+            var process_name: []const u8 = undefined;
+
+            if (capability.workspace_path) |ws_path| {
+                // Extract last component of workspace path
+                const trimmed = std.mem.trimRight(u8, ws_path, "/");
+                process_name = if (std.mem.lastIndexOf(u8, trimmed, "/")) |idx|
+                    trimmed[idx + 1 ..]
+                else
+                    trimmed;
+            } else {
+                // Extract binary basename and strip common extensions
+                const basename = if (std.mem.lastIndexOf(u8, target_binary, "/")) |idx|
+                    target_binary[idx + 1 ..]
+                else
+                    target_binary;
+
+                // Strip common script extensions for cleaner names
+                process_name = if (std.mem.endsWith(u8, basename, ".sh"))
+                    basename[0 .. basename.len - 3]
+                else if (std.mem.endsWith(u8, basename, ".py"))
+                    basename[0 .. basename.len - 3]
+                else if (std.mem.endsWith(u8, basename, ".rb"))
+                    basename[0 .. basename.len - 3]
+                else if (std.mem.endsWith(u8, basename, ".pl"))
+                    basename[0 .. basename.len - 3]
+                else
+                    basename;
+            }
 
             // Generate random suffix
             var random_bytes: [4]u8 = undefined;
             std.crypto.random.bytes(&random_bytes);
             const suffix = std.fmt.bytesToHex(random_bytes, .lower);
 
-            const formatted = std.fmt.bufPrint(&name_buf, "{s}-{s}", .{ basename, suffix }) catch "isolate-instance";
+            const formatted = std.fmt.bufPrint(&name_buf, "{s}-{s}", .{ process_name, suffix }) catch "isolate-instance";
             break :blk formatted;
         };
 
