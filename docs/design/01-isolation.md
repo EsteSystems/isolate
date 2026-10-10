@@ -15,7 +15,7 @@ Contain an untrusted program: it runs in a jail whose filesystem isolate built f
 
 - **Kernel vulnerabilities and side channels.** isolate relies on the jail boundary being sound.
 - **System-call filtering.** No Capsicum, no MAC policy.
-- **Hiding part of a mounted directory.** A rule for `/usr/lib` exposes all of `/usr/lib`. To expose less, name a single file or a deeper directory.
+- **Hiding part of a mounted directory.** A rule for `/usr/lib` exposes all of `/usr/lib`. To expose less, name single files, which is what `isolate detect` does for libraries.
 - **Controlling execution per rule.** A rule is read-only or read-write. Whether a file under it can be executed is not something a rule decides.
 - **Protecting the program from the host.** Root on the host can do anything to the jail.
 - **Network access** is covered in [05-network.md](05-network.md); **resource limits** in [04-resource-limits.md](04-resource-limits.md).
@@ -26,7 +26,7 @@ Contain an untrusted program: it runs in a jail whose filesystem isolate built f
 /var/run/isolate/                    root-owned, 0755
 └── inst-XXXXXX/                     per run, from mkdtemp(3), 0755
     ├── root/                        the jail's root filesystem
-    │   ├── <binary>                 copy of the program, 0755
+    │   ├── <program's own path>     the program, a read-only nullfs mount of its file
     │   ├── etc/                     user database: root and the program's user only
     │   ├── dev/                     devfs, reduced to a few nodes
     │   ├── tmp/                     1777; the instance tmp if a /tmp rule exists
@@ -73,6 +73,7 @@ The jail's `/etc` holds `master.passwd`, `passwd`, `pwd.db`, `spwd.db` and `grou
 | ISO-11 | If something the capability file asks for cannot be set up, the run does not start, and nothing is left behind. | Holds (tested) for a rule whose path does not exist. A failed devfs mount, devfs restriction or any other mount takes the same path (by inspection). Related: LIM-5, NET-5. |
 | ISO-12 | Inside the jail the program cannot create raw sockets, create jails or mount filesystems. It cannot use System V IPC unless the capability file sets `sysv_ipc: true`; then the jail has a System V namespace of its own, never the host's, and the kernel destroys it with the jail. | System V IPC: holds (tested): `shmget` fails by default, works when granted, and a segment the program leaves behind is gone after the run. The rest by inspection. |
 | ISO-13 | The program receives exactly the arguments given after the binary on the command line. | Holds (tested) with 200 arguments, and with arguments that look like isolate's own options. |
+| ISO-15 | The program runs from the absolute path it has on the host, and cannot modify its own file. | Holds (tested): `argv[0]` is the host path, also when the program was named by a relative path; a world-writable script cannot overwrite itself. |
 | ISO-14 | The program can look up its own user and group by id and by name. The jail's user database names no other user of the host and holds no password hash, and the program cannot read `master.passwd` or `spwd.db`. | Holds (tested), for `user: auto` and for an existing user. |
 
 ## Default behaviour that is not an invariant
@@ -111,5 +112,6 @@ Any one of these means isolation is broken:
 ## Known gaps
 
 - No test checks that two instances running at the same time cannot see each other's `/tmp`. Each has its own directory by construction.
-- The copy of the binary in the jail root is owned by root and mode 0755; a program that expects to rewrite itself cannot.
+- The program's file keeps the owner and mode it has on the host. A file the jail's user may not execute fails at `execv` with "Permission denied"; isolate does not widen its permissions.
+- The directories leading to the program are created in the jail, so the names in its path are visible there.
 - Restricting `/dev` runs `devfs(8)` once per visible node, which adds a dozen short-lived processes to every start.

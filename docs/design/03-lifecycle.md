@@ -26,9 +26,9 @@ Child, in order:
 
 1. Create the ephemeral user (`user: auto`) or look up the named one.
 2. Create the instance directory and the jail root.
-3. Build the jail's filesystem: directories, workspace mount, copy of the binary, `passwd` and `group`, devfs, one mount per rule.
+3. Build the jail's filesystem: directories, workspace mount, user database, devfs, one mount per rule, and the program at its own path.
 4. Create the jail. In VNET mode, move the interface in and configure it.
-5. Add resource limits.
+5. Add resource limits, and load network rules into pf.
 6. Attach to the jail, drop to the user, set the environment.
 7. Send the jail id, username and jail path to the parent over a pipe.
 8. Close every descriptor above 2 and `execv` the program.
@@ -40,7 +40,7 @@ Parent:
 1. Install handlers for `SIGINT`, `SIGTERM` and `SIGHUP`.
 2. Read the child's state from the pipe and write the registry entry. If the entry cannot be written, stop the program.
 3. Wait for the child.
-4. Return a VNET jail's interface to the host, remove the jail, unmount everything under the instance directory, remove the directory, delete the ephemeral user, remove the jail's resource limits.
+4. Return a VNET jail's interface to the host, remove the jail, unmount everything under the instance directory, remove the directory, delete the ephemeral user, remove the jail's resource limits and its pf rules.
 5. Delete the registry entry and exit with the child's status.
 
 ## The registry
@@ -80,7 +80,7 @@ An instance is **running** if its jail exists or its `pid` exists, **orphaned** 
 
 1. For every registered instance whose manager is gone: remove its jail, limits, instance directory and ephemeral user, and delete the entry.
 2. Remove every jail named `isolate-<pid>` that no registered instance owns, unless process `<pid>` still has a living parent other than init.
-3. Remove resource limits belonging to `isolate-*` jails that no longer exist.
+3. Remove resource limits and pf anchors belonging to `isolate-*` jails that no longer exist.
 4. Remove every `inst-*` directory that no jail has its root in and that was last modified more than 60 seconds ago.
 5. Delete every user named `app-<pid>` that carries isolate's comment, unless a registered instance uses it, process `<pid>` exists, or jail `isolate-<pid>` exists.
 
@@ -92,7 +92,7 @@ Steps 2 to 5 are what make `clean` work with an empty registry, which is the sit
 
 | ID | Invariant | Status |
 |---|---|---|
-| LIF-1 | When `isolate run` returns, nothing of the instance remains: no jail, mount, instance directory, ephemeral user, resource limit or registry entry. This holds when the program exits, is killed, or isolate receives `SIGINT`, `SIGTERM` or `SIGHUP`. | Holds (tested) for normal exit, a killed program, a failed setup, two `SIGTERM`s, `stop -f` and a VNET run. `SIGINT` and `SIGHUP` by inspection. |
+| LIF-1 | When `isolate run` returns, nothing of the instance remains: no jail, mount, instance directory, ephemeral user, resource limit, pf rule or registry entry. This holds when the program exits, is killed, or isolate receives `SIGINT`, `SIGTERM` or `SIGHUP`. | Holds (tested) for normal exit, a killed program, a failed setup, two `SIGTERM`s, `stop -f` and a VNET run. `SIGINT` and `SIGHUP` by inspection. |
 | LIF-2 | Whatever an `isolate run` leaves when it cannot clean up (it was killed with `SIGKILL`, or the host crashed or rebooted) is removed by one `isolate clean`, with or without a registry entry. | Holds (tested): a registered orphan is removed completely; so are a jail, a user and a directory that have no registry entry. A managed instance is left running. |
 | LIF-3 | Cleanup never deletes or changes host data outside the instance directory. Mounts are removed before the directory tree, and removal never crosses a mount point. | Holds (tested): a workspace and an extra read-write rule keep their files. |
 | LIF-4 | `stop` and `clean` act only on things isolate created: a directory of the form `/var/run/isolate/inst-XXXXXX`, a user named `app-<digits>` with isolate's comment, and a jail named `isolate-<pid>`. | Holds (tested; unit tests): a jail and a user that merely look similar are left alone. |
