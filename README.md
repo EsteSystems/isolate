@@ -51,7 +51,7 @@ doas ./zig-out/bin/isolate clean
 
 ### Requirements
 
-- Zig 0.13.0 or later
+- Zig 0.16.0 (pinned in `build.zig.zon`)
 - FreeBSD 13.0 or later (for jail support)
 - Root privileges for isolation (detection works without root)
 

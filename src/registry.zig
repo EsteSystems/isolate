@@ -6,6 +6,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+
+// kill(2) with signal 0 is used to probe whether a PID exists
+extern "c" fn kill(pid: std.c.pid_t, sig: c_int) c_int;
 
 /// Registry directory path
 pub const REGISTRY_DIR = "/var/run/isolate";
@@ -44,19 +48,21 @@ pub const Instance = struct {
 
 /// Registry for managing instances
 pub const Registry = struct {
+    io: Io,
     allocator: Allocator,
     registry_dir: []const u8,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator) Self {
+    pub fn init(io: Io, allocator: Allocator) Self {
         // Try primary directory first, fall back to /tmp
-        const dir = if (std.fs.accessAbsolute(REGISTRY_DIR, .{})) |_|
+        const dir = if (Io.Dir.accessAbsolute(io, REGISTRY_DIR, .{})) |_|
             REGISTRY_DIR
         else |_|
             REGISTRY_DIR_FALLBACK;
 
         return .{
+            .io = io,
             .allocator = allocator,
             .registry_dir = dir,
         };
@@ -64,11 +70,11 @@ pub const Registry = struct {
 
     /// Ensure registry directory exists
     pub fn ensureDir(self: *Self) !void {
-        std.fs.makeDirAbsolute(self.registry_dir) catch |err| {
+        Io.Dir.createDirAbsolute(self.io, self.registry_dir, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) {
                 // Try fallback
                 self.registry_dir = REGISTRY_DIR_FALLBACK;
-                std.fs.makeDirAbsolute(self.registry_dir) catch |err2| {
+                Io.Dir.createDirAbsolute(self.io, self.registry_dir, .default_dir) catch |err2| {
                     if (err2 != error.PathAlreadyExists) return err2;
                 };
             }
@@ -79,13 +85,15 @@ pub const Registry = struct {
     pub fn register(self: *Self, instance: Instance) !void {
         try self.ensureDir();
 
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ self.registry_dir, instance.name });
 
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
+        const file = try Io.Dir.createFileAbsolute(self.io, path, .{});
+        defer file.close(self.io);
 
-        var writer = file.writer();
+        var write_buf: [1024]u8 = undefined;
+        var file_writer = file.writer(self.io, &write_buf);
+        const writer = &file_writer.interface;
 
         // Format workspace_path to a stack buffer to avoid memory leak
         var ws_buf: [512]u8 = undefined;
@@ -115,32 +123,34 @@ pub const Registry = struct {
             instance.start_time,
             ws_str,
         });
+
+        try writer.flush();
     }
 
     /// Unregister an instance
     pub fn unregister(self: *Self, name: []const u8) void {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ self.registry_dir, name }) catch return;
-        std.fs.deleteFileAbsolute(path) catch {};
+        Io.Dir.deleteFileAbsolute(self.io, path) catch {};
     }
 
-    /// List all registered instances
+    /// List all registered instances. Caller owns the list and its entries.
     pub fn list(self: *Self) !std.ArrayList(InstanceInfo) {
-        var instances = std.ArrayList(InstanceInfo).init(self.allocator);
+        var instances: std.ArrayList(InstanceInfo) = .empty;
 
-        var dir = std.fs.openDirAbsolute(self.registry_dir, .{ .iterate = true }) catch |err| {
+        var dir = Io.Dir.openDirAbsolute(self.io, self.registry_dir, .{ .iterate = true }) catch |err| {
             if (err == error.FileNotFound) return instances;
             return err;
         };
-        defer dir.close();
+        defer dir.close(self.io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
             if (self.loadInstance(entry.name)) |info| {
-                try instances.append(info);
+                try instances.append(self.allocator, info);
             } else |_| {}
         }
 
@@ -166,20 +176,23 @@ pub const Registry = struct {
 
     /// Load instance info from file
     fn loadInstance(self: *Self, filename: []const u8) !InstanceInfo {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.registry_dir, filename });
 
-        const file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
+        const file = try Io.Dir.openFileAbsolute(self.io, path, .{});
+        defer file.close(self.io);
 
-        const content = try file.readToEndAlloc(self.allocator, 4096);
+        var file_reader = file.reader(self.io, &.{});
+        const content = try file_reader.interface.allocRemaining(self.allocator, .limited(4096));
         defer self.allocator.free(content);
 
         // Simple JSON parsing (just extract the fields we need)
         const name = try extractJsonString(self.allocator, content, "name");
+        errdefer self.allocator.free(name);
         const pid = try extractJsonInt(content, "pid");
         const jail_id = try extractJsonInt(content, "jail_id");
         const binary_path = try extractJsonString(self.allocator, content, "binary_path");
+        errdefer self.allocator.free(binary_path);
         const start_time = try extractJsonInt(content, "start_time");
 
         // Check if process is still running
@@ -211,7 +224,7 @@ pub const Registry = struct {
             for (instances.items) |*inst| {
                 inst.deinit();
             }
-            instances.deinit();
+            instances.deinit(self.allocator);
         }
 
         for (instances.items) |inst| {
@@ -243,7 +256,7 @@ fn checkProcessState(pid: i64, jail_id: i64) InstanceState {
         }
 
         // Check if PID exists
-        const kill_result = std.c.kill(@intCast(pid), 0);
+        const kill_result = kill(@intCast(pid), 0);
         if (kill_result == 0) {
             return .running;
         } else if (std.c._errno().* == @intFromEnum(std.c.E.SRCH)) {
@@ -253,7 +266,7 @@ fn checkProcessState(pid: i64, jail_id: i64) InstanceState {
         return .stopped;
     } else {
         // For other platforms, just check PID
-        const kill_result = std.c.kill(@intCast(pid), 0);
+        const kill_result = kill(@intCast(pid), 0);
         if (kill_result == 0) {
             return .running;
         }
@@ -266,9 +279,9 @@ fn extractJsonString(allocator: Allocator, json: []const u8, key: []const u8) ![
     var search_buf: [64]u8 = undefined;
     const search = try std.fmt.bufPrint(&search_buf, "\"{s}\": \"", .{key});
 
-    const start_idx = std.mem.indexOf(u8, json, search) orelse return error.KeyNotFound;
+    const start_idx = std.mem.find(u8, json, search) orelse return error.KeyNotFound;
     const value_start = start_idx + search.len;
-    const value_end = std.mem.indexOfPos(u8, json, value_start, "\"") orelse return error.InvalidJson;
+    const value_end = std.mem.findPos(u8, json, value_start, "\"") orelse return error.InvalidJson;
 
     return allocator.dupe(u8, json[value_start..value_end]);
 }
@@ -278,7 +291,7 @@ fn extractJsonInt(json: []const u8, key: []const u8) !i64 {
     var search_buf: [64]u8 = undefined;
     const search = try std.fmt.bufPrint(&search_buf, "\"{s}\": ", .{key});
 
-    const start_idx = std.mem.indexOf(u8, json, search) orelse return error.KeyNotFound;
+    const start_idx = std.mem.find(u8, json, search) orelse return error.KeyNotFound;
     const value_start = start_idx + search.len;
 
     // Find end of number
@@ -321,6 +334,6 @@ test "extractJsonInt" {
 
 test "Registry init" {
     const allocator = std.testing.allocator;
-    const registry = Registry.init(allocator);
+    const registry = Registry.init(std.testing.io, allocator);
     try std.testing.expect(registry.registry_dir.len > 0);
 }
