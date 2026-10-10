@@ -22,7 +22,7 @@ Traditional containerization requires learning Docker, Kubernetes, registries, o
 - **System Capability Check**: Verify kernel features before deployment
 - **No Daemon, No Images**: One executable that uses only the FreeBSD base system (`libjail`, `pw`, `ifconfig`)
 
-Not everything in the capability file is enforced yet. `network:` rules in particular are parsed but not applied. The [design documents](docs/design/README.md) list what is guaranteed, what is out of scope, and every known gap.
+One thing in the capability file is not enforced yet: `network:` rules are parsed but not applied, and every run says so. The [design documents](docs/design/README.md) list what is guaranteed, what is out of scope, and every known gap.
 
 ## Quick Start
 
@@ -200,7 +200,9 @@ isolate check
 
 ### Capability File Format
 
-Capability files (`.caps`) define the isolation parameters. The full specification, including keys that are accepted but not yet applied, is in [docs/design/02-capability-file.md](docs/design/02-capability-file.md).
+Capability files (`.caps`) define the isolation parameters. The full specification is in [docs/design/02-capability-file.md](docs/design/02-capability-file.md).
+
+A file is either applied in full or refused: an unknown key, an invalid value, or a rule for a path that does not exist stops the run with the file name, line and reason.
 
 ```ini
 # User context
@@ -225,7 +227,9 @@ filesystem: /lib:r            # Read-only access to /lib
 filesystem: /usr/lib:r        # Read-only access to /usr/lib
 filesystem: /tmp:rw           # Read-write access to /tmp
 filesystem: /data:rw          # Application data directory
-# Rules name directories. A rule for a single file is not applied.
+filesystem: /etc/resolv.conf:r # A single file
+# A rule names a directory or a file that exists on the host. It is
+# read-only (:r, the default) or read-write (:rw); nothing else.
 
 # Network access rules - parsed and listed, but NOT enforced (there is no
 # firewall integration yet). Use network_mode to control network access.
@@ -389,7 +393,13 @@ zig build examples
 doas ./zig-out/bin/isolate run ./zig-out/examples/hello
 ```
 
-The unit tests cover parsing and validation. Nothing in the test suite creates a jail; behaviour that needs root has been checked by hand on FreeBSD 15.1.
+The unit tests cover parsing and validation and create no jails. The end-to-end scenarios do, so they need FreeBSD and root:
+
+```sh
+zig build && doas sh tests/scenarios.sh
+```
+
+They create real jails, users, mounts, limits and a network interface, check about 70 behaviours against the [design documents](docs/design/README.md), and verify at the end that nothing was left behind.
 
 ## Troubleshooting
 
@@ -400,9 +410,9 @@ Jail creation requires root. Use `doas` or `sudo`:
 doas isolate run ./myapp
 ```
 
-### "Failed to set memory limit"
+### "Resource limits requested but racct is not enabled"
 
-Resource limits require `rctl` to be enabled in the kernel:
+A capability file with limits is refused on a kernel without them. Resource limits require `rctl` to be enabled in the kernel:
 ```sh
 # Check if rctl is available
 sysctl kern.racct.enable
@@ -428,9 +438,9 @@ The program is gone but its `isolate run` process did not clean up (it was kille
 doas isolate clean
 ```
 
-### VNET not available
+### "VNET requested but VIMAGE is not available"
 
-VNET requires VIMAGE support in the kernel:
+A capability file asking for `network_mode: vnet` is refused on a kernel without it; isolate does not fall back to the host's network. VNET requires VIMAGE support in the kernel:
 ```sh
 # Check if VNET is available
 sysctl -n kern.features.vimage
@@ -467,8 +477,8 @@ Contributions are welcome! Please read the architecture and design documents bef
 
 - **Review capability files**: Auto-detection is heuristic; always review generated `.caps` files
 - **Network rules are not enforced**: only `network_mode` restricts network access. The default, `inherit`, gives the program the host's network
-- **Capability-file mistakes are quiet**: a misspelled key is reported only with `-v` and does not stop the run. Check with `isolate run -n -v` before relying on a file
-- **Known gaps**: the [design documents](docs/design/README.md) list every invariant that does not hold yet
+- **Check a file before relying on it**: `isolate run -n -v <binary>` prints the settings a run would use
+- **Known gaps**: each [design document](docs/design/README.md) ends with what is not covered
 - **Ephemeral users**: Use `user: auto` for privilege separation
 - **Minimal permissions**: Only grant necessary filesystem and network access
 - **Resource limits**: Set appropriate limits to prevent resource exhaustion

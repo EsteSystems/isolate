@@ -484,27 +484,34 @@ fn cmdRun(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions) !u8 {
     if (caps.load(io, allocator, caps_file)) |result| {
         parse_result = result;
     } else |err| {
-        if (err == caps.ParseError.FileNotFound) {
-            try stderr.print("Warning: No capability file at {s}\n", .{caps_file});
-        } else {
-            try stderr.print("Warning: Could not load capabilities from {s}: {}\n", .{ caps_file, err });
+        // Only a file that does not exist falls back to the defaults. One
+        // that exists but cannot be read or parsed stops the run: its
+        // author meant something, and the defaults are not it.
+        if (err != caps.ParseError.FileNotFound) {
+            try stderr.print("Error: Could not read capability file {s}: {}\n", .{ caps_file, err });
+            return 1;
         }
+        try stderr.print("Warning: No capability file at {s}\n", .{caps_file});
         try stderr.print("Running with default capabilities: ephemeral user, inherited network, no filesystem rules.\n", .{});
         try stderr.print("Nothing (not even /lib or /libexec) is mounted in the jail, so dynamically linked binaries will not start.\n", .{});
         try stderr.print("Run 'isolate detect {s}' to generate a capability file.\n\n", .{target_binary});
         // Use default capabilities
         parse_result = .{
             .caps = caps.Capabilities.init(allocator),
-            .warnings = .empty,
+            .problems = .empty,
         };
     }
     defer parse_result.deinit();
 
-    // Print any warnings from parsing
-    if (parse_result.warnings.items.len > 0 and opts.verbose) {
-        for (parse_result.warnings.items) |warning| {
-            try stderr.print("Warning (line {}): {s}\n", .{ warning.line, warning.message });
+    // A capability file with a line isolate cannot apply as written is
+    // refused outright: running with part of a policy is worse than not
+    // running.
+    if (parse_result.problems.items.len > 0) {
+        for (parse_result.problems.items) |problem| {
+            try stderr.print("{s}:{d}: {s}\n", .{ caps_file, problem.line, problem.message });
         }
+        try stderr.print("Error: {d} problem(s) in {s}; not starting.\n", .{ parse_result.problems.items.len, caps_file });
+        return 1;
     }
 
     // Network rules are parsed and listed but not enforced: there is no
@@ -745,6 +752,10 @@ fn cleanOrphans(io: std.Io, allocator: std.mem.Allocator, reg: *registry.Registr
     }
 }
 
+/// `clean` leaves an instance directory alone for this long after its last
+/// modification: a run creates the directory a moment before its jail.
+const instance_dir_grace_seconds = 60;
+
 /// Handle 'clean' command
 fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
     var stdout_file = stdoutWriter(io);
@@ -772,16 +783,11 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
         try stdout.print("Cleaned {d} orphaned instance(s).\n", .{cleaned});
     }
 
-    // Also clean any orphaned instance directories
+    // Then whatever isolate left behind that no registry entry accounts
+    // for: see docs/design/03-lifecycle.md, LIF-2
     if (builtin.os.tag == .freebsd and c.geteuid() == 0) {
-        const purged = freebsd.purgeStaleLimits();
-        if (purged > 0) {
-            try stdout.print("Removed resource limits of {d} jail(s) that no longer exist.\n", .{purged});
-        }
-
-        try stdout.print("Checking for orphaned instance directories...\n", .{});
-
-        // Instances that are still running keep their directories
+        // The entries that remain belong to instances whose isolate process
+        // is alive. Their jails, users and directories are in use.
         var instances = try reg.list();
         defer {
             for (instances.items) |*inst| {
@@ -790,34 +796,44 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
             instances.deinit(allocator);
         }
 
-        var dir = std.Io.Dir.openDirAbsolute(io, registry.REGISTRY_DIR, .{ .iterate = true }) catch {
-            return 0;
-        };
-        defer dir.close(io);
+        var managed_jids: std.ArrayList(i32) = .empty;
+        defer managed_jids.deinit(allocator);
+        var managed_users: std.ArrayList([]const u8) = .empty;
+        defer managed_users.deinit(allocator);
+        for (instances.items) |inst| {
+            try managed_jids.append(allocator, inst.jail_id);
+            try managed_users.append(allocator, inst.username);
+        }
+
+        const stray_jails = freebsd.removeStrayJails(io, managed_jids.items);
+        if (stray_jails > 0) {
+            try stdout.print("Removed {d} unregistered jail(s).\n", .{stray_jails});
+        }
+
+        const purged = freebsd.purgeStaleLimits();
+        if (purged > 0) {
+            try stdout.print("Removed resource limits of {d} jail(s) that no longer exist.\n", .{purged});
+        }
+
+        try stdout.print("Checking for orphaned instance directories...\n", .{});
 
         var cleaned_dirs: u32 = 0;
-        var iter = dir.iterate();
-        while (try iter.next(io)) |entry| {
-            if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "inst-")) continue;
+        if (std.Io.Dir.openDirAbsolute(io, registry.REGISTRY_DIR, .{ .iterate = true })) |opened| {
+            var dir = opened;
+            defer dir.close(io);
 
-            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ registry.REGISTRY_DIR, entry.name }) catch continue;
+            var iter = dir.iterate();
+            while (try iter.next(io)) |entry| {
+                if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "inst-")) continue;
 
-            // A running instance's jail root is <path>/root
-            var in_use = false;
-            for (instances.items) |inst| {
-                if (inst.state != .running) continue;
-                if (inst.jail_path.len > path.len and
-                    std.mem.startsWith(u8, inst.jail_path, path) and
-                    inst.jail_path[path.len] == '/')
-                {
-                    in_use = true;
-                    break;
-                }
-            }
-            if (in_use) continue;
+                var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ registry.REGISTRY_DIR, entry.name }) catch continue;
 
-            if (builtin.os.tag == .freebsd) {
+                // In use: some jail has its root here, or a run created the
+                // directory moments ago and has not created its jail yet
+                if (freebsd.instanceDirHasJail(path)) continue;
+                if ((freebsd.pathAgeSeconds(path) orelse 0) < instance_dir_grace_seconds) continue;
+
                 try stdout.print("Removing orphaned instance directory {s}\n", .{path});
                 freebsd.cleanupInstanceDir(path) catch {
                     try stderr.print("Warning: Could not fully remove {s}\n", .{path});
@@ -825,10 +841,15 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
                 };
                 cleaned_dirs += 1;
             }
-        }
+        } else |_| {}
 
         if (cleaned_dirs > 0) {
             try stdout.print("Removed {d} orphaned instance directory(s).\n", .{cleaned_dirs});
+        }
+
+        const stray_users = freebsd.removeStrayUsers(io, allocator, managed_users.items);
+        if (stray_users > 0) {
+            try stdout.print("Removed {d} unused ephemeral user(s).\n", .{stray_users});
         }
     }
 
@@ -881,20 +902,16 @@ var child_pid: c.pid_t = 0;
 var signals_received: u32 = 0;
 
 /// SIGINT/SIGTERM/SIGHUP in the parent: pass the first one on to the child
-/// so it can shut down; on the second, remove the jail, which kills
-/// everything inside it. The parent itself keeps waiting, so that the
-/// jail, mounts, directory and user are cleaned up once the child is gone
-/// instead of being left behind when the parent dies first.
+/// so it can shut down; on the second, kill it. The parent itself keeps
+/// waiting, and once the child is gone its normal cleanup removes the jail
+/// (and with it anything else still running inside), the mounts, the
+/// directory and the user - instead of all that being left behind when the
+/// parent dies first. Only kill(2) is called here; removing the jail
+/// involves running other programs, which is not for a signal handler.
 fn forwardSignal(sig: c_int) callconv(.c) void {
     signals_received += 1;
     if (child_pid <= 0) return;
-    if (signals_received >= 2) {
-        if (builtin.os.tag == .freebsd) {
-            freebsd.removeJail(freebsd.freebsd_get_jail_id());
-        }
-    } else {
-        _ = c.kill(child_pid, sig);
-    }
+    _ = c.kill(child_pid, if (signals_received >= 2) c.SIGKILL else sig);
 }
 
 /// Run isolation using native Zig implementation
@@ -965,6 +982,16 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             break :blk formatted;
         };
 
+        // Instance names are unique. Refuse before anything is created.
+        {
+            var reg = registry.Registry.init(io, allocator);
+            if (reg.exists(name)) {
+                stderr.print("Error: An instance named '{s}' is already registered.\n", .{name}) catch {};
+                stderr.print("See 'isolate list'. If it is not running, 'isolate clean' removes it.\n", .{}) catch {};
+                return 1;
+            }
+        }
+
         // Create pipe for IPC (to pass jail info to parent for cleanup)
         var pipefd: [2]c_int = undefined;
         if (c.pipe(&pipefd) < 0) {
@@ -1018,26 +1045,27 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
                 target_binary;
 
             // Build the path inside the jail - binary is copied to jail root
-            var exec_path_buf: [256]u8 = undefined;
-            const exec_path = std.fmt.bufPrint(&exec_path_buf, "/{s}", .{binary_name}) catch {
-                stderr.print("Binary name too long\n", .{}) catch {};
+            const exec_path = std.fmt.allocPrintSentinel(allocator, "/{s}", .{binary_name}, 0) catch {
+                stderr.print("Out of memory\n", .{}) catch {};
                 c._exit(1);
-                unreachable;
             };
-            exec_path_buf[exec_path.len] = 0; // Null terminate
 
-            // Build argv for execv
-            var argv_buf: [64]?[*:0]const u8 = [_]?[*:0]const u8{null} ** 64;
-            argv_buf[0] = @ptrCast(binary_name.ptr);
+            // Build argv for execv: the binary's name, then every argument
+            // given on the command line, however many there are. Each is a
+            // slice of a NUL-terminated command-line string.
+            const argv = allocator.alloc(?[*:0]const u8, args.len + 2) catch {
+                stderr.print("Out of memory\n", .{}) catch {};
+                c._exit(1);
+            };
+            argv[0] = @ptrCast(binary_name.ptr);
+            for (args, 1..) |arg, i| argv[i] = @ptrCast(arg.ptr);
+            argv[args.len + 1] = null;
 
-            var argc: usize = 1;
-            for (args) |arg| {
-                if (argc >= argv_buf.len - 1) break;
-                argv_buf[argc] = @ptrCast(arg.ptr);
-                argc += 1;
-            }
+            // The program gets stdin, stdout and stderr and nothing else
+            // that happened to be open in this process
+            c.closefrom(3);
 
-            _ = c.execv(@ptrCast(&exec_path_buf), @ptrCast(&argv_buf));
+            _ = c.execv(exec_path.ptr, @ptrCast(argv.ptr));
 
             // If we get here, execv failed
             stderr.print("Failed to execute {s}\n", .{target_binary}) catch {};
@@ -1100,13 +1128,16 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             };
             defer instance.deinit();
 
+            // An instance that cannot be registered cannot be listed,
+            // stopped or cleaned up after, so it is not left running
+            var registered = true;
             reg.register(instance) catch |err| {
-                if (verbose) {
-                    stderr.print("Warning: Failed to register instance: {}\n", .{err}) catch {};
-                }
+                registered = false;
+                stderr.print("Error: Could not register instance '{s}': {}. Stopping it.\n", .{ name, err }) catch {};
+                freebsd.removeJail(jid);
             };
 
-            if (verbose) {
+            if (verbose and registered) {
                 stdout.print("Instance '{s}' registered.\n", .{name}) catch {};
             }
 
@@ -1125,8 +1156,12 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             freebsd.cleanupIsolation(io);
             freebsd.removeResourceLimitsForPid(pid);
 
-            // Unregister instance
-            reg.unregister(instance.name);
+            // Unregister instance (never someone else's entry of the same name)
+            if (registered) {
+                reg.unregister(instance.name);
+            } else {
+                return 1;
+            }
 
             if (verbose) {
                 stdout.print("Cleanup complete.\n", .{}) catch {};

@@ -48,36 +48,24 @@ Each document lists invariants with an identifier (`ISO-3`, `LIF-1`, …). An in
 
 | Status | Meaning |
 |---|---|
-| **Holds (tested)** | Demonstrated on FreeBSD 15.1 by running the scenario described, or covered by a unit test. |
+| **Holds (tested)** | Demonstrated on FreeBSD 15.1 by a check in `tests/scenarios.sh`, or covered by a unit test. |
 | **Holds (by inspection)** | Follows from reading the code. No test exercises it. |
 | **Violated** | The code does not do this today. It is a defect to fix, not a description of intended behaviour. |
 | **Planned** | A goal that has not been implemented. |
 
-"Tested" means a manual scenario unless a unit test is named. The root-only scenarios are not yet automated and are not part of `zig build test`; see [03-lifecycle.md](03-lifecycle.md), "Known gaps".
+"Tested" means a check in `tests/scenarios.sh` unless a unit test is named. That script creates real jails, so it needs FreeBSD and root and is run by hand; it is not part of `zig build test`.
 
 Each document also has:
 
 - **Success criteria** — observable results that must all be true for the area to be considered working.
 - **Failure criteria** — observations any one of which means the area is broken, whatever else passes.
 
-## Summary of violated invariants
+## Status
 
-These are the defects the design documents currently record. Each is described in its own document.
+No invariant is currently recorded as violated.
 
-| ID | Defect |
-|---|---|
-| ISO-6 | `user: root` is accepted, so the program can run as uid 0 in the jail. |
-| ISO-9 | Every host device node is visible in the jail's `/dev`. |
-| ISO-10 | File descriptors open in the invoking process are inherited by the program. |
-| ISO-11 | A failed mount is a warning; the run continues. |
-| ISO-13 | Arguments beyond the 62nd are dropped without a message. |
-| CAP-1 | `cpu:`, `network_default:`, `filesystem_default:`, the `x` permission, single-file rules and write-only rules are accepted and do nothing. |
-| CAP-2 | Capability-file errors are shown only with `-v`, and never stop the run. |
-| LIF-2 | `clean` cannot find a jail or an ephemeral user that has no registry entry. |
-| LIF-9 | Two instances can be given the same name; the second overwrites the first's registry entry. |
-| LIF-10 | Registry entries are written in place, so a reader can see a partial one. |
-| LIM-5 | If limits cannot be applied, the run continues without them. |
-| NET-5 | If VNET is requested and unavailable, the run falls back to the host's network. |
-| DET-2 | `detect` writes rules that isolate does not apply. |
+Two hold only by inspection because the test host cannot exercise them: LIM-5 (limits requested on a kernel without racct) and the no-VNET half of NET-5. `tests/scenarios.sh` contains the LIM-5 check and runs it when racct is absent.
+
+Each document ends with its known gaps: behaviour that is not an invariant but is worth knowing, and cases no test covers.
 
 Planned, not yet built: NET-6 (enforcing `network:` rules with pf).

@@ -22,6 +22,11 @@ pub fn build(b: *std.Build) void {
     // FreeBSD: need libjail for jail API
     if (is_freebsd) {
         isolate_mod.linkSystemLibrary("jail", .{});
+        // The one piece that has to be C; see the comment in the file
+        isolate_mod.addCSourceFile(.{
+            .file = b.path("src/freebsd_proc.c"),
+            .flags = &.{},
+        });
     }
 
     const exe = b.addExecutable(.{

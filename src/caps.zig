@@ -22,6 +22,8 @@ const Allocator = std.mem.Allocator;
 pub const MAX_NETWORK_RULES = 16;
 pub const MAX_FILE_RULES = 32;
 pub const MAX_ENV_VARS = 32;
+pub const MAX_ENV_NAME = 255;
+pub const MAX_ENV_VALUE = 1023;
 
 /// Network traffic direction
 pub const Direction = enum(u8) {
@@ -41,35 +43,42 @@ pub const Direction = enum(u8) {
     }
 };
 
-/// File permission flags
+/// File permission flags. A rule is a nullfs mount, which is either
+/// read-only or read-write; there is nothing else a rule can express.
 pub const Permission = packed struct {
     read: bool = false,
     write: bool = false,
-    execute: bool = false,
-    _padding: u5 = 0,
+    _padding: u6 = 0,
 
     pub const read_only = Permission{ .read = true };
     pub const read_write = Permission{ .read = true, .write = true };
-    pub const read_execute = Permission{ .read = true, .execute = true };
-    pub const all = Permission{ .read = true, .write = true, .execute = true };
 
-    pub fn fromString(s: []const u8) Permission {
+    /// "r" or "rw" (in either order, any case). Anything else - a
+    /// write-only rule, an "x", an unknown letter, nothing at all - is null:
+    /// isolate could not apply it as written.
+    pub fn fromString(s: []const u8) ?Permission {
         var perm = Permission{};
+        if (s.len == 0) return null;
         for (s) |c| {
             switch (c) {
-                'r', 'R' => perm.read = true,
-                'w', 'W' => perm.write = true,
-                'x', 'X' => perm.execute = true,
-                else => {},
+                'r', 'R' => {
+                    if (perm.read) return null;
+                    perm.read = true;
+                },
+                'w', 'W' => {
+                    if (perm.write) return null;
+                    perm.write = true;
+                },
+                else => return null,
             }
         }
+        if (!perm.read) return null;
         return perm;
     }
 
     pub fn format(self: Permission, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.read) try writer.writeByte('r');
         if (self.write) try writer.writeByte('w');
-        if (self.execute) try writer.writeByte('x');
     }
 };
 
@@ -130,7 +139,6 @@ pub const ResourceLimits = struct {
     memory_bytes: ?usize = null,
     max_processes: ?u32 = null,
     max_files: ?u32 = null,
-    max_cpu_percent: ?u8 = null,
 };
 
 /// Network isolation mode
@@ -161,8 +169,6 @@ pub const Capabilities = struct {
     // User context
     username: []const u8,
     create_user: bool,
-    target_uid: ?u32 = null,
-    target_gid: ?u32 = null,
 
     // Workspace
     workspace_path: ?[]const u8 = null,
@@ -172,11 +178,9 @@ pub const Capabilities = struct {
 
     // Network access rules (for firewall-style rules, separate from isolation mode)
     network_rules: std.ArrayList(NetworkRule),
-    network_default_deny: bool,
 
     // Filesystem access
     file_rules: std.ArrayList(FileRule),
-    fs_default_deny: bool,
 
     // Environment
     env_vars: std.ArrayList(EnvVar),
@@ -194,9 +198,7 @@ pub const Capabilities = struct {
             .username = "auto",
             .create_user = true,
             .network_rules = .empty,
-            .network_default_deny = false,
             .file_rules = .empty,
-            .fs_default_deny = false,
             .env_vars = .empty,
             .env_clear = false,
             .limits = .{},
@@ -303,21 +305,23 @@ pub const ParseError = error{
     IoError,
 };
 
-/// Result of parsing with optional warning/error context
+/// Result of parsing: the capabilities, and every line that could not be
+/// applied as written. A non-empty `problems` list means the file must not
+/// be used; see docs/design/02-capability-file.md, CAP-2.
 pub const ParseResult = struct {
     caps: Capabilities,
-    warnings: std.ArrayList(Warning),
+    problems: std.ArrayList(Problem),
 
-    pub const Warning = struct {
+    pub const Problem = struct {
         line: usize,
         message: []const u8,
     };
 
     pub fn deinit(self: *ParseResult) void {
-        for (self.warnings.items) |w| {
+        for (self.problems.items) |w| {
             self.caps.allocator.free(w.message);
         }
-        self.warnings.deinit(self.caps.allocator);
+        self.problems.deinit(self.caps.allocator);
         self.caps.deinit();
     }
 };
@@ -385,6 +389,7 @@ pub fn parseNetworkRule(allocator: Allocator, rule_str: []const u8) ParseError!N
     };
 
     var address: []const u8 = "";
+    errdefer if (address.len > 0) allocator.free(address);
     var port: ?u16 = null;
     var direction: Direction = .both;
 
@@ -401,18 +406,18 @@ pub fn parseNetworkRule(allocator: Allocator, rule_str: []const u8) ParseError!N
                 port = p;
                 // Next could be direction
                 if (iter.next()) |dir_str| {
-                    direction = Direction.fromString(dir_str) orelse .both;
+                    direction = Direction.fromString(dir_str) orelse return ParseError.InvalidNetworkRule;
                 }
             } else |_| {
                 // It's an address
                 address = try allocator.dupe(u8, second);
                 // Next should be port
                 if (iter.next()) |port_str| {
-                    port = std.fmt.parseInt(u16, port_str, 10) catch null;
+                    port = std.fmt.parseInt(u16, port_str, 10) catch return ParseError.InvalidNetworkRule;
                 }
                 // Next could be direction
                 if (iter.next()) |dir_str| {
-                    direction = Direction.fromString(dir_str) orelse .both;
+                    direction = Direction.fromString(dir_str) orelse return ParseError.InvalidNetworkRule;
                 }
             }
         }
@@ -437,7 +442,7 @@ pub fn parseFileRule(allocator: Allocator, rule_str: []const u8) ParseError!File
     if (last_colon) |idx| {
         path = rule_str[0..idx];
         const perm_str = rule_str[idx + 1 ..];
-        permissions = Permission.fromString(perm_str);
+        permissions = Permission.fromString(perm_str) orelse return ParseError.InvalidFileRule;
     } else {
         path = rule_str;
     }
@@ -473,7 +478,7 @@ pub fn parseEnvVar(allocator: Allocator, env_str: []const u8) ParseError!EnvVar 
     const name = env_str[0..eq_idx];
     const value = env_str[eq_idx + 1 ..];
 
-    if (name.len == 0) return ParseError.InvalidEnvVar;
+    if (name.len == 0 or name.len > MAX_ENV_NAME or value.len > MAX_ENV_VALUE) return ParseError.InvalidEnvVar;
 
     return .{
         .name = try allocator.dupe(u8, name),
@@ -502,12 +507,12 @@ pub fn loadFromReader(allocator: Allocator, reader: *std.Io.Reader) ParseError!P
     var caps = Capabilities.init(allocator);
     errdefer caps.deinit();
 
-    var warnings: std.ArrayList(ParseResult.Warning) = .empty;
+    var problems: std.ArrayList(ParseResult.Problem) = .empty;
     errdefer {
-        for (warnings.items) |w| {
+        for (problems.items) |w| {
             allocator.free(w.message);
         }
-        warnings.deinit(allocator);
+        problems.deinit(allocator);
     }
 
     var line_num: usize = 0;
@@ -526,8 +531,8 @@ pub fn loadFromReader(allocator: Allocator, reader: *std.Io.Reader) ParseError!P
 
         // Parse key: value
         const colon_idx = std.mem.findScalar(u8, trimmed, ':') orelse {
-            const msg = try std.fmt.allocPrint(allocator, "Invalid syntax (missing colon)", .{});
-            try warnings.append(allocator, .{ .line = line_num, .message = msg });
+            const msg = try std.fmt.allocPrint(allocator, "Invalid syntax (expected 'key: value')", .{});
+            try problems.append(allocator, .{ .line = line_num, .message = msg });
             continue;
         };
 
@@ -540,77 +545,89 @@ pub fn loadFromReader(allocator: Allocator, reader: *std.Io.Reader) ParseError!P
             value_with_comment;
 
         // Parse capability based on key
+        if (value.len == 0) {
+            const msg = try std.fmt.allocPrint(allocator, "Missing value for {s}", .{key});
+            try problems.append(allocator, .{ .line = line_num, .message = msg });
+            continue;
+        }
+
         if (std.mem.eql(u8, key, "user")) {
-            if (!std.mem.eql(u8, value, "auto")) {
+            if (!std.mem.eql(u8, caps.username, "auto")) allocator.free(caps.username);
+            if (std.mem.eql(u8, value, "auto")) {
+                caps.username = "auto";
+                caps.create_user = true;
+            } else {
                 caps.username = try allocator.dupe(u8, value);
                 caps.create_user = false;
             }
         } else if (std.mem.eql(u8, key, "memory")) {
             caps.limits.memory_bytes = parseMemorySize(value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid memory size: {s}", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "processes")) {
             caps.limits.max_processes = std.fmt.parseInt(u32, value, 10) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid process count: {s}", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "files")) {
             caps.limits.max_files = std.fmt.parseInt(u32, value, 10) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid file count: {s}", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "cpu")) {
-            caps.limits.max_cpu_percent = std.fmt.parseInt(u8, value, 10) catch {
-                const msg = try std.fmt.allocPrint(allocator, "Invalid CPU percent: {s}", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
-                continue;
-            };
+            // rctl's pcpu limit is too coarse to honour a percentage, so
+            // the key is refused rather than accepted and ignored
+            const msg = try std.fmt.allocPrint(allocator, "cpu: CPU limits are not supported", .{});
+            try problems.append(allocator, .{ .line = line_num, .message = msg });
         } else if (std.mem.eql(u8, key, "network")) {
             if (caps.network_rules.items.len >= MAX_NETWORK_RULES) {
                 const msg = try std.fmt.allocPrint(allocator, "Too many network rules (max {})", .{MAX_NETWORK_RULES});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             }
             const rule = parseNetworkRule(allocator, value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid network rule: {s}", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
             try caps.network_rules.append(allocator, rule);
         } else if (std.mem.eql(u8, key, "filesystem") or std.mem.eql(u8, key, "file")) {
             if (caps.file_rules.items.len >= MAX_FILE_RULES) {
                 const msg = try std.fmt.allocPrint(allocator, "Too many file rules (max {})", .{MAX_FILE_RULES});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             }
             const rule = parseFileRule(allocator, value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid file rule: {s}", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
             try caps.file_rules.append(allocator, rule);
         } else if (std.mem.eql(u8, key, "env")) {
             if (caps.env_vars.items.len >= MAX_ENV_VARS) {
                 const msg = try std.fmt.allocPrint(allocator, "Too many env vars (max {})", .{MAX_ENV_VARS});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             }
             const env = parseEnvVar(allocator, value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid env var: {s}", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
             try caps.env_vars.append(allocator, env);
-        } else if (std.mem.eql(u8, key, "network_default")) {
-            caps.network_default_deny = std.mem.eql(u8, value, "deny");
-        } else if (std.mem.eql(u8, key, "filesystem_default")) {
-            caps.fs_default_deny = std.mem.eql(u8, value, "deny");
         } else if (std.mem.eql(u8, key, "env_clear")) {
-            caps.env_clear = std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1");
+            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "yes")) {
+                caps.env_clear = true;
+            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "no")) {
+                caps.env_clear = false;
+            } else {
+                const msg = try std.fmt.allocPrint(allocator, "Invalid env_clear: {s} (use true or false)", .{value});
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
+            }
         } else if (std.mem.eql(u8, key, "network_mode")) {
             // Parse network isolation mode: inherit, none, or vnet:<interface>
             if (std.mem.eql(u8, value, "inherit")) {
@@ -620,30 +637,37 @@ pub fn loadFromReader(allocator: Allocator, reader: *std.Io.Reader) ParseError!P
             } else if (std.mem.startsWith(u8, value, "vnet:")) {
                 caps.network_config.mode = .vnet;
                 const iface = value[5..]; // Skip "vnet:"
+                if (caps.network_config.interface) |old| allocator.free(old);
+                caps.network_config.interface = null;
                 if (iface.len > 0) {
                     caps.network_config.interface = try allocator.dupe(u8, iface);
+                } else {
+                    const msg = try std.fmt.allocPrint(allocator, "Invalid network_mode: vnet: needs an interface name", .{});
+                    try problems.append(allocator, .{ .line = line_num, .message = msg });
                 }
             } else if (std.mem.eql(u8, value, "vnet")) {
                 caps.network_config.mode = .vnet;
                 // No interface specified - will need --vnet CLI arg
             } else {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid network_mode: {s} (use inherit, none, or vnet:<interface>)", .{value});
-                try warnings.append(allocator, .{ .line = line_num, .message = msg });
+                try problems.append(allocator, .{ .line = line_num, .message = msg });
             }
         } else if (std.mem.eql(u8, key, "network_ip")) {
             // IP address to configure on VNET interface (e.g., "10.0.99.2/24")
+            if (caps.network_config.ip_address) |old| allocator.free(old);
             caps.network_config.ip_address = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "workspace")) {
+            if (caps.workspace_path) |old| allocator.free(old);
             caps.workspace_path = try allocator.dupe(u8, value);
         } else {
             const msg = try std.fmt.allocPrint(allocator, "Unknown capability: {s}", .{key});
-            try warnings.append(allocator, .{ .line = line_num, .message = msg });
+            try problems.append(allocator, .{ .line = line_num, .message = msg });
         }
     }
 
     return .{
         .caps = caps,
-        .warnings = warnings,
+        .problems = problems,
     };
 }
 
@@ -752,15 +776,88 @@ test "parseFileRule" {
         try std.testing.expect(rule.permissions.write);
     }
 
-    // Read-execute
+    // Order and case of the letters do not matter
     {
-        const rule = try parseFileRule(allocator, "/usr/bin/app:rx");
+        const rule = try parseFileRule(allocator, "/data:WR");
         defer allocator.free(rule.path);
-        try std.testing.expectEqualStrings("/usr/bin/app", rule.path);
-        try std.testing.expect(rule.permissions.read);
-        try std.testing.expect(rule.permissions.execute);
-        try std.testing.expect(!rule.permissions.write);
+        try std.testing.expect(rule.permissions.read and rule.permissions.write);
     }
+}
+
+test "parseFileRule rejects permissions it cannot apply" {
+    const allocator = std.testing.allocator;
+    // write-only, execute, unknown letters, repeated letters, empty
+    const bad = [_][]const u8{ "/var/log:w", "/usr/bin/app:rx", "/data:rwx", "/data:x", "/data:rz", "/data:rr", "/data:" };
+    for (bad) |rule| {
+        try std.testing.expectError(ParseError.InvalidFileRule, parseFileRule(allocator, rule));
+    }
+}
+
+test "parseNetworkRule rejects bad ports and directions" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(ParseError.InvalidNetworkRule, parseNetworkRule(allocator, "tcp:8080:sideways"));
+    try std.testing.expectError(ParseError.InvalidNetworkRule, parseNetworkRule(allocator, "tcp:10.0.0.1:notaport"));
+    try std.testing.expectError(ParseError.InvalidNetworkRule, parseNetworkRule(allocator, "icmp:1"));
+}
+
+test "parseEnvVar rejects over-long entries" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(ParseError.InvalidEnvVar, parseEnvVar(allocator, "N" ** 256 ++ "=v"));
+    try std.testing.expectError(ParseError.InvalidEnvVar, parseEnvVar(allocator, "NAME=" ++ "v" ** 1024));
+}
+
+test "loadFromReader reports every line it cannot apply" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\user: auto
+        \\memroy: 64M
+        \\cpu: 50
+        \\network_default: deny
+        \\filesystem_default: deny
+        \\filesystem: /var/log:w
+        \\filesystem: /:rw
+        \\env_clear: maybe
+        \\memory:
+        \\network_mode: vnet:
+        \\not a key value line
+        \\files: 64
+    ;
+    var reader: std.Io.Reader = .fixed(content);
+    var result = try loadFromReader(allocator, &reader);
+    defer result.deinit();
+
+    // Every line except the first and the last is a problem
+    try std.testing.expectEqual(@as(usize, 10), result.problems.items.len);
+    for (result.problems.items, 2..) |problem, line| {
+        try std.testing.expectEqual(line, problem.line);
+    }
+    try std.testing.expectEqual(@as(?u32, 64), result.caps.limits.max_files);
+    try std.testing.expect(result.caps.limits.memory_bytes == null);
+}
+
+test "loadFromReader: last value wins for repeated keys, without leaking" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\user: nobody
+        \\user: www
+        \\user: auto
+        \\workspace: /a
+        \\workspace: /b
+        \\network_mode: vnet:epair0b
+        \\network_mode: vnet:epair1b
+        \\network_ip: 10.0.0.1/24
+        \\network_ip: 10.0.0.2/24
+    ;
+    var reader: std.Io.Reader = .fixed(content);
+    var result = try loadFromReader(allocator, &reader);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.problems.items.len);
+    try std.testing.expectEqualStrings("auto", result.caps.username);
+    try std.testing.expect(result.caps.create_user);
+    try std.testing.expectEqualStrings("/b", result.caps.workspace_path.?);
+    try std.testing.expectEqualStrings("epair1b", result.caps.network_config.interface.?);
+    try std.testing.expectEqualStrings("10.0.0.2/24", result.caps.network_config.ip_address.?);
 }
 
 test "parseFileRule rejects unsafe paths" {
@@ -870,6 +967,6 @@ test "loadFromReader" {
     // Check env_clear
     try std.testing.expect(caps.env_clear);
 
-    // No warnings expected
-    try std.testing.expectEqual(@as(usize, 0), result.warnings.items.len);
+    // No problems expected
+    try std.testing.expectEqual(@as(usize, 0), result.problems.items.len);
 }

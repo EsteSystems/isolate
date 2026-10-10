@@ -104,14 +104,40 @@ pub const Registry = struct {
         };
     }
 
-    /// Register a new instance
+    /// Whether an entry with this name exists
+    pub fn exists(self: *Self, name: []const u8) bool {
+        if (!isValidInstanceName(name)) return false;
+        var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ self.registry_dir, name }) catch return false;
+        Io.Dir.accessAbsolute(self.io, path, .{}) catch return false;
+        return true;
+    }
+
+    /// Register a new instance. Fails with error.InstanceNameInUse if an
+    /// entry of that name exists. The entry appears complete or not at all:
+    /// it is written to a temporary file and hard-linked into place, which
+    /// is atomic and refuses to replace an existing entry.
     pub fn register(self: *Self, instance: Instance) !void {
         if (!isValidInstanceName(instance.name)) return error.InvalidInstanceName;
         try self.ensureDir();
 
         var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ self.registry_dir, instance.name });
+        const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}.json", .{ self.registry_dir, instance.name });
 
+        // Not ending in .json, so list() never reads a half-written file
+        var tmp_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const tmp_path = try std.fmt.bufPrintZ(&tmp_buf, "{s}/{s}.json.tmp.{d}", .{ self.registry_dir, instance.name, instance.manager_pid });
+
+        try self.writeEntry(tmp_path, instance);
+        defer Io.Dir.deleteFileAbsolute(self.io, tmp_path) catch {};
+
+        if (std.c.link(tmp_path.ptr, path.ptr) != 0) {
+            if (std.c._errno().* == @intFromEnum(std.c.E.EXIST)) return error.InstanceNameInUse;
+            return error.RegistryWriteFailed;
+        }
+    }
+
+    fn writeEntry(self: *Self, path: []const u8, instance: Instance) !void {
         const file = try Io.Dir.createFileAbsolute(self.io, path, .{});
         defer file.close(self.io);
 
@@ -412,6 +438,56 @@ test "isValidInstanceName" {
     try std.testing.expect(!isValidInstanceName("a/b"));
     try std.testing.expect(!isValidInstanceName("with space"));
     try std.testing.expect(!isValidInstanceName("x" ** 65));
+}
+
+test "register is exclusive and leaves no temporary file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+
+    var reg = Registry{ .io = io, .allocator = allocator, .registry_dir = dir_buf[0..dir_len] };
+
+    const inst = Instance{
+        .name = "unique-name",
+        .pid = 100,
+        .manager_pid = 99,
+        .jail_id = 5,
+        .jail_path = "/var/run/isolate/inst-aB3dE9/root",
+        .username = "app-100",
+        .binary_path = "/bin/x \"quoted\"",
+        .start_time = 1,
+        .workspace_path = null,
+        .allocator = allocator,
+    };
+
+    try std.testing.expect(!reg.exists("unique-name"));
+    try reg.register(inst);
+    try std.testing.expect(reg.exists("unique-name"));
+
+    // A second instance of the same name is refused, and the first entry
+    // is untouched
+    var other = inst;
+    other.pid = 200;
+    other.manager_pid = 199;
+    try std.testing.expectError(error.InstanceNameInUse, reg.register(other));
+
+    var info = (try reg.get("unique-name")).?;
+    defer info.deinit();
+    try std.testing.expectEqual(@as(i32, 100), info.pid);
+    try std.testing.expectEqualStrings("/bin/x \"quoted\"", info.binary_path);
+
+    // Only the entry itself is in the directory
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    reg.unregister("unique-name");
+    try std.testing.expect(!reg.exists("unique-name"));
 }
 
 test "extractJsonInt" {

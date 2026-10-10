@@ -123,14 +123,14 @@ pub fn printCheck(caps: SystemCapabilities, writer: *std.Io.Writer) !void {
     if (caps.racct_enabled) {
         try writer.print("  [OK] racct/rctl           Enabled - resource limits available\n", .{});
     } else {
-        try writer.print("  [!!] racct/rctl           NOT ENABLED - resource limits unavailable\n", .{});
+        try writer.print("  [!!] racct/rctl           NOT ENABLED - files with limits will be refused\n", .{});
     }
 
     // VNET
     if (caps.vnet_available) {
         try writer.print("  [OK] VNET/VIMAGE          Available - network isolation supported\n", .{});
     } else {
-        try writer.print("  [!!] VNET/VIMAGE          NOT AVAILABLE - --vnet will fall back to inherit\n", .{});
+        try writer.print("  [!!] VNET/VIMAGE          NOT AVAILABLE - network_mode: vnet will be refused\n", .{});
     }
 
     // Always available on FreeBSD
@@ -185,14 +185,14 @@ pub fn warnIfRacctDisabled(caps: SystemCapabilities, writer: *std.Io.Writer) !vo
     if (!caps.racct_enabled) {
         try writer.print(
             \\
-            \\Warning: Resource limits requested but racct is not enabled.
+            \\Error: Resource limits requested but racct is not enabled.
             \\
             \\Resource limits (memory, processes, files) require racct/rctl support.
             \\To enable, add to /boot/loader.conf:
             \\
             \\    kern.racct.enable=1
             \\
-            \\Then reboot. Running without resource limits for now.
+            \\Then reboot. Not starting: the limits in the capability file cannot be applied.
             \\
             \\
         , .{});
@@ -204,12 +204,12 @@ pub fn warnIfVnetUnavailable(caps: SystemCapabilities, writer: *std.Io.Writer) !
     if (!caps.vnet_available) {
         try writer.print(
             \\
-            \\Warning: VNET requested but VIMAGE is not available in this kernel.
+            \\Error: VNET requested but VIMAGE is not available in this kernel.
             \\
             \\Network isolation requires a kernel compiled with 'options VIMAGE'.
             \\FreeBSD GENERIC kernel includes this since 13.0.
             \\
-            \\Falling back to inherited network stack.
+            \\Not starting: the capability file asks for a network stack of its own.
             \\
             \\
         , .{});

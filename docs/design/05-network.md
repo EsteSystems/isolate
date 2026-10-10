@@ -34,7 +34,9 @@ After creating the jail, isolate:
 2. If `network_ip` is set, assigns it and brings the interface up (`ifconfig -j <jid> <if> inet <ip> up`).
 3. Brings the jail's loopback up with `127.0.0.1/8`.
 
-Both `ifconfig` commands run on the host, so the jail needs no `/sbin`. When the jail is removed, the kernel returns the interface to the host.
+All `ifconfig` commands run on the host, so the jail needs no `/sbin`.
+
+Before removing a VNET jail, isolate moves every interface other than the loopback back to the host (`ifconfig <if> -vnet <jid>`). It does not rely on the kernel returning the interface when the jail goes: a removed jail whose network stack still holds state, such as a TCP connection the program made, stays "dying" for some time, and an interface inside a dying jail cannot be reclaimed.
 
 The jail gets no default route. It can reach only the networks its interface is directly attached to.
 
@@ -45,8 +47,8 @@ The jail gets no default route. It can reach only the networks its interface is 
 | NET-1 | In `none` mode the program cannot create an IPv4 or IPv6 socket. | Holds (tested) for IPv4: `socket()` fails with `EPROTONOSUPPORT`. IPv6 by inspection. |
 | NET-2 | In `vnet` mode the jail's network stack contains only its loopback and the named interface. The host's addresses are not reachable from the jail unless they are on that interface's network. | Holds (tested): the jail reached the host on the epair address and not on the host's LAN address. |
 | NET-3 | A service listening in a VNET jail is reachable only at the jail's address, not at the host's addresses. | Holds (tested) |
-| NET-4 | The interface given to a VNET jail is back on the host after the run. | Holds (tested) |
-| NET-5 | If a capability file asks for `none` or `vnet` and isolate cannot provide it, the run does not start. The program is never given more network than the file states. | **Violated** (by inspection): when the kernel lacks VNET, isolate warns and uses `inherit`, giving the program the host's network. If moving the interface or setting its address fails, isolate warns and continues with a jail that has no working network. |
+| NET-4 | The interface given to a VNET jail is back on the host when the run ends, whatever the program did with it. | Holds (tested), including after the program made a TCP connection. |
+| NET-5 | If a capability file asks for `none` or `vnet` and isolate cannot provide it, the run does not start. The program is never given more network than the file states. | Holds (tested) for an interface that does not exist: the run is refused, the program never starts, nothing is left behind. A failed address assignment takes the same path, and a kernel without VNET is refused before the jail is created (both by inspection). |
 | NET-6 | When a capability file contains `network:` rules, the program can make and accept only the connections the rules allow. | **Planned.** Rules are parsed and listed; nothing enforces them. A run with rules prints a warning saying so. |
 
 ## Planned: enforcing `network:` rules (NET-6)
@@ -91,12 +93,10 @@ Today:
 3. After the run the epair's jail end is listed on the host again.
 4. `inherit`: the program reaches whatever the host reaches.
 
-All four pass on FreeBSD 15.1.
+5. With an interface name that does not exist, the run is refused.
+6. On a kernel without VNET, a capability file with `network_mode: vnet` is refused.
 
-For NET-5, once fixed:
-
-5. On a kernel without VNET, a capability file with `network_mode: vnet` is refused.
-6. With an interface name that does not exist, the run is refused.
+Criteria 1–5 pass on FreeBSD 15.1. Criterion 6 has not been run: the test host has VNET.
 
 For NET-6, once built:
 
@@ -112,11 +112,10 @@ For NET-6, once built:
 - A program asked to run in `none` or `vnet` runs with the host's network.
 - Once NET-6 exists: a connection the rules do not allow succeeds.
 
-The third occurs today on a kernel without VNET (NET-5).
-
 ## Known gaps
 
 - `allow.socket_af` is set to true in every mode, permitting socket families beyond IPv4, IPv6, UNIX and route. Its effect in `none` mode has not been reviewed.
 - IPv6 has not been tested in any mode.
 - Several instances cannot share one interface; each VNET instance needs its own.
+- A jail whose program made network connections can remain listed as dying (`jls -d`) after the run. It holds nothing of isolate's; see [03-lifecycle.md](03-lifecycle.md), "Known gaps".
 - In `inherit` mode a program can bind any unprivileged port on any host address, including ones another instance wants.

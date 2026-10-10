@@ -12,7 +12,7 @@ A program cannot use more memory, processes or file descriptors than its capabil
 
 ## Out of scope
 
-- **CPU limits.** The `cpu` key is parsed and not applied; see [02-capability-file.md](02-capability-file.md), CAP-1.
+- **CPU limits.** The `cpu` key is refused. rctl's `pcpu` limit is too coarse to honour a percentage: tested on FreeBSD 15.1, `pcpu:deny=20` let a busy loop use about 49% of a CPU.
 - **Disk space, disk I/O and network bandwidth.**
 - **Swap and virtual address space** as separate limits.
 - **Per-process limits.** Every limit applies to the jail as a whole: all processes in it, added together.
@@ -44,11 +44,11 @@ The kernel samples resident memory about once a second, which is why a short bur
 
 | ID | Invariant | Status |
 |---|---|---|
-| LIM-1 | With `processes: N`, the jail never holds more than N processes. | Holds (tested): with N = 8, the eighth `fork` fails. |
+| LIM-1 | With `processes: N`, the jail never holds more than N processes. | Holds (tested): with N = 8, the eighth process cannot be created. |
 | LIM-2 | With `files: N`, the jail never holds more than N open file descriptors. | Holds (tested): with N = 64, the 62nd additional `open` fails. |
 | LIM-3 | With `memory: N`, a process whose resident memory stays above N is killed within two seconds. | Holds (tested): exit status 137 under a 64 MB limit; the same program completes under 512 MB. |
 | LIM-4 | An instance's limits exist only while its jail exists. No limit from an earlier instance applies to a later one. | Holds (tested): no rules remain after a run; rules are cleared for the jail name before the jail is created. |
-| LIM-5 | If the capability file sets a limit and it cannot be applied, the run does not start. | **Violated** (by inspection): when racct is disabled, or `rctl_add_rule` fails, isolate prints a warning and runs the program unlimited. |
+| LIM-5 | If the capability file sets a limit and it cannot be applied, the run does not start. | Holds (by inspection): with racct disabled, or when adding a rule fails, setup fails and everything created so far is removed. The scenario for this only runs on a host without racct, so it has not been exercised. |
 | LIM-6 | A limit is in force before the program's first instruction runs. | Holds (by inspection): rules are added before the child attaches to the jail. |
 
 ## Success criteria
@@ -60,7 +60,7 @@ The kernel samples resident memory about once a second, which is why a short bur
 5. After each run, `rctl` lists no rule for the instance's jail.
 6. On a kernel without racct, a capability file with any limit is refused.
 
-Criteria 1–5 pass on FreeBSD 15.1. Criterion 6 fails (LIM-5).
+Criteria 1–5 pass on FreeBSD 15.1. Criterion 6 has not been run: the test host has racct enabled.
 
 ## Failure criteria
 

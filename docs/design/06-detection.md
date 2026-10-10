@@ -28,7 +28,20 @@ Four passes, each producing hints. A hint is a description, one or more capabili
 | Strings | `.rodata`, `.data`, `.dynstr` | A string starting `/etc/` → that path read-only (60). A string starting `/var/` → that path read-write (65). `http://` or `https://` → outbound 80 and 443 (70). |
 | Name | the file name | Contains `nginx` → inbound 80 and 443, `/var/www` read-only, `memory: 128M` (90). Similar entries for `httpd`, `sshd`, `postgres`, `redis`, and generic `server`, `client`, `daemon`. |
 
-The output file starts with fixed defaults (`user: auto`, `memory: 128M`, `processes: 5`, `files: 512`), then the hints in order of confidence. Identical hints are written once. There is no merging of confidences: two different hints that imply the same line both appear.
+The output file starts with `user: auto` and the three limits, then the hints in order of confidence, each under a comment saying what it was inferred from.
+
+What isolate would not apply is written as a comment with the reason, never as a live line:
+
+| Inferred | Written as |
+|---|---|
+| `memory`, `processes` | Folded into the limits at the top. A hint can only raise them above the defaults (128M, 5); `files` is always 512. |
+| `network:` rule | A comment: network rules are not enforced. |
+| `filesystem:` rule for a path that exists on this host | A live rule, once per path. |
+| `filesystem:` rule for a path that does not exist here | A comment: not present on this host. |
+| A rule that is not valid, or beyond the limit of 32 | A comment saying so. |
+| `env:` entry | A live line, once. |
+
+There is no merging of confidences; confidence only orders the output.
 
 At most 64 hints are kept. Sections larger than 10 MB are not scanned for strings.
 
@@ -37,7 +50,7 @@ At most 64 hints are kept. Sections larger than 10 MB are not scanned for string
 | ID | Invariant | Status |
 |---|---|---|
 | DET-1 | `detect` never executes the binary it analyses and needs no privileges beyond reading it. | Holds (tested): runs as `nobody`. |
-| DET-2 | Every line `detect` writes is one isolate applies. The generated file loads without warnings. | **Violated** (tested). For `nginx` it writes eight `network:` rules, which are not enforced, and rules for single files such as `/var/log/nginx/error.log:rw`, which are skipped. It also repeats keys (`processes: 5` then `processes: 10`), where the last one silently wins. |
+| DET-2 | Every live line `detect` writes is one isolate applies as written. The generated file loads without problems. | Holds (tested; unit test `generated capability files load without problems`): the files generated for `nginx`, `sshd` and `sh` load cleanly, and the one for the `hello` example runs it unedited. |
 | DET-3 | `detect` writes only the output file, and only where asked: `<binary>.caps` or the `-o` path. | Holds (by inspection) |
 | DET-4 | A file that is not a readable ELF binary produces a valid capability file with defaults, not an error. | Holds (tested) for a shell script: a warning, then defaults and a `/tmp` rule. |
 | DET-5 | Analysis is bounded in memory regardless of the input. | Holds (by inspection) for hint count and string sections. `.dynstr` and the section headers are read at whatever size the file declares. |
@@ -49,7 +62,7 @@ At most 64 hints are kept. Sections larger than 10 MB are not scanned for string
 3. The generated file passes the capability-file parser with no warnings ([02-capability-file.md](02-capability-file.md), CAP-2).
 4. Every generated line is preceded by a comment saying what it was inferred from.
 
-Criteria 1, 2 and 4 pass: the `hello` and `server` examples run from their generated files. Criterion 3 fails for any binary that yields network rules or file paths (DET-2).
+All four pass. For criterion 2 the line is a comment, since network rules are not enforced.
 
 ## Failure criteria
 
@@ -59,8 +72,8 @@ Criteria 1, 2 and 4 pass: the `hello` and `server` examples run from their gener
 
 ## Known gaps
 
-- **The result for a real server is not runnable.** For `nginx`, detection misses `/usr/local/sbin`, `/usr/local/etc/nginx` and `/bin`, and proposes `/var/www`, which may not exist. The file is a starting point for editing, no more.
+- **The result for a real server loads, but is not enough to run it.** For `nginx`, detection misses `/usr/local/sbin`, `/usr/local/etc/nginx` and `/bin`. The file is a starting point for editing, no more.
+- Whether a path exists is decided on the machine where `detect` runs. A file generated on one host can name paths missing on another, where the run is then refused.
 - Read-write access is proposed for every embedded `/var/…` string, whether or not the program writes there.
 - The port in an inbound hint is always 8080 for unrecognised servers; it is not read from the binary.
 - Name matching is by substring: a binary called `myserver-client` matches `server`.
-- Once CAP-2 is fixed (unknown or unusable lines stop the run), DET-2 must be fixed at the same time, or generated files will stop working.

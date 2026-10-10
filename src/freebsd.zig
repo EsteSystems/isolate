@@ -475,6 +475,10 @@ fn safeExec(path: []const u8, argv: []const ?[*:0]const u8) !void {
     return error.ExecFailed;
 }
 
+/// The comment (gecos) field of every user isolate creates. Together with
+/// the app-<digits> name it identifies a user as one of ours.
+const ephemeral_user_comment = "Isolate ephemeral user";
+
 /// Create an ephemeral user
 pub fn createUser(username: []const u8) !struct { uid: u32, gid: u32 } {
     var name_buf: [64]u8 = undefined;
@@ -503,7 +507,7 @@ pub fn createUser(username: []const u8) !struct { uid: u32, gid: u32 } {
         "-d",
         "/tmp",
         "-c",
-        "Isolate ephemeral user",
+        ephemeral_user_comment,
         null,
     };
 
@@ -629,7 +633,10 @@ fn getSystemCapabilities() syscheck.SystemCapabilities {
     return cached_sys_caps.?;
 }
 
-pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.ResourceLimits) void {
+/// Add the rctl rules for the limits in the capability file. If a limit is
+/// requested and cannot be applied, that is an error: the program must not
+/// start unlimited.
+pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.ResourceLimits) !void {
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
     var rule_buf: [256]u8 = undefined;
@@ -648,7 +655,7 @@ pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.Resourc
     const sys_caps = getSystemCapabilities();
     if (!sys_caps.racct_enabled) {
         syscheck.warnIfRacctDisabled(sys_caps, stdout) catch {};
-        return;
+        return error.ResourceLimitFailed;
     }
 
     if (limits.memory_bytes) |mem| {
@@ -661,9 +668,10 @@ pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.Resourc
             stdout.print("Setting memory limit: {d} bytes (process is killed above it)\n", .{mem}) catch {};
             const ret = rctl_add_rule(&rule_buf, formatted.len, &out_buf, out_buf.len);
             if (ret != 0) {
-                stdout.print("Warning: Failed to set memory limit (rctl error)\n", .{}) catch {};
+                stdout.print("Error: Failed to set memory limit (rctl error)\n", .{}) catch {};
+                return error.ResourceLimitFailed;
             }
-        } else |_| {}
+        } else |_| return error.ResourceLimitFailed;
     }
 
     if (limits.max_processes) |procs| {
@@ -671,9 +679,10 @@ pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.Resourc
             stdout.print("Setting process limit: {d}\n", .{procs}) catch {};
             const ret = rctl_add_rule(&rule_buf, formatted.len, &out_buf, out_buf.len);
             if (ret != 0) {
-                stdout.print("Warning: Failed to set process limit (rctl error)\n", .{}) catch {};
+                stdout.print("Error: Failed to set process limit (rctl error)\n", .{}) catch {};
+                return error.ResourceLimitFailed;
             }
-        } else |_| {}
+        } else |_| return error.ResourceLimitFailed;
     }
 
     if (limits.max_files) |files| {
@@ -681,9 +690,10 @@ pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.Resourc
             stdout.print("Setting file descriptor limit: {d}\n", .{files}) catch {};
             const ret = rctl_add_rule(&rule_buf, formatted.len, &out_buf, out_buf.len);
             if (ret != 0) {
-                stdout.print("Warning: Failed to set file limit (rctl error)\n", .{}) catch {};
+                stdout.print("Error: Failed to set file limit (rctl error)\n", .{}) catch {};
+                return error.ResourceLimitFailed;
             }
-        } else |_| {}
+        } else |_| return error.ResourceLimitFailed;
     }
 }
 
@@ -713,8 +723,10 @@ pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, netw
         .vnet => blk: {
             const sys_caps = getSystemCapabilities();
             if (!sys_caps.vnet_available) {
+                // Never fall back to the host's network: that would give the
+                // program more than its capability file asks for
                 syscheck.warnIfVnetUnavailable(sys_caps, stdout) catch {};
-                break :blk false; // Fall back to inherit
+                return error.JailCreateFailed;
             }
             break :blk true;
         },
@@ -790,16 +802,17 @@ pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, netw
     if (use_vnet) {
         if (network_config.interface) |iface| {
             stdout.print("Moving interface {s} into jail\n", .{iface}) catch {};
-            moveInterfaceToJail(jid, iface) catch |err| {
-                stdout.print("Warning: Failed to move interface {s} into jail: {}\n", .{ iface, err }) catch {};
-                // Don't fail jail creation, just warn
+            moveInterfaceToJail(jid, iface) catch {
+                stdout.print("Error: Failed to move interface {s} into the jail (does it exist?)\n", .{iface}) catch {};
+                return error.JailParamFailed;
             };
 
             // Configure IP address if specified
             if (network_config.ip_address) |ip| {
                 stdout.print("Configuring IP address {s} on {s}\n", .{ ip, iface }) catch {};
-                configureJailInterface(jid, iface, ip) catch |err| {
-                    stdout.print("Warning: Failed to configure IP {s}: {}\n", .{ ip, err }) catch {};
+                configureJailInterface(jid, iface, ip) catch {
+                    stdout.print("Error: Failed to configure address {s} on {s}\n", .{ ip, iface }) catch {};
+                    return error.JailParamFailed;
                 };
             } else {
                 stdout.print("Note: No network_ip set; {s} is in the jail but has no address\n", .{iface}) catch {};
@@ -810,7 +823,8 @@ pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, netw
 
         // A new network stack starts with an unconfigured loopback
         configureJailInterface(jid, "lo0", "127.0.0.1/8") catch {
-            stdout.print("Warning: Failed to configure loopback in jail\n", .{}) catch {};
+            stdout.print("Error: Failed to configure loopback in jail\n", .{}) catch {};
+            return error.JailParamFailed;
         };
     }
 
@@ -886,9 +900,87 @@ pub fn attachToJail(io: std.Io, jid: i32) !void {
     }
 }
 
-/// Remove a jail
+/// Run a command and return what it wrote to standard output
+fn execCapture(path: [:0]const u8, argv: []const ?[*:0]const u8, out: []u8) ![]u8 {
+    var fds: [2]c_int = undefined;
+    if (c.pipe(&fds) != 0) return error.ForkFailed;
+
+    const pid = c.fork();
+    if (pid < 0) {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+        return error.ForkFailed;
+    }
+
+    if (pid == 0) {
+        _ = c.close(fds[0]);
+        _ = c.dup2(fds[1], c.STDOUT_FILENO);
+        _ = c.close(fds[1]);
+        const devnull = c.open("/dev/null", c.O_WRONLY);
+        if (devnull >= 0) _ = c.dup2(devnull, c.STDERR_FILENO);
+        _ = c.execv(path.ptr, @ptrCast(argv.ptr));
+        c._exit(127);
+    }
+
+    _ = c.close(fds[1]);
+    var len: usize = 0;
+    while (len < out.len) {
+        const n = c.read(fds[0], out[len..].ptr, out.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    _ = c.close(fds[0]);
+
+    var status: c_int = undefined;
+    _ = c.waitpid(pid, &status, 0);
+    if (!(c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0)) return error.ExecFailed;
+    return out[0..len];
+}
+
+/// Whether jail `jid` has a network stack of its own
+fn jailHasOwnVnet(jid: i32) bool {
+    var jid_val: c_int = jid;
+    var vnet: c_int = 0;
+    var iov = [_]c.struct_iovec{
+        .{ .iov_base = @ptrCast(@constCast("jid")), .iov_len = 4 },
+        .{ .iov_base = @ptrCast(&jid_val), .iov_len = @sizeOf(c_int) },
+        .{ .iov_base = @ptrCast(@constCast("vnet")), .iov_len = 5 },
+        .{ .iov_base = @ptrCast(&vnet), .iov_len = @sizeOf(c_int) },
+    };
+    if (c.jail_get(&iov, iov.len, 0) < 0) return false;
+    return vnet == c.JAIL_SYS_NEW;
+}
+
+/// Move every interface of a VNET jail, other than its loopback, back to the
+/// host. This has to happen before the jail is removed: a removed jail whose
+/// network stack still holds kernel state (a TCP connection in TIME_WAIT is
+/// enough) stays "dying" for a long time, and an interface inside it cannot
+/// be reclaimed until it is finally gone.
+fn reclaimInterfaces(jid: i32) void {
+    if (!jailHasOwnVnet(jid)) return;
+
+    var jid_buf: [16]u8 = undefined;
+    const jid_z = std.fmt.bufPrintZ(&jid_buf, "{d}", .{jid}) catch return;
+
+    var out_buf: [4096]u8 = undefined;
+    const list_argv: [5]?[*:0]const u8 = .{ "/sbin/ifconfig", "-j", jid_z.ptr, "-l", null };
+    const listing = execCapture("/sbin/ifconfig", &list_argv, &out_buf) catch return;
+
+    var names = std.mem.tokenizeAny(u8, listing, " \t\r\n");
+    while (names.next()) |ifname| {
+        if (std.mem.startsWith(u8, ifname, "lo")) continue;
+        var if_buf: [64]u8 = undefined;
+        const if_z = std.fmt.bufPrintZ(&if_buf, "{s}", .{ifname}) catch continue;
+        const argv: [5]?[*:0]const u8 = .{ "/sbin/ifconfig", if_z.ptr, "-vnet", jid_z.ptr, null };
+        safeExec("/sbin/ifconfig", &argv) catch {};
+    }
+}
+
+/// Remove a jail, killing everything in it. A VNET jail's interfaces are
+/// returned to the host first.
 pub fn removeJail(jid: i32) void {
     if (jid >= 0) {
+        reclaimInterfaces(jid);
         _ = c.jail_remove(jid);
     }
 }
@@ -905,6 +997,161 @@ pub fn jailBelongsTo(jid: i32, pid: i32) bool {
     var expected_buf: [64]u8 = undefined;
     const expected = std.fmt.bufPrint(&expected_buf, jail_name_prefix ++ "{d}", .{pid}) catch return false;
     return std.mem.eql(u8, std.mem.span(name_ptr), expected);
+}
+
+// Defined in freebsd_proc.c, which can include <sys/user.h>
+extern fn isolate_parent_pid(pid: c_int) c_int;
+
+extern "c" fn time(tloc: ?*i64) i64;
+
+/// The parent of process `pid`, or null if there is no such process
+fn parentPid(pid: i32) ?i32 {
+    const parent = isolate_parent_pid(pid);
+    return if (parent < 0) null else parent;
+}
+
+/// Whether the jailed process `pid` exists and still has the `isolate run`
+/// process that started it as its parent. A process whose manager has died
+/// is reparented to init (pid 1). This also covers a run that is still
+/// setting up: the process creating the user, directory and jail is `pid`
+/// itself, with its manager alive.
+fn hasLiveManager(pid: i32) bool {
+    const parent = parentPid(pid) orelse return false;
+    return parent > 1;
+}
+
+/// The pid in a name of the form <prefix><digits>, or null
+fn pidFromName(name: []const u8, prefix: []const u8) ?i32 {
+    if (name.len <= prefix.len or !std.mem.startsWith(u8, name, prefix)) return null;
+    return std.fmt.parseInt(i32, name[prefix.len..], 10) catch null;
+}
+
+/// Iterates over every jail on the host
+const JailIterator = struct {
+    lastjid: c_int = 0,
+    name_buf: [256]u8 = undefined,
+    path_buf: [PATH_MAX]u8 = undefined,
+
+    fn next(self: *JailIterator) ?c_int {
+        @memset(&self.name_buf, 0);
+        @memset(&self.path_buf, 0);
+        var iov = [_]c.struct_iovec{
+            .{ .iov_base = @ptrCast(@constCast("lastjid")), .iov_len = 8 },
+            .{ .iov_base = @ptrCast(&self.lastjid), .iov_len = @sizeOf(c_int) },
+            .{ .iov_base = @ptrCast(@constCast("name")), .iov_len = 5 },
+            .{ .iov_base = @ptrCast(&self.name_buf), .iov_len = self.name_buf.len },
+            .{ .iov_base = @ptrCast(@constCast("path")), .iov_len = 5 },
+            .{ .iov_base = @ptrCast(&self.path_buf), .iov_len = self.path_buf.len },
+        };
+        const jid = c.jail_get(&iov, iov.len, 0);
+        if (jid < 0) return null;
+        self.lastjid = jid;
+        return jid;
+    }
+
+    fn name(self: *const JailIterator) []const u8 {
+        return std.mem.sliceTo(&self.name_buf, 0);
+    }
+
+    fn path(self: *const JailIterator) []const u8 {
+        return std.mem.sliceTo(&self.path_buf, 0);
+    }
+};
+
+/// Remove jails isolate created that no registry entry accounts for: for
+/// example after an `isolate run` was killed before it registered, or after
+/// an entry was lost. `managed_jids` are the jails of registered instances.
+/// A jail whose process still has a live manager is left alone. Returns the
+/// number removed.
+pub fn removeStrayJails(io: std.Io, managed_jids: []const i32) u32 {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+
+    var removed: u32 = 0;
+    var it = JailIterator{};
+    while (it.next()) |jid| {
+        const pid = pidFromName(it.name(), jail_name_prefix) orelse continue;
+        if (std.mem.findScalar(i32, managed_jids, jid) != null) continue;
+        if (hasLiveManager(pid)) continue;
+
+        stdout.print("Removing unregistered jail {s} (JID {d})\n", .{ it.name(), jid }) catch {};
+        removeJail(jid);
+        removeResourceLimits(it.name());
+        removed += 1;
+    }
+    return removed;
+}
+
+/// Whether some jail has `<inst_dir>/root` as its root
+pub fn instanceDirHasJail(inst_dir: []const u8) bool {
+    var it = JailIterator{};
+    while (it.next()) |_| {
+        const root = it.path();
+        if (root.len == inst_dir.len + "/root".len and
+            std.mem.startsWith(u8, root, inst_dir) and
+            std.mem.endsWith(u8, root, "/root")) return true;
+    }
+    return false;
+}
+
+/// Seconds since `path` was last modified, or null if it cannot be examined
+pub fn pathAgeSeconds(path: []const u8) ?i64 {
+    var buf: [PATH_MAX]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return null;
+    var st: std.c.Stat = undefined;
+    if (stat(path_z.ptr, &st) != 0) return null;
+    return time(null) - st.mtim.sec;
+}
+
+/// Delete ephemeral users isolate created that nothing uses any more: after
+/// a reboot, for instance, every such user is still in the password
+/// database while the registry is empty. A user is ours if it is named
+/// app-<digits> and carries isolate's comment. It is kept if a registered
+/// instance uses it, if process <digits> exists, or if jail
+/// isolate-<digits> exists. Returns the number deleted.
+pub fn removeStrayUsers(io: std.Io, allocator: Allocator, managed_usernames: []const []const u8) u32 {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+
+    // Collect first: the database must not change while it is being read
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (candidates.items) |name| allocator.free(name);
+        candidates.deinit(allocator);
+    }
+
+    c.setpwent();
+    while (true) {
+        const pw = c.getpwent();
+        if (pw == null) break;
+        const name = std.mem.span(pw.*.pw_name);
+        if (!isEphemeralUsername(name)) continue;
+        if (!std.mem.eql(u8, std.mem.span(pw.*.pw_gecos), ephemeral_user_comment)) continue;
+        const copy = allocator.dupe(u8, name) catch break;
+        candidates.append(allocator, copy) catch {
+            allocator.free(copy);
+            break;
+        };
+    }
+    c.endpwent();
+
+    var removed: u32 = 0;
+    outer: for (candidates.items) |name| {
+        for (managed_usernames) |managed| {
+            if (std.mem.eql(u8, managed, name)) continue :outer;
+        }
+        const pid = pidFromName(name, "app-") orelse continue;
+        if (parentPid(pid) != null) continue; // the process exists
+
+        var jail_name_buf: [64]u8 = undefined;
+        const jail_name = std.fmt.bufPrintZ(&jail_name_buf, jail_name_prefix ++ "{d}", .{pid}) catch continue;
+        if (c.jail_getid(jail_name.ptr) >= 0) continue;
+
+        stdout.print("Removing unused ephemeral user {s}\n", .{name}) catch {};
+        deleteUser(name);
+        removed += 1;
+    }
+    return removed;
 }
 
 /// Tear down what an instance left behind when the isolate process that
@@ -1012,6 +1259,67 @@ pub fn setupEnvironment(io: std.Io, capability: *const caps.Capabilities, userna
 // Filesystem Isolation Setup
 // ============================================================================
 
+/// The device nodes left visible in a jail's /dev
+const visible_devices = [_][:0]const u8{
+    "null",   "zero",   "full", "random", "urandom",
+    "stdin",  "stdout", "stderr",
+    "fd",     "fd/*",   "pts",  "pts/*",
+};
+
+/// Hide every node of a freshly mounted devfs, then unhide the short list
+/// above. Without this the jail's /dev lists every device on the host.
+fn restrictDevfs(dev_path: []const u8) !void {
+    var path_buf: [PATH_MAX]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{dev_path}) catch return error.InvalidPath;
+
+    const hide: [7]?[*:0]const u8 = .{ "/sbin/devfs", "-m", path_z.ptr, "rule", "apply", "hide", null };
+    try safeExec("/sbin/devfs", &hide);
+
+    for (visible_devices) |node| {
+        const unhide: [9]?[*:0]const u8 = .{ "/sbin/devfs", "-m", path_z.ptr, "rule", "apply", "path", node.ptr, "unhide", null };
+        try safeExec("/sbin/devfs", &unhide);
+    }
+}
+
+/// Mount the host directory or file named by a filesystem rule at the same
+/// path inside the jail. Any failure is an error.
+fn mountRule(io: std.Io, jail_path: []const u8, rule: caps.FileRule) !void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+
+    var src_buf: [PATH_MAX]u8 = undefined;
+    const src_z = std.fmt.bufPrintZ(&src_buf, "{s}", .{rule.path}) catch return error.InvalidPath;
+
+    var st: std.c.Stat = undefined;
+    if (stat(src_z.ptr, &st) != 0) {
+        stdout.print("Error: {s} (filesystem rule) does not exist on the host\n", .{rule.path}) catch {};
+        return error.MountFailed;
+    }
+
+    var target_buf: [PATH_MAX]u8 = undefined;
+    const target = std.fmt.bufPrintZ(&target_buf, "{s}{s}", .{ jail_path, rule.path }) catch return error.InvalidPath;
+
+    if (std.c.S.ISDIR(st.mode)) {
+        mkdirp(target) catch return error.FilesystemSetupFailed;
+    } else if (std.c.S.ISREG(st.mode)) {
+        // nullfs mounts a file onto a file: create an empty one to mount on
+        mkdirp(std.fs.path.dirname(target) orelse return error.InvalidPath) catch return error.FilesystemSetupFailed;
+        const fd = c.open(target.ptr, c.O_WRONLY | c.O_CREAT, @as(c_uint, 0o644));
+        if (fd < 0) return error.FilesystemSetupFailed;
+        _ = c.close(fd);
+    } else {
+        stdout.print("Error: {s} (filesystem rule) is neither a directory nor a regular file\n", .{rule.path}) catch {};
+        return error.MountFailed;
+    }
+
+    const rdonly = !rule.permissions.write;
+    stdout.print("Mounting {s} -> {s} ({s})\n", .{ rule.path, target, if (rdonly) "ro" else "rw" }) catch {};
+    mountNullfs(rule.path, target, rdonly) catch {
+        stdout.print("Error: Failed to mount {s}\n", .{rule.path}) catch {};
+        return error.MountFailed;
+    };
+}
+
 pub fn setupFilesystemIsolation(
     io: std.Io,
     capability: *const caps.Capabilities,
@@ -1118,75 +1426,50 @@ pub fn setupFilesystemIsolation(
         }
     }
 
-    // Mount devfs
+    // Mount devfs and reduce it to what an unprivileged program needs
     stdout.print("Mounting system directories...\n", .{}) catch {};
     {
         const dev_path = std.fmt.bufPrint(&path_buf, "{s}/dev", .{jail_path}) catch return error.InvalidPath;
         mountDevfs(dev_path) catch {
-            stdout.print("Warning: Failed to mount devfs\n", .{}) catch {};
+            stdout.print("Error: Failed to mount devfs\n", .{}) catch {};
+            return error.MountFailed;
+        };
+        restrictDevfs(dev_path) catch {
+            stdout.print("Error: Failed to restrict the device nodes in the jail's /dev\n", .{}) catch {};
+            return error.MountFailed;
         };
     }
 
-    // Process capability filesystem rules
+    // Process capability filesystem rules. A rule that cannot be mounted
+    // stops the run: the program must never start with less, or other,
+    // access than its capability file states.
     stdout.print("Processing capability filesystem rules...\n", .{}) catch {};
     for (capability.file_rules.items) |rule| {
-        if (rule.permissions.read) {
-            // Security: Intercept /tmp mounts to use instance-specific directory
-            // This prevents cross-instance information leakage
-            if (std.mem.eql(u8, rule.path, "/tmp")) {
-                // Create the instance-specific tmp directory inside the
-                // per-instance directory, next to the jail root
-                var instance_tmp_buf: [PATH_MAX]u8 = undefined;
-                const instance_tmp = std.fmt.bufPrint(&instance_tmp_buf, "{s}/tmp", .{instanceDir(jail_path)}) catch continue;
+        // Security: a /tmp rule mounts an instance-specific directory, never
+        // the host's /tmp. This prevents cross-instance information leakage.
+        if (std.mem.eql(u8, rule.path, "/tmp")) {
+            var instance_tmp_buf: [PATH_MAX]u8 = undefined;
+            const instance_tmp = std.fmt.bufPrintZ(&instance_tmp_buf, "{s}/tmp", .{instanceDir(jail_path)}) catch return error.InvalidPath;
 
-                stdout.print("Creating isolated tmp: {s}\n", .{instance_tmp}) catch {};
-                mkdirp(instance_tmp) catch {
-                    stdout.print("Warning: Failed to create instance tmp directory\n", .{}) catch {};
-                    continue;
-                };
+            stdout.print("Creating isolated tmp: {s}\n", .{instance_tmp}) catch {};
+            mkdirp(instance_tmp) catch {
+                stdout.print("Error: Failed to create instance tmp directory\n", .{}) catch {};
+                return error.FilesystemSetupFailed;
+            };
+            _ = std.c.chmod(instance_tmp.ptr, 0o1777);
 
-                // Set permissions on instance tmp (sticky bit + world writable)
-                {
-                    var tmp_buf: [PATH_MAX]u8 = undefined;
-                    @memcpy(tmp_buf[0..instance_tmp.len], instance_tmp);
-                    tmp_buf[instance_tmp.len] = 0;
-                    _ = std.c.chmod(@ptrCast(&tmp_buf), 0o1777);
-                }
+            const mount_path = std.fmt.bufPrint(&path_buf, "{s}/tmp", .{jail_path}) catch return error.InvalidPath;
+            mkdirp(mount_path) catch return error.FilesystemSetupFailed;
 
-                // Mount instance-specific tmp as /tmp in jail
-                const mount_path = std.fmt.bufPrint(&path_buf, "{s}/tmp", .{jail_path}) catch continue;
-                mkdirp(mount_path) catch continue;
-
-                stdout.print("Mounting {s} -> {s} (rw, isolated)\n", .{ instance_tmp, mount_path }) catch {};
-                mountNullfs(instance_tmp, mount_path, false) catch {
-                    stdout.print("Warning: Failed to mount isolated tmp\n", .{}) catch {};
-                };
-                continue;
-            }
-
-            // Check if source path exists and is a directory
-            var src_buf: [PATH_MAX]u8 = undefined;
-            @memcpy(src_buf[0..rule.path.len], rule.path);
-            src_buf[rule.path.len] = 0;
-
-            var st: std.c.Stat = undefined;
-            if (stat(@ptrCast(&src_buf), &st) == 0 and std.c.S.ISDIR(st.mode)) {
-                const mount_path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ jail_path, rule.path }) catch continue;
-
-                mkdirp(mount_path) catch continue;
-
-                const rdonly = !rule.permissions.write;
-                stdout.print("Mounting {s} -> {s} ({s})\n", .{
-                    rule.path,
-                    mount_path,
-                    if (rdonly) "ro" else "rw",
-                }) catch {};
-
-                mountNullfs(rule.path, mount_path, rdonly) catch {
-                    stdout.print("Warning: Failed to mount {s}\n", .{rule.path}) catch {};
-                };
-            }
+            stdout.print("Mounting {s} -> {s} (rw, isolated)\n", .{ instance_tmp, mount_path }) catch {};
+            mountNullfs(instance_tmp, mount_path, false) catch {
+                stdout.print("Error: Failed to mount isolated tmp\n", .{}) catch {};
+                return error.MountFailed;
+            };
+            continue;
         }
+
+        try mountRule(io, jail_path, rule);
     }
 
     // Set permissions on tmp again after mounts
@@ -1272,7 +1555,14 @@ pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_
         stdout.print("Created user {s} with UID {d}, GID {d}\n", .{ username, target_uid, target_gid }) catch {};
     } else {
         username = capability.username;
-        const user_info = try lookupUser(username);
+        const user_info = lookupUser(username) catch |err| {
+            stdout.print("Error: User {s} does not exist\n", .{username}) catch {};
+            return err;
+        };
+        if (user_info.uid == 0) {
+            stdout.print("Error: Refusing to run as {s} (uid 0). The program must run unprivileged.\n", .{username}) catch {};
+            return error.PermissionDenied;
+        }
         target_uid = user_info.uid;
         target_gid = user_info.gid;
         stdout.print("Using existing user {s} (UID {d}, GID {d})\n", .{ username, target_uid, target_gid }) catch {};
@@ -1317,7 +1607,11 @@ pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_
     };
 
     // Set resource limits
-    setResourceLimits(io, jail_name, capability.limits);
+    setResourceLimits(io, jail_name, capability.limits) catch {
+        cleanupIsolation(io);
+        removeResourceLimits(jail_name);
+        return error.ResourceLimitFailed;
+    };
 
     // Attach to jail
     attachToJail(io, jid) catch {
@@ -1417,6 +1711,19 @@ test "trustedInstanceDir accepts only isolate's own layout" {
     for (bad) |path| {
         try std.testing.expect(trustedInstanceDir(path) == null);
     }
+}
+
+test "pidFromName" {
+    try std.testing.expectEqual(@as(?i32, 2947), pidFromName("isolate-2947", jail_name_prefix));
+    try std.testing.expectEqual(@as(?i32, 12), pidFromName("app-12", "app-"));
+    try std.testing.expect(pidFromName("isolate-", jail_name_prefix) == null);
+    try std.testing.expect(pidFromName("isolate-12x", jail_name_prefix) == null);
+    try std.testing.expect(pidFromName("webjail", jail_name_prefix) == null);
+}
+
+test "parentPid of this process is its parent; of a missing pid, null" {
+    try std.testing.expectEqual(@as(?i32, c.getppid()), parentPid(c.getpid()));
+    try std.testing.expect(parentPid(99999999) == null);
 }
 
 test "isEphemeralUsername" {
