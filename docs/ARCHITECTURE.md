@@ -2,7 +2,7 @@
 
 This document describes how isolate is built: its modules, the data it keeps, and what happens during each command. What isolate must guarantee, and what it deliberately leaves out, is specified in the [design documents](design/README.md).
 
-isolate is a single command-line program for FreeBSD. It has no daemon and keeps no state apart from one small file per running instance.
+isolate is a single command-line program for FreeBSD: a sandbox launcher that runs a program from the host in a jail holding only what a capability file lists. It has no daemon and keeps no state apart from one small file per running instance.
 
 ## Overview
 
@@ -29,11 +29,13 @@ isolate is a single command-line program for FreeBSD. It has no daemon and keeps
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `src/main.zig` | ~1270 | Argument parsing, the six commands, the fork between the jailed program and the process that waits for it, signal forwarding. |
-| `src/freebsd.zig` | ~1450 | Everything that touches the system: instance directory, mounts, ephemeral user, jail creation, VNET, resource limits, privilege drop, cleanup and teardown. |
-| `src/caps.zig` | ~880 | The `Capabilities` structure and the capability-file parser. |
-| `src/detect.zig` | ~740 | ELF reading and the heuristics behind `isolate detect`. |
-| `src/registry.zig` | ~430 | The on-disk registry of running instances. |
+| `src/main.zig` | ~1400 | Argument parsing, the six commands, the fork between the jailed program and the process that waits for it, signal forwarding. |
+| `src/freebsd.zig` | ~2000 | Everything that touches the system: instance directory, mounts, ephemeral user, jail creation, VNET, resource limits, loading pf rules, privilege drop, cleanup and teardown. |
+| `src/caps.zig` | ~1060 | The `Capabilities` structure and the capability-file parser. |
+| `src/detect.zig` | ~1060 | ELF reading, the guesses behind `isolate detect`, and writing the capability file. |
+| `src/libs.zig` | ~300 | The shared-library closure of a binary: what the run-time linker would load, found without running it. |
+| `src/netrules.zig` | ~180 | Network rules as pf rules, and whether a capability file's rules can be enforced. |
+| `src/registry.zig` | ~510 | The on-disk registry of running instances. |
 | `src/syscheck.zig` | ~240 | Kernel feature detection for `isolate check` and for warnings. |
 | `src/c_api.zig` | ~40 | A shared `@cImport` of the libc headers `main.zig` uses. |
 | `src/freebsd_proc.c` | ~25 | One function, the parent of a process, in C because `<sys/user.h>` cannot be imported into Zig 0.16. |
@@ -64,6 +66,7 @@ isolate is a dynamically linked executable. At run time it uses:
 | `/usr/sbin/pwd_mkdb` | Building the user database in the jail's `/etc`. |
 | `/sbin/ifconfig` | Moving an interface into a VNET jail, configuring it, and taking it back. |
 | `/sbin/devfs` | Hiding device nodes in the jail's `/dev`. |
+| `/sbin/pfctl`, and pf enabled with `anchor "isolate/*"` | Network rules. Not needed otherwise. |
 | A kernel with jails, nullfs and devfs | Always. |
 | `kern.racct.enable=1` | Resource limits. |
 | A kernel with `VIMAGE` | `network_mode: vnet`. |
@@ -86,7 +89,7 @@ pub const Capabilities = struct {
     workspace_path: ?[]const u8,       // host directory mounted at /workspace
     network_config: NetworkConfig,     // mode, interface, ip_address
 
-    network_rules: std.ArrayList(NetworkRule),  // parsed, not enforced
+    network_rules: std.ArrayList(NetworkRule),  // enforced with pf, VNET jails only
     file_rules: std.ArrayList(FileRule),
 
     env_vars: std.ArrayList(EnvVar),
@@ -149,7 +152,7 @@ pub const CapabilityHint = struct {
 
 Nothing is written anywhere else. In particular nothing is created under `/tmp`.
 
-The jail root contains a copy of the program at `/<basename>`, a user database in `etc` holding root and the program's user, devfs at `dev`, and empty directories that the rules mount over. The full list is in [design/01-isolation.md](design/01-isolation.md).
+The jail root contains the program, mounted read-only at the path it has on the host, a user database in `etc` holding root and the program's user, devfs at `dev`, and empty directories that the rules mount over. The full list is in [design/01-isolation.md](design/01-isolation.md).
 
 ## Execution flow
 
@@ -170,21 +173,23 @@ main: parse arguments (options only before the binary)
   3 build the jail filesystem:               from the pipe; on a short read
       directories                            the child failed: report, exit
       nullfs  workspace → /workspace       c write the registry entry
-      copy the binary to /<basename>         (exclusive; on failure stop the child)
-      build the user database in etc/      d waitpid(child)
-      mount devfs; hide all but a          e VNET: ifconfig <if> -vnet <jid>
-        few nodes (devfs rule apply)         jail_remove
-      nullfs  one mount per rule             unmount everything under the
+      build the user database in etc/        (exclusive; on failure stop the child)
+      mount devfs; hide all but a          d waitpid(child)
+        few nodes (devfs rule apply)       e VNET: ifconfig <if> -vnet <jid>
+      nullfs  one mount per rule,            jail_remove
+        shortest path first                  unmount everything under the
+      nullfs  the program, read-only
   4 jail_set (create)                         instance directory, deepest first
       VNET: ifconfig <if> vnet <jid>         remove the directory tree
             ifconfig -j <jid> ... up         pw userdel app-<pid>
   5 rctl_add_rule per limit                  remove the jail's rctl rules
+    pfctl -a isolate/<jail> -f rules         and its pf anchor
   6 jail_attach                            f delete the registry entry
     setgroups, setgid, setuid              g exit with the child's status
     set environment
   7 write jail id, username, path
     to the pipe
-  8 closefrom(3); execv /<basename>
+  8 closefrom(3); execv the program's path
 ```
 
 If any of the child's steps 1–6 fails, the child removes what it created and exits; it never writes to the pipe. That includes a rule whose path does not exist, a limit that cannot be applied, and a VNET interface that cannot be moved or configured: nothing asked for in the capability file is skipped.
@@ -204,16 +209,24 @@ Reads every `*.json` in the registry directory and computes each instance's stat
 ### `detect`
 
 ```
-open the file; read the ELF header and section headers
-  ├─ .dynamic + .dynstr  → DT_NEEDED library names   → match against a table
-  ├─ .dynsym  + .dynstr  → imported symbol names     → socket/bind, fork, open, ...
-  ├─ .rodata, .data, .dynstr → printable strings     → /etc/..., /var/..., http://
+facts (libs.zig):
+  read .interp, DT_NEEDED and DT_RUNPATH/DT_RPATH of the binary
+  resolve each needed name: run path, then the directories in
+    /var/run/ld-elf.so.hints, then /lib and /usr/lib
+  repeat for every library found                     → the library closure
+
+guesses (detect.zig):
+  ├─ DT_NEEDED library names                         → match against a table
+  ├─ .dynsym imported symbols                        → socket/bind, fork, open, dlopen
+  ├─ .rodata, .data, .dynstr printable strings       → /etc/..., /var/..., http://
   └─ file name                                       → match against a table
-sort hints by confidence; drop exact duplicates
-write the capability file: fixed defaults, then one commented block per hint
+
+write the capability file:
+  user and limits; the closure as live filesystem rules, one per file;
+  every guess as a comment
 ```
 
-All reads are positional (`pread`). A file that is not ELF produces a warning and a file containing only the defaults. The tables and their limits are in [design/06-detection.md](design/06-detection.md).
+All reads are positional (`pread`); the program is never run. A file that is not ELF produces a warning and a file containing only the defaults. The distinction between facts and guesses, and its limits, are in [design/06-detection.md](design/06-detection.md).
 
 ### `check`
 
@@ -234,6 +247,7 @@ Reads `kern.racct.enable`, `kern.features.vimage`, `security.jail.jailed`, `kern
 | Unmount | `getmntinfo(3)`, `unmount(2)`, with `MNT_FORCE` as a fallback |
 | Remove a directory tree | `fts(3)` with `FTS_PHYSICAL | FTS_XDEV` |
 | Resource limits | `rctl_add_rule(2)`, `rctl_remove_rule(2)`, `rctl_get_rules(2)` |
+| Network rules | `fork` + `execv("/sbin/pfctl")`: `-s info`, `-s rules`, `-a isolate/<jail> -f`, `-F rules`, `-s Anchors` |
 | Create and delete the user | `fork` + `execv("/usr/sbin/pw")` |
 | The jail's user database | `fork` + `execv("/usr/sbin/pwd_mkdb")` |
 | VNET interface | `fork` + `execv("/sbin/ifconfig")`: `vnet`, `-j <jid> … up`, `-vnet` |
@@ -282,9 +296,9 @@ Output goes to stdout and stderr through unbuffered, streaming writers, so that 
 
 ## Tests
 
-`zig build test` runs the unit tests of every module: 47 on FreeBSD, 37 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry, generated capability files, and small helpers. None of them creates a jail.
+`zig build test` runs the unit tests of every module: 60 on FreeBSD, 49 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry, generated capability files, and small helpers. None of them creates a jail.
 
-`tests/scenarios.sh` does. It needs FreeBSD and root, creates real jails, users, mounts, limits and an epair interface, and makes about 85 checks, each labelled with the invariant it demonstrates. It refuses to start on a host that already has isolate leftovers, and its last check is that it left none. Run it with `doas sh tests/scenarios.sh` after `zig build`.
+`tests/scenarios.sh` does. It needs FreeBSD and root, creates real jails, users, mounts, limits and an epair interface, and makes about 115 checks, each labelled with the invariant it demonstrates. It refuses to start on a host that already has isolate leftovers, and its last check is that it left none. Run it with `doas sh tests/scenarios.sh` after `zig build`.
 
 ## Measurements
 

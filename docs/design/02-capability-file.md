@@ -30,7 +30,7 @@ key: value            # trailing comment
 - One `key: value` per line. Leading and trailing whitespace is ignored.
 - Lines that are empty or start with `#` are ignored. A `#` inside a value starts a comment, so values cannot contain `#`.
 - A line is at most 4096 bytes.
-- At most 32 `filesystem:` rules, 32 `env:` entries and 16 `network:` rules.
+- At most 128 `filesystem:` rules, 32 `env:` entries and 16 `network:` rules.
 - A key may be repeated. For single-valued keys the last occurrence wins.
 
 ## Keys
@@ -48,9 +48,9 @@ key: value            # trailing comment
 | `memory` | number with optional `K`, `M`, `G`, `B` suffix (powers of 1024) | unlimited |
 | `processes` | integer | unlimited |
 | `files` | integer | unlimited |
-| `network` | `<proto>[:<address>]:<port>[:<direction>]`, or `unix:<path>`, or `none` | none |
+| `network` | `<tcp or udp>[:<IPv4 address>][:<port>][:<direction>]`, or `none` | none |
 
-Every key in this table takes effect, with one exception: **`network:` rules are parsed and listed but not enforced.** A run with such rules prints a warning saying so. Enforcement is planned; see [05-network.md](05-network.md), NET-6.
+Every key in this table takes effect. `network:` rules are enforced with pf and need a VNET jail on an epair; a file that has rules and cannot have them enforced is refused. See [05-network.md](05-network.md).
 
 Anything else is an error. In particular these are **refused**, because isolate would have nothing to do with them:
 
@@ -60,6 +60,9 @@ Anything else is an error. In particular these are **refused**, because isolate 
 | `network_default:`, `filesystem_default:` | They never had an effect. Nothing is mounted by default already. |
 | `filesystem: <path>:w` | A mount cannot be write-only. |
 | `filesystem: <path>:rx`, `:x` | Rules do not control execution. |
+| `network: unix:<path>` | A packet filter cannot enforce it. Access to a socket file is a matter of filesystem rules. |
+| `network:` with a host name or IPv6 address | Rules are IPv4 addresses and networks. |
+| `network:` rules without `network_mode: vnet:<epairNb>` | There would be nothing to enforce them on. |
 | Any key not in the table | Most likely a typo. |
 
 ### `user`
@@ -75,6 +78,8 @@ The host path is mounted with nullfs at the same path inside the jail.
 - The path must exist on the host when the run starts, as a directory or a regular file. A single file is mounted as a single file.
 - `:r` or no suffix means read-only. `:rw` means read-write.
 - **`/tmp` is special.** A rule for `/tmp` mounts a directory private to the instance, not the host's `/tmp`.
+- Rules are mounted shortest path first, so their order in the file does not matter.
+- A rule for something inside a directory that another rule mounts adds nothing and is accepted. If it asks for `:rw` inside a read-only directory, the file contradicts itself and is refused.
 
 ### `sysv_ipc`
 
@@ -91,7 +96,7 @@ Each entry is set in the program's environment after the built-in variables, so 
 | The file does not exist | A warning, then the run continues with the defaults: `user: auto`, `network_mode: inherit`, no filesystem rules, no limits, inherited environment. Because nothing is mounted, a dynamically linked program cannot start. |
 | The file exists but cannot be read, or a line is longer than 4096 bytes | Error. The run does not start. |
 | A line has an unknown key, an invalid value, a refused form, or exceeds a rule limit | Each such line is reported as `<file>:<line>: <reason>`. The run does not start. `-v` is not needed to see this. |
-| A rule names a path that does not exist, or a limit or network mode cannot be applied | Error at setup. The run does not start and nothing is left behind. See ISO-11, LIM-5, NET-5. |
+| A rule names a path that does not exist, or a limit, network mode or network rule cannot be applied | Error at setup. The run does not start and nothing is left behind. See ISO-11, LIM-5, NET-5, NET-6. |
 
 `isolate run -n` (dry run) applies the same checks to the file and prints the settings a run would use. It does not check that rule paths exist.
 
@@ -107,12 +112,13 @@ Each entry is set in the program's environment after the built-in variables, so 
 
 | ID | Invariant | Status |
 |---|---|---|
-| CAP-1 | Every key the parser accepts either changes how the program runs, as documented here, or is rejected. There are no silent no-ops. | Holds (tested; unit tests). `network:` rules are the declared exception: accepted, not enforced, and a warning says so on every run. |
+| CAP-1 | Every key the parser accepts either changes how the program runs, as documented here, or is rejected. There are no silent no-ops. | Holds (tested; unit tests) |
 | CAP-2 | A line isolate cannot apply is reported on every run, with its file and line number, and the run does not start. | Holds (tested; unit test `loadFromReader reports every line it cannot apply`) |
 | CAP-3 | No filesystem rule can mount the host's root, or a path that means something other than it reads. | Holds (tested; unit test `parseFileRule rejects unsafe paths`) |
 | CAP-4 | A missing capability file never widens access: the defaults mount nothing. | Holds (tested) |
 | CAP-5 | An option given on the command line takes precedence over the same setting in the file. | Holds (by inspection) |
 | CAP-6 | Parsing is bounded: line length, rule counts and entry sizes cannot make isolate consume unbounded memory. | Holds (by inspection) |
+| CAP-7 | The order of filesystem rules in the file does not change the result, and rules that overlap either agree or are refused. | Holds (tested): a file rule and a rule for its directory work in either order; a read-write rule inside a read-only one is refused. |
 
 ## Success criteria
 
@@ -134,4 +140,3 @@ All four pass.
 - Values cannot contain `#`. There is no escape.
 - A repeated single-valued key is not reported; the last one wins.
 - Whether a missing capability file should stop the run instead of falling back to defaults is undecided. It is safe (CAP-4) but rarely what the user wants.
-- `network:` rules remain the one accepted key without effect, until NET-6 is built.

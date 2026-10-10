@@ -2,21 +2,21 @@
 
 ## Purpose
 
-The capability file decides what network a program has: the host's, none, or a network stack of its own. A further goal, not yet built, is to restrict which connections it may make or accept.
+The capability file decides what network a program has: the host's, none, or a network stack of its own. For a program with a stack of its own, it can also say exactly which connections may be made and accepted.
 
 ## Scope
 
 - The three network modes and what each guarantees.
 - VNET: what isolate does with the interface it is given.
-- `network:` rules: the planned enforcement.
+- `network:` rules: what they mean and how they are enforced.
 
 ## Out of scope
 
 - **Creating network infrastructure.** isolate does not create epair or bridge interfaces, assign addresses on the host side, add routes, or configure NAT. The interface named in the capability file must already exist.
-- **Address management.** No DHCP, no allocation of addresses to instances.
-- **DNS.** The jail gets no `resolv.conf` unless a rule provides one.
-- **IPv6 configuration in VNET jails.** `network_ip` is passed to `ifconfig inet`.
-- **Bandwidth limits and traffic accounting.**
+- **The host's firewall.** isolate loads rules into an anchor of its own. It does not enable pf, write `pf.conf`, or manage any other rule.
+- **Network rules without a VNET jail.** With the host's network there is no interface that carries only the program's traffic. A capability file with rules and `network_mode: inherit` is refused.
+- **IPv6 in rules, and protocols other than TCP and UDP.** Rules are IPv4. With any rule present, everything they cannot express is blocked.
+- **Address management, DNS, bandwidth limits and traffic accounting.**
 
 ## Modes
 
@@ -40,82 +40,93 @@ Before removing a VNET jail, isolate moves every interface other than the loopba
 
 The jail gets no default route. It can reach only the networks its interface is directly attached to.
 
+## Network rules
+
+```
+network: tcp:8080:inbound              accept TCP connections on port 8080
+network: tcp:443:outbound              connect to TCP port 443 anywhere
+network: udp:10.0.0.53:53:outbound     send DNS queries to one server
+network: tcp:10.0.99.1:5432:inbound    accept 5432 from one address
+network: udp:514                       both directions
+network: none                          no connections at all
+```
+
+The form is `<tcp|udp>[:<IPv4 address or network>][:<port>][:<inbound|outbound|both>]`. The address is the *other* end: the destination for `outbound`, the source for `inbound`. Host names are not accepted.
+
+**Meaning**
+
+- No rules: no filtering. The jail can use whatever its interface reaches.
+- One or more rules: only what a rule allows is passed. Everything else to or from the jail is dropped, in both directions, including ICMP and IPv6.
+- Replies belong to the connection that caused them: an `outbound` rule lets the answers back in.
+
+**Mechanism**
+
+Rules require `network_mode: vnet:<epairNb>`. The jail holds the `b` end of an epair; the `a` end stays on the host, and every packet to or from the jail crosses it. isolate writes pf rules for that interface into an anchor named `isolate/<jail name>`:
+
+```
+pass in  quick on epair0a inet proto tcp from any to any port 443 keep state    # outbound from the jail
+pass out quick on epair0a inet proto tcp from any to any port 8080 keep state   # inbound to the jail
+block drop quick on epair0a all
+```
+
+Seen from the host end the directions are mirrored: what the jail sends arrives *in*. Every rule is `quick`, so a match in the anchor decides at once.
+
+The anchor is loaded after the jail is created and before the program starts. pf states on the interface are flushed at the same time, so that connections an earlier user of the interface had open cannot carry over. The anchor is removed when the instance is cleaned up, by `stop` and `clean` for an instance whose isolate process has died, and `clean` removes anchors of jails that no longer exist.
+
+**What the host must provide**
+
+pf enabled, with this line in `pf.conf` before any rule that passes traffic:
+
+```
+anchor "isolate/*"
+```
+
+`isolate check` reports whether both are in place. If a capability file has rules and they are not, the run is refused.
+
 ## Invariants
+
+"Tested" names a check in `tests/scenarios.sh`, run on FreeBSD 15.1.
 
 | ID | Invariant | Status |
 |---|---|---|
 | NET-1 | In `none` mode the program cannot create an IPv4 or IPv6 socket. | Holds (tested) for IPv4: `socket()` fails with `EPROTONOSUPPORT`. IPv6 by inspection. |
-| NET-2 | In `vnet` mode the jail's network stack contains only its loopback and the named interface. The host's addresses are not reachable from the jail unless they are on that interface's network. | Holds (tested): the jail reached the host on the epair address and not on the host's LAN address. |
-| NET-3 | A service listening in a VNET jail is reachable only at the jail's address, not at the host's addresses. | Holds (tested) |
+| NET-2 | In `vnet` mode the jail's network stack contains only its loopback and the named interface. The host's addresses are not reachable from the jail unless they are on that interface's network. | Holds (tested) |
+| NET-3 | A service listening in a VNET jail is reachable only at the jail's address, not at the host's addresses. | Holds (tested by hand with PostgreSQL; not in the scenarios) |
 | NET-4 | The interface given to a VNET jail is back on the host when the run ends, whatever the program did with it. | Holds (tested), including after the program made a TCP connection. |
-| NET-5 | If a capability file asks for `none` or `vnet` and isolate cannot provide it, the run does not start. The program is never given more network than the file states. | Holds (tested) for an interface that does not exist: the run is refused, the program never starts, nothing is left behind. A failed address assignment takes the same path, and a kernel without VNET is refused before the jail is created (both by inspection). |
-| NET-6 | When a capability file contains `network:` rules, the program can make and accept only the connections the rules allow. | **Planned.** Rules are parsed and listed; nothing enforces them. A run with rules prints a warning saying so. |
-
-## Planned: enforcing `network:` rules (NET-6)
-
-This is a goal with criteria, not a finished design.
-
-**Rule syntax** (already parsed):
-
-```
-network: tcp:8080:inbound        accept TCP connections on port 8080
-network: tcp:443:outbound        connect to TCP port 443 anywhere
-network: udp:10.0.0.53:53:outbound
-network: none                    no connections at all
-```
-
-**Intended semantics**
-
-- No `network:` rules: no filtering. Only `network_mode` applies.
-- One or more rules: everything not matched by a rule is blocked, in both directions.
-- Rules never widen access beyond what the mode already gives.
-
-**Intended mechanism: pf**
-
-Rules for an instance are loaded into a pf anchor of its own when the jail is created and flushed when it is removed.
-
-- In `vnet` mode, the rules filter on the host side of the jail's interface.
-- In `inherit` mode the jail shares the host's addresses, so traffic cannot be told apart by address or interface. pf can match TCP and UDP sockets by owning user, and every `user: auto` instance has a user of its own, so rules would be keyed on the ephemeral uid.
-
-**Open questions**
-
-1. pf must be enabled and its main ruleset must reference isolate's anchor. Does isolate require the administrator to set that up, or refuse to run rules without it? Under NET-5 it must refuse.
-2. Matching by user covers TCP and UDP only, and only when the user is unique to the instance. Should rules with `user: <existing>` in `inherit` mode be rejected?
-3. `unix:<path>` rules cannot be enforced by a packet filter. Drop the form, or enforce it through the filesystem rules?
-4. Cleanup: the anchor must be removed on every exit path and by `clean`, like every other per-instance resource ([03-lifecycle.md](03-lifecycle.md), LIF-1 and LIF-2).
+| NET-5 | If a capability file asks for `none` or `vnet` and isolate cannot provide it, the run does not start. The program is never given more network than the file states. | Holds (tested) for an interface that does not exist. A failed address assignment takes the same path, and a kernel without VNET is refused before the jail is created (both by inspection). |
+| NET-6 | When a capability file contains `network:` rules, the program can make and accept only the connections the rules allow. If the rules cannot be enforced, the run does not start. | Holds (tested): an allowed outbound port connects and another port on the same host does not; a rule with an address allows that address and port only; `network: none` blocks everything; an allowed inbound port is reachable from the host and another listening port is not; rules without a VNET jail, or with a host name, are refused. Refusal when pf is not enabled or lacks the anchor: by inspection, since the test host has both. |
+| NET-7 | An instance's pf rules exist only while its jail exists. | Holds (tested): no anchor remains after a run, and `clean` removes the anchor of an instance whose isolate process was killed. |
 
 ## Success criteria
 
-Today:
-
 1. `none`: a program's attempt to open a TCP socket fails.
-2. `vnet` with an epair: the program reaches the host's end of the epair, cannot reach the host's other addresses, and a server in the jail answers on the jail's address only.
+2. `vnet` with an epair: the program reaches the host's end of the epair and cannot reach the host's other addresses.
 3. After the run the epair's jail end is listed on the host again.
 4. `inherit`: the program reaches whatever the host reaches.
-
 5. With an interface name that does not exist, the run is refused.
-6. On a kernel without VNET, a capability file with `network_mode: vnet` is refused.
+6. With `network: tcp:P:outbound` as the only rule, the program connects to port P and to no other port.
+7. With `network: tcp:P:inbound` as the only rule, a server in the jail is reachable on P and on no other port it listens on.
+8. After the run, no pf anchor of the instance remains.
+9. A capability file with rules and `network_mode: inherit` is refused, with the reason.
 
-Criteria 1–5 pass on FreeBSD 15.1. Criterion 6 has not been run: the test host has VNET.
-
-For NET-6, once built:
-
-7. With `network: tcp:443:outbound` as the only rule, the program connects to port 443 and to no other port, and accepts no inbound connection.
-8. With `network: tcp:8080:inbound` as the only rule, a server in the jail is reachable on 8080 and the program cannot connect out.
-9. After the run, no pf rule or anchor of the instance remains.
-10. With pf disabled, a capability file containing rules is refused.
+All nine pass on FreeBSD 15.1. Not run, because the test host has VNET and pf: refusal on a kernel without VNET, and refusal with pf disabled.
 
 ## Failure criteria
 
 - A program in `none` mode communicates over IP.
 - A program in `vnet` mode reaches a host address that is not on its interface's network.
 - A program asked to run in `none` or `vnet` runs with the host's network.
-- Once NET-6 exists: a connection the rules do not allow succeeds.
+- A connection the rules do not allow succeeds.
+- A program starts although its capability file has rules that were not loaded.
+- An instance's rules remain in pf after it is gone.
 
 ## Known gaps
 
+- **A rule in the host's `pf.conf` can override the anchor.** A `quick` rule placed before the `anchor` line decides first. The anchor line belongs at the top of the filter rules; isolate checks that it exists, not where it is.
+- **With rules, ICMP is blocked**, so `ping` and path-MTU discovery do not work for the jail. No rule form allows it.
+- **Rules are IPv4.** IPv6 traffic of a jail with rules is dropped. IPv6 has not been tested in any mode.
+- Rules need an epair. A physical or VLAN interface given to a jail has no end on the host to filter on, and a capability file with rules for one is refused.
+- Outbound connections beyond the host need the host to forward and usually to translate addresses. That is host configuration; the rules only decide what is allowed to leave the jail.
 - `allow.socket_af` is set to true in every mode, permitting socket families beyond IPv4, IPv6, UNIX and route. Its effect in `none` mode has not been reviewed.
-- IPv6 has not been tested in any mode.
 - Several instances cannot share one interface; each VNET instance needs its own.
 - A jail whose program made network connections can remain listed as dying (`jls -d`) after the run. It holds nothing of isolate's; see [03-lifecycle.md](03-lifecycle.md), "Known gaps".
-- In `inherit` mode a program can bind any unprivileged port on any host address, including ones another instance wants.

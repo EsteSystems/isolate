@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const elf = std.elf;
 const caps = @import("caps.zig");
+const libs = @import("libs.zig");
 
 /// Maximum capability hints
 pub const MAX_CAPABILITY_HINTS = 64;
@@ -33,6 +34,9 @@ pub const DetectionResult = struct {
     allocator: Allocator,
     hints: std.ArrayList(CapabilityHint),
     binary_name: []const u8,
+    /// The program imports dlopen(): it may load libraries at run time
+    /// that no static analysis can list
+    uses_dlopen: bool = false,
 
     const Self = @This();
 
@@ -87,7 +91,6 @@ const LibraryPattern = struct {
 };
 
 const library_patterns = [_]LibraryPattern{
-    .{ .pattern = "libc.so", .description = "Standard C library - basic filesystem access", .capability = "filesystem: /lib:r\nfilesystem: /usr/lib:r\nfilesystem: /libexec:r\nfilesystem: /usr/local/lib:r", .confidence = 95 },
     .{ .pattern = "libssl", .description = "SSL/TLS library - likely needs network access", .capability = "network: tcp:443:outbound\nnetwork: tcp:80:outbound", .confidence = 80 },
     .{ .pattern = "libcrypto", .description = "Cryptography library", .capability = "network: tcp:443:outbound", .confidence = 75 },
     .{ .pattern = "libpq", .description = "PostgreSQL library - needs database connection", .capability = "network: tcp:5432:outbound", .confidence = 85 },
@@ -231,6 +234,29 @@ pub const ElfAnalyzer = struct {
 
     /// Get linked libraries from .dynamic section (DT_NEEDED entries)
     pub fn getNeededLibraries(self: *Self, result: *std.ArrayList([]const u8)) !void {
+        return self.getDynamicStrings(elf.DT_NEEDED, result);
+    }
+
+    /// The program interpreter named in the .interp section, e.g.
+    /// /libexec/ld-elf.so.1. Null for a statically linked program. Caller
+    /// owns the result.
+    pub fn getInterpreter(self: *Self) !?[]const u8 {
+        const shdr = self.findSection(".interp") orelse return null;
+        if (shdr.sh_size == 0 or shdr.sh_size > 4096) return null;
+
+        const data = try self.allocator.alloc(u8, shdr.sh_size);
+        defer self.allocator.free(data);
+        const n = self.file.readPositionalAll(self.io, data, shdr.sh_offset) catch return null;
+
+        const path = std.mem.sliceTo(data[0..n], 0);
+        if (path.len == 0) return null;
+        return try self.allocator.dupe(u8, path);
+    }
+
+    /// Append the string value of every .dynamic entry with the given tag:
+    /// DT_NEEDED (library names), DT_RPATH or DT_RUNPATH (search paths).
+    /// The strings are owned by the caller.
+    pub fn getDynamicStrings(self: *Self, tag: i64, result: *std.ArrayList([]const u8)) !void {
         // Find .dynamic section
         const dynamic_shdr = self.findSection(".dynamic") orelse return;
 
@@ -254,7 +280,7 @@ pub const ElfAnalyzer = struct {
             const bytes = self.file.readPositionalAll(self.io, std.mem.asBytes(&dyn), offset) catch break;
             if (bytes < entry_size) break;
 
-            if (dyn.d_tag == elf.DT_NEEDED) {
+            if (dyn.d_tag == tag) {
                 const name_offset = dyn.d_val;
                 if (name_offset < dynstr.len) {
                     const lib_name = std.mem.sliceTo(dynstr[name_offset..], 0);
@@ -402,6 +428,9 @@ pub fn analyzeSymbols(allocator: Allocator, analyzer: *ElfAnalyzer, result: *Det
         if (std.mem.eql(u8, sym, "socket") or std.mem.eql(u8, sym, "__socket")) {
             has_socket = true;
         }
+        if (std.mem.eql(u8, sym, "dlopen")) {
+            result.uses_dlopen = true;
+        }
         if (std.mem.eql(u8, sym, "bind") or std.mem.eql(u8, sym, "listen")) {
             has_bind = true;
         }
@@ -499,16 +528,27 @@ fn isMountable(io: std.Io, path: []const u8) bool {
 /// Generate capability file from detection results.
 ///
 /// Every line written without a leading '#' is one `isolate run` applies as
-/// written, so the file loads with no problems (design: DET-2). What
-/// detection inferred but isolate cannot apply is written as a comment that
-/// says why: network rules (not enforced), filesystem rules for paths that
-/// do not exist here, and anything that is not a valid rule.
+/// written, so the file loads with no problems (design: DET-2).
+///
+/// Two kinds of line are written, and only one kind is live:
+///
+///   Facts - the shared libraries the program is linked against, found by
+///   following its dependencies. These are live rules.
+///
+///   Guesses - anything inferred from the program's name, the symbols it
+///   imports or strings embedded in it. These are written as comments for
+///   a person to enable. A guess is never live: the strings in a binary
+///   name files such as private keys, and a generated file must not grant
+///   access to them unasked.
 pub fn generateCapabilityFile(
     io: std.Io,
     allocator: Allocator,
     binary_path: []const u8,
     output_path: []const u8,
     result: *DetectionResult,
+    closure: ?*const libs.Closure,
+    /// Write the directories the libraries are in, not the files
+    use_dirs: bool,
 ) !void {
     const file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
     defer file.close(io);
@@ -549,19 +589,21 @@ pub fn generateCapabilityFile(
     try writer.print("# Auto-generated capability file for {s}\n", .{binary_path});
     try writer.print("# Generated on: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\n", .{
         year_day.year,
-        @as(u32, @intFromEnum(month_day.month)) + 1, // month is 0-indexed enum
+        @as(u32, @intFromEnum(month_day.month)), // the enum starts at 1 for January
         month_day.day_index + 1, // day is 0-indexed
         day_seconds.getHoursIntoDay(),
         day_seconds.getMinutesIntoHour(),
         day_seconds.getSecondsIntoMinute(),
     });
-    try writer.writeAll("# This is a starting point from static analysis, not a verified policy.\n");
-    try writer.writeAll("# Review every line. Check the result with: isolate run -n -v <binary>\n\n");
+    try writer.writeAll("#\n# Live lines are facts read from the binary: the libraries it links against.\n");
+    try writer.writeAll("# Commented lines are guesses from its name, symbols and embedded strings;\n");
+    try writer.writeAll("# uncomment the ones the program really needs.\n");
+    try writer.writeAll("# Check the result with: isolate run -n -v <binary>\n\n");
 
     try writer.writeAll("# User context - creates ephemeral user automatically\n");
     try writer.writeAll("user: auto\n\n");
 
-    try writer.writeAll("# Resource limits (adjust based on application needs)\n");
+    try writer.writeAll("# Resource limits: defaults, raised by what was detected. Adjust them.\n");
     try writer.print("memory: {d}M\n", .{memory_bytes / (1024 * 1024)});
     try writer.print("processes: {d}\n", .{processes});
     try writer.print("files: {d}\n\n", .{files});
@@ -580,8 +622,87 @@ pub fn generateCapabilityFile(
     var file_rule_count: usize = 0;
     var env_count: usize = 0;
 
-    try writer.writeAll("# Detected capabilities (sorted by confidence)\n");
-    try writer.writeAll("# Lines starting with '#' are not applied; each says why.\n\n");
+    if (closure) |cl| {
+        if (cl.interpreter == null and cl.libraries.items.len == 0) {
+            try writer.writeAll("# Statically linked: this program needs no shared libraries.\n\n");
+        } else {
+            if (use_dirs) {
+                try writer.writeAll("# Shared libraries: the directories this program's libraries are in.\n");
+                try writer.writeAll("# Everything in these directories is visible in the jail. Without\n");
+                try writer.writeAll("# --dirs, detect lists only the library files themselves.\n");
+                var lib_dirs = try cl.directories(allocator);
+                defer lib_dirs.deinit(allocator);
+                if (cl.interpreter) |interp| {
+                    if (std.fs.path.dirname(interp)) |interp_dir| {
+                        try writer.print("filesystem: {s}:r\n", .{interp_dir});
+                        try added_paths.put(try allocator.dupe(u8, interp_dir), {});
+                        file_rule_count += 1;
+                    }
+                }
+                for (lib_dirs.items) |lib_dir| {
+                    if (added_paths.contains(lib_dir)) continue;
+                    try writer.print("filesystem: {s}:r\n", .{lib_dir});
+                    try added_paths.put(try allocator.dupe(u8, lib_dir), {});
+                    file_rule_count += 1;
+                }
+            } else {
+                try writer.writeAll("# Shared libraries: exactly the files this program is linked against,\n");
+                try writer.writeAll("# found by following its dependencies the way the run-time linker does.\n");
+                try writer.writeAll("# Nothing else from the library directories is visible in the jail.\n");
+                if (cl.interpreter) |interp| {
+                    try writer.print("filesystem: {s}:r\n", .{interp});
+                    try added_paths.put(try allocator.dupe(u8, interp), {});
+                    file_rule_count += 1;
+                }
+                for (cl.libraries.items) |path| {
+                    if (added_paths.contains(path)) continue;
+                    if (file_rule_count >= caps.MAX_FILE_RULES) {
+                        try writer.print("#   filesystem: {s}:r    (over the limit of {d} filesystem rules)\n", .{ path, caps.MAX_FILE_RULES });
+                        continue;
+                    }
+                    try writer.print("filesystem: {s}:r\n", .{path});
+                    try added_paths.put(try allocator.dupe(u8, path), {});
+                    file_rule_count += 1;
+                }
+            }
+            for (cl.unresolved.items) |name| {
+                try writer.print("#   {s}    (needed, but not found on this host)\n", .{name});
+            }
+
+            // isolate sets LD_LIBRARY_PATH to the usual three directories.
+            // Libraries found anywhere else need the linker told where.
+            var dirs = try cl.directories(allocator);
+            defer dirs.deinit(allocator);
+            var needs_path = false;
+            for (dirs.items) |dir| {
+                var builtin = false;
+                for (libs.builtin_dirs) |known| {
+                    if (std.mem.eql(u8, dir, known)) builtin = true;
+                }
+                if (!builtin) needs_path = true;
+            }
+            if (needs_path) {
+                try writer.writeAll("# Where the linker finds them\n");
+                try writer.writeAll("env: LD_LIBRARY_PATH=");
+                for (dirs.items, 0..) |dir, i| {
+                    if (i > 0) try writer.writeByte(':');
+                    try writer.writeAll(dir);
+                }
+                try writer.writeByte('\n');
+                env_count += 1;
+            }
+
+            if (result.uses_dlopen) {
+                try writer.writeAll("#\n# This program calls dlopen(): it can load further libraries at run time\n");
+                try writer.writeAll("# (plugins, modules). Those cannot be found by reading the binary. If it\n");
+                try writer.writeAll("# fails to load one, add a rule for that file or for its directory.\n");
+            }
+            try writer.writeAll("\n");
+        }
+    }
+
+    try writer.writeAll("# Guesses, most confident first. None of these is applied.\n");
+    try writer.writeAll("# Uncomment a line to use it.\n\n");
 
     var current_conf_range: ?u8 = null;
 
@@ -613,7 +734,7 @@ pub fn generateCapabilityFile(
                 // Folded into the limits at the top of the file
                 try writer.print("#   {s}    (see the limits above)\n", .{cap_line});
             } else if (std.mem.eql(u8, kv.key, "network")) {
-                try writer.print("#   {s}    (network rules are not enforced; use network_mode)\n", .{cap_line});
+                try writer.print("# {s}\n", .{cap_line});
             } else if (std.mem.eql(u8, kv.key, "filesystem")) {
                 const rule = caps.parseFileRule(allocator, kv.value) catch {
                     try writer.print("#   {s}    (not a usable rule)\n", .{cap_line});
@@ -629,21 +750,13 @@ pub fn generateCapabilityFile(
                 const is_tmp = std.mem.eql(u8, rule.path, "/tmp");
                 if (!is_tmp and !isMountable(io, rule.path)) {
                     try writer.print("#   {s}    (not present on this host)\n", .{cap_line});
-                } else if (file_rule_count >= caps.MAX_FILE_RULES) {
-                    try writer.print("#   {s}    (over the limit of {d} filesystem rules)\n", .{ cap_line, caps.MAX_FILE_RULES });
                 } else {
-                    try writer.print("{s}\n", .{cap_line});
-                    file_rule_count += 1;
+                    try writer.print("# {s}\n", .{cap_line});
                 }
             } else if (std.mem.eql(u8, kv.key, "env")) {
                 if (added_lines.contains(cap_line)) continue;
                 try added_lines.put(cap_line, {});
-                if (env_count >= caps.MAX_ENV_VARS) {
-                    try writer.print("#   {s}    (over the limit of {d} env entries)\n", .{ cap_line, caps.MAX_ENV_VARS });
-                } else {
-                    try writer.print("{s}\n", .{cap_line});
-                    env_count += 1;
-                }
+                try writer.print("# {s}\n", .{cap_line});
             } else {
                 try writer.print("#   {s}    (not applied)\n", .{cap_line});
             }
@@ -655,6 +768,8 @@ pub fn generateCapabilityFile(
     // Add commented examples
     try writer.writeAll("# Other settings (commented out):\n");
     try writer.writeAll("# network_mode: none             # no network at all (default: inherit, the host's network)\n");
+    try writer.writeAll("# network_mode: vnet:epair0b     # a network stack of its own; needed for network: rules\n");
+    try writer.writeAll("# network: tcp:443:outbound      # with rules, everything not listed is blocked\n");
     try writer.writeAll("# filesystem: /home/user:rw      # a directory or file, read-only (r) or read-write (rw)\n");
     try writer.writeAll("# env: PATH=/usr/bin:/bin        # custom environment\n");
     try writer.writeAll("# env_clear: true                # start from an empty environment\n");
@@ -668,6 +783,8 @@ pub fn detectCapabilities(
     allocator: Allocator,
     binary_path: []const u8,
     output_path: ?[]const u8,
+    /// Mount whole library directories instead of the exact library files
+    use_dirs: bool,
 ) DetectError!void {
     var stdout_file = std.Io.File.stdout().writerStreaming(io, &.{});
     const stdout = &stdout_file.interface;
@@ -698,6 +815,23 @@ pub fn detectCapabilities(
     var result = DetectionResult.init(allocator, binary_path);
     defer result.deinit();
 
+    // The exact library files, unless whole directories were asked for or
+    // the binary cannot be followed
+    var closure: ?libs.Closure = null;
+    defer if (closure) |*cl| cl.deinit();
+    {
+        const system_dirs = libs.searchDirs(io, allocator) catch null;
+        defer if (system_dirs) |dirs| allocator.free(dirs);
+        if (system_dirs) |dirs| {
+            closure = libs.resolve(io, allocator, binary_path, dirs) catch null;
+        }
+        if (closure) |cl| {
+            stdout.print("Resolving shared libraries... {d} found", .{cl.libraries.items.len}) catch {};
+            if (cl.unresolved.items.len > 0) stdout.print(", {d} not found", .{cl.unresolved.items.len}) catch {};
+            stdout.writeAll("\n") catch {};
+        }
+    }
+
     // Try ELF analysis
     if (ElfAnalyzer.init(io, allocator, binary_path)) |elf_result| {
         var analyzer = elf_result;
@@ -723,13 +857,8 @@ pub fn detectCapabilities(
     stdout.print("==================\n", .{}) catch {};
     stdout.print("Found {d} capability hints\n", .{result.hints.items.len}) catch {};
 
-    if (result.hints.items.len == 0) {
-        stdout.writeAll("No specific capabilities detected. Using minimal defaults.\n") catch {};
-        result.addHint("Minimal capabilities for unknown application", "filesystem: /tmp:rw", 50) catch {};
-    }
-
     // Generate capability file
-    generateCapabilityFile(io, allocator, binary_path, output, &result) catch |err| {
+    generateCapabilityFile(io, allocator, binary_path, output, &result, if (closure) |*cl| cl else null, use_dirs) catch |err| {
         std.debug.print("Error generating capability file: {}\n", .{err});
         return DetectError.IoError;
     };
@@ -788,7 +917,7 @@ test "generated capability files load without problems" {
     try result.addHint("string", "filesystem: relative/path:rw", 60);
     try result.addHint("daemon", "filesystem: /var/log:w", 55);
 
-    try generateCapabilityFile(io, allocator, "/usr/local/sbin/nginx", out_path, &result);
+    try generateCapabilityFile(io, allocator, "/usr/local/sbin/nginx", out_path, &result, null, false);
 
     var parsed = try caps.load(io, allocator, out_path);
     defer parsed.deinit();
@@ -800,10 +929,63 @@ test "generated capability files load without problems" {
     try std.testing.expectEqual(@as(?u32, 512), parsed.caps.limits.max_files);
     // Network rules are comments, not rules
     try std.testing.expectEqual(@as(usize, 0), parsed.caps.network_rules.items.len);
-    // /tmp once; the nonexistent, malformed and write-only rules not at all
-    try std.testing.expectEqual(@as(usize, 1), parsed.caps.file_rules.items.len);
-    try std.testing.expectEqualStrings("/tmp", parsed.caps.file_rules.items[0].path);
+    // Everything here was a guess, so nothing is live: no filesystem rule,
+    // no environment entry
+    try std.testing.expectEqual(@as(usize, 0), parsed.caps.file_rules.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.caps.env_vars.items.len);
+}
+
+test "generated files list the library closure file by file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    // Two stand-in "libraries" that exist, in a directory the linker would
+    // not search by default
+    var lib_a_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var lib_b_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const lib_a = try std.fmt.bufPrint(&lib_a_buf, "{s}/liba.so.1", .{dir});
+    const lib_b = try std.fmt.bufPrint(&lib_b_buf, "{s}/libb.so.2", .{dir});
+    for ([_][]const u8{ lib_a, lib_b }) |path| {
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        f.close(io);
+    }
+
+    var closure = libs.Closure{ .allocator = allocator };
+    defer closure.deinit();
+    closure.interpreter = try allocator.dupe(u8, lib_a); // any existing file
+    try closure.libraries.append(allocator, try allocator.dupe(u8, lib_b));
+    try closure.unresolved.append(allocator, try allocator.dupe(u8, "libmissing.so.9"));
+
+    var result = DetectionResult.init(allocator, "/usr/local/bin/app");
+    defer result.deinit();
+    result.uses_dlopen = true;
+    try result.addHint("temp files", "filesystem: /tmp:rw", 70);
+
+    var out_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out_path = try std.fmt.bufPrint(&out_buf, "{s}/out.caps", .{dir});
+    try generateCapabilityFile(io, allocator, "/usr/local/bin/app", out_path, &result, &closure, false);
+
+    var parsed = try caps.load(io, allocator, out_path);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.problems.items.len);
+
+    // The interpreter and the library are facts and live. The /tmp hint is
+    // a guess and is not.
+    try std.testing.expectEqual(@as(usize, 2), parsed.caps.file_rules.items.len);
+    try std.testing.expectEqualStrings(lib_a, parsed.caps.file_rules.items[0].path);
+    try std.testing.expectEqualStrings(lib_b, parsed.caps.file_rules.items[1].path);
+    try std.testing.expect(!parsed.caps.file_rules.items[1].permissions.write);
+
+    // The library directory is not one of isolate's defaults, so the
+    // linker is told about it
     try std.testing.expectEqual(@as(usize, 1), parsed.caps.env_vars.items.len);
+    try std.testing.expectEqualStrings("LD_LIBRARY_PATH", parsed.caps.env_vars.items[0].name);
+    try std.testing.expectEqualStrings(dir, parsed.caps.env_vars.items[0].value);
 }
 
 test "DetectionResult sortByConfidence" {
@@ -826,7 +1008,7 @@ test "DetectionResult sortByConfidence" {
 test "library pattern matching" {
     // Test that we can find patterns in library names
     const test_libs = [_][]const u8{
-        "libc.so.7",
+        "libcurl.so.4",
         "libssl.so.1.1",
         "libpq.so.5",
     };

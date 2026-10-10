@@ -1,6 +1,6 @@
 # isolate - Process Isolation for FreeBSD
 
-**isolate** is an infrastructureless container runner that provides process isolation using native FreeBSD primitives. This guide demonstrates isolating nginx as a practical use case.
+**isolate** is a sandbox launcher for FreeBSD: it runs a program that is already installed on the host inside a jail that contains only what you list. This guide demonstrates isolating nginx as a practical use case.
 
 The step-by-step guide below was run as written on FreeBSD 15.1 with the nginx package and isolate 0.3.0. What isolate guarantees, and what it does not, is specified in the [design documents](design/README.md).
 
@@ -604,7 +604,7 @@ Host Filesystem                              Jail Filesystem
 
                                              /etc/passwd (generated, minimal)
                                              /etc/group (generated, minimal)
-                                             /start.sh (copy of the program given on the command line)
+/var/isolate/nginx/start.sh   ──nullfs──▶    /var/isolate/nginx/start.sh (read-only, the program)
                                              /dev (devfs)
 ```
 
@@ -640,7 +640,7 @@ rctl -a jail:isolate-1316:openfiles:deny=1024          # 1024 file descriptors
 // isolate forks and, in the child:
 1. jail_attach(jid)           // Enter the jail; the working directory becomes its root
 2. setgroups, setgid(1001), setuid(1001)  // Drop to the ephemeral user, with no other groups
-3. execv("/start.sh", argv)   // Execute the start script, which execs nginx
+3. execv("/var/isolate/nginx/start.sh", argv)   // The start script, at its own path; it execs nginx
 ```
 
 ### What nginx Sees Inside the Jail
@@ -656,7 +656,7 @@ $ ps -J isolate-1316 -o pid,user,command
 
 # The jail's root filesystem
 $ ls /var/run/isolate/inst-*/root
-bin  dev  etc  lib  libexec  start.sh  tmp  usr  var  workspace
+bin  dev  etc  lib  libexec  tmp  usr  var  workspace
 
 # The listening socket is on the host's network (network_mode: inherit)
 $ netstat -an | grep 8080

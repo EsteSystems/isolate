@@ -185,6 +185,33 @@ When the jail goes away, isolate hands `epair0b` back to the host, so the next s
 
 Clients on other machines cannot reach `10.0.99.2` unless the host routes or redirects to it, for example with a pf `rdr` rule. That is host network configuration, outside what isolate does.
 
+### Allow only database connections
+
+A VNET jail can still open connections to anything its interface reaches, and answers on every port something listens on. A network rule narrows that to the one thing a database server is for:
+
+```sh
+cat >> /usr/local/etc/isolate/postgres.caps << 'CAPS'
+
+# Accept PostgreSQL connections; nothing else in, nothing out
+network: tcp:5432:inbound
+CAPS
+```
+
+Rules are enforced with pf on the host's end of the epair. The host needs pf enabled, with isolate's anchor in `/etc/pf.conf` before any rule that passes traffic:
+
+```sh
+# in /etc/pf.conf
+anchor "isolate/*"
+
+sysrc pf_enable=YES
+service pf start
+isolate check      # the last section reports whether pf is ready
+```
+
+With the rule in place the database still answers on 5432, while a ping to `10.0.99.2` and connections to any other port are dropped, and the server cannot open connections of its own. If pf is not enabled or the anchor line is missing, isolate refuses to start the server instead of running it unfiltered.
+
+A server that needs to reach something, such as a replication peer or an authentication service, needs an `outbound` rule for it.
+
 ## 9. Run it as a service
 
 isolate does not supervise or start anything at boot; `isolate run` simply stays in the foreground. The repository has an `rc.d` script, [`examples/rc.d/isolate`](../examples/rc.d/isolate), that runs it under `daemon(8)`, which restarts the server if it exits and writes its output to a log file.
@@ -229,7 +256,7 @@ What the service does in each situation, all observed on FreeBSD 15.1:
 | The machine boots | The epair is created, the service starts the server in its jail. In a test reboot the database answered 35 seconds after boot. |
 | The machine shuts down or reboots | The service stops the server with a fast shutdown. No recovery is needed at the next start. |
 | `service isolate stop` with sessions open | Sessions are disconnected; the stop takes about a second. |
-| The server crashes or is killed | isolate cleans up the jail and exits; the supervisor starts it again after five seconds; PostgreSQL recovers from its write-ahead log. |
+| The server crashes or is killed | isolate cleans up the jail and its network rules and exits; the supervisor starts it again after five seconds; PostgreSQL recovers from its write-ahead log. |
 | The `isolate run` process is killed | The server keeps running in its jail and keeps answering. Nothing is restarted until the server itself exits, because the supervisor waits for the server's output to close. When it does exit, the supervisor runs `isolate clean` and starts a fresh instance. `service isolate stop` works in this state too. |
 
 The script handles any number of instances; see the comments at its top for the settings.
@@ -237,7 +264,7 @@ The script handles any number of instances; see the comments at its top for the 
 ## What the server can see
 
 ```
-/                 bin dev etc lib libexec postgres tmp usr var workspace
+/                 bin dev etc lib libexec tmp usr var workspace
 /dev              fd full null pts random stderr stdin stdout urandom zero
 /workspace        the workspace, read-write
 /tmp              private to this instance

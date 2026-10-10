@@ -8,24 +8,26 @@ These documents say what isolate must do, what it deliberately does not do, and 
 | [02-capability-file.md](02-capability-file.md) | The `.caps` format: every key, its meaning and its defaults |
 | [03-lifecycle.md](03-lifecycle.md) | `run`, `stop`, `clean`, `list`, the registry, and cleanup |
 | [04-resource-limits.md](04-resource-limits.md) | Memory, process and file-descriptor limits |
-| [05-network.md](05-network.md) | Network modes, VNET, and the planned enforcement of network rules |
+| [05-network.md](05-network.md) | Network modes, VNET, and network rules enforced with pf |
 | [06-detection.md](06-detection.md) | `isolate detect` |
 
 ## Product scope
 
-isolate runs **one program from the host, in one FreeBSD jail, with only the access a capability file declares**, and removes everything it created when the program ends.
+isolate is a **sandbox launcher**: it runs one program that is already installed on the host, in one FreeBSD jail that contains only what a capability file lists, and removes everything it created when the program ends.
+
+It is not a container runner. It does not package, ship or reproduce anything; the program and its libraries are the host's.
 
 **In scope**
 
 - Running a host binary inside a jail built for that run, as an unprivileged user.
-- A declarative capability file that states the program's filesystem access, network mode, resource limits and environment.
+- A declarative capability file that states the program's filesystem access, network mode and rules, resource limits and environment.
 - Lifecycle management of running instances: list, stop, and cleanup after crashes.
-- Generating a starting capability file from static analysis of a binary.
+- Generating a capability file that lists exactly the shared libraries a binary is linked against.
 
 **Out of scope**
 
 - **Any platform other than FreeBSD.** There is no Linux, macOS or Windows backend and none is planned in these documents.
-- **Images, packaging and distribution.** isolate runs what is already on the host.
+- **Images, packaging and distribution.** isolate runs what is already on the host. A capability file is written for the host it runs on.
 - **Orchestration.** No scheduling, clustering, remote API or metrics endpoint.
 - **Supervision.** isolate does not daemonize, restart a program that exits, or start anything at boot. `isolate run` stays in the foreground for as long as the program runs.
 - **Persistent jails.** Nothing survives the end of a run or a reboot.
@@ -64,8 +66,7 @@ Each document also has:
 
 No invariant is currently recorded as violated.
 
-Two hold only by inspection because the test host cannot exercise them: LIM-5 (limits requested on a kernel without racct) and the no-VNET half of NET-5. `tests/scenarios.sh` contains the LIM-5 check and runs it when racct is absent.
+Some refusals hold only by inspection because the test host cannot exercise them: LIM-5 (limits requested on a kernel without racct), the no-VNET half of NET-5, and the half of NET-6 that refuses network rules when pf is not ready. `tests/scenarios.sh` contains checks for the first and the last and runs them on a host that lacks racct or pf.
 
 Each document ends with its known gaps: behaviour that is not an invariant but is worth knowing, and cases no test covers.
 
-Planned, not yet built: NET-6 (enforcing `network:` rules with pf).

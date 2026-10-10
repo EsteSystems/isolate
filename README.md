@@ -1,29 +1,52 @@
 # isolate
 
-Infrastructureless container runner for FreeBSD.
+A sandbox launcher for FreeBSD: run a program that is already installed on the host inside a jail that contains only what you list.
 
-isolate provides process isolation without requiring container runtimes, orchestration platforms, or image registries. It runs a program from the host inside a FreeBSD jail built for that run, with only the access a capability file declares, and removes everything again when the program ends.
+```sh
+isolate detect /usr/local/bin/myapp      # writes myapp.caps: the exact libraries it links against
+doas isolate run /usr/local/bin/myapp    # a jail with those files, a throwaway user, and nothing else
+```
 
-## Philosophy
+The program sees the libraries it is linked against, the directories you name, and no other part of the host. It runs as a user that exists only for that run. When it exits, the jail, its mounts, the user and its limits are gone.
 
-**Infrastructure should be invisible.** Applications need isolation, not infrastructure.
+## What it is, and is not
 
-Traditional containerization requires learning Docker, Kubernetes, registries, orchestrators, and complex networking. isolate takes a different approach: analyze your binary, generate a capability file, and run it isolated. No images, no daemons, no clusters.
+isolate does one job: it confines a program you already have. There is no image to build, no base system to install into a jail, and no daemon. The closest relatives are bubblewrap, firejail and nsjail on Linux.
+
+It is **not a container runner**. It does not package software, move it between machines, or reproduce an environment: the program and its libraries are the host's, and a capability file is written for the host it runs on.
+
+### Compared with other FreeBSD tools
+
+| Tool | What it gives you | How isolate differs |
+|---|---|---|
+| `jail.conf`, Bastille, iocage, pot, AppJail | Managed jails with a base system of their own: persistent, updatable, many services each | No base system, nothing persists, one program. Much lighter, far less capable. |
+| Podman and OCI containers | Images you build, ship and run anywhere | A different job. isolate ships nothing. |
+| Service jails (`<name>_svcj` in `rc.conf`, FreeBSD 15) | One line puts an existing service in a jail, with networking and privileges restricted | A service jail shares the host's whole filesystem. isolate's jail holds only what the capability file lists. |
+| Capsicum | Sandboxing a program builds into itself | Needs changes to the program. isolate needs none. |
+
+The comparison with service jails is the one that matters, because they are in the base system and take no setup. Checked on FreeBSD 15.1: a program in a default service jail can list `/`, read `/etc/master.passwd` and `/root`, and sees every device node; what it loses is network access and privileges. isolate restricts the other half: `find`, run under isolate from its generated capability file, sees nine files.
+
+Use a service jail when you want a host service to keep working exactly as it does, with less privilege. Use isolate when you want a program to be unable to see the rest of the machine.
 
 ## Features
 
-- **Native OS Isolation**: Uses FreeBSD jails
-- **Capability Detection**: Analyzes a binary to draft a capability file for you to review
-- **Ephemeral Users**: Creates temporary users per instance for privilege separation
-- **Resource Limits**: Memory, process, and file descriptor limits via rctl
-- **System V IPC on request**: A private shared-memory and semaphore namespace per jail, for programs like PostgreSQL
-- **Network Modes**: Host network, no network, or a VNET stack of its own
-- **Workspace Mounting**: Mount host directories for persistent application data
-- **Instance Management**: Track, list, stop, and clean up running instances
-- **System Capability Check**: Verify kernel features before deployment
-- **No Daemon, No Images**: One executable that uses only the FreeBSD base system (`libjail`, `pw`, `ifconfig`)
+- **A filesystem that holds only what you list**: read-only or read-write rules for directories and single files, mounted into an otherwise empty jail
+- **Exact library detection**: `isolate detect` follows a program's shared-library dependencies and lists precisely those files
+- **A throwaway user**: created for the run, deleted afterwards, with no other groups
+- **Network modes**: the host's network, none, or a VNET stack of its own
+- **Network rules**: for a VNET jail, which connections may be made and accepted, enforced with pf
+- **Resource limits**: memory, processes and file descriptors, via rctl
+- **System V IPC on request**: a private namespace per jail, for programs like PostgreSQL
+- **All or nothing**: a capability file is applied in full or the run is refused. Nothing in it is skipped
+- **Thorough cleanup**: after a normal exit, a crash, a signal or a reboot
+- **Instance management**: list, stop and clean up running instances; an `rc.d` script for services
+- **No daemon, no images**: one executable that uses only the FreeBSD base system
 
-One thing in the capability file is not enforced yet: `network:` rules are parsed but not applied, and every run says so. The [design documents](docs/design/README.md) list what is guaranteed, what is out of scope, and every known gap.
+The [design documents](docs/design/README.md) state what is guaranteed, what is out of scope, and what is not covered, with the test behind each claim.
+
+## Maturity
+
+isolate is young. It has been developed and tested on one FreeBSD release (15.1), has had no independent security review, and has no port or package. Its behaviour is specified and exercised by about 115 end-to-end checks, but that is not the same as having been attacked. Read the [design documents](docs/design/README.md) before trusting it with hostile code.
 
 ## Quick Start
 
@@ -31,10 +54,10 @@ One thing in the capability file is not enforced yet: `network:` rules are parse
 # Build isolate
 zig build
 
-# Detect capabilities for your application
+# List the libraries your program links against, as a capability file
 ./zig-out/bin/isolate detect ./myapp
 
-# Review and edit the generated capability file
+# Review it; add the directories the program needs for its data
 cat ./myapp.caps
 
 # Run in isolation (requires root)
@@ -126,7 +149,7 @@ Options must come before the binary. Everything after it is passed to the binary
 
 #### `isolate detect [options] <binary> [output.caps]`
 
-Analyze a binary and generate a capability file.
+Write a capability file listing exactly the shared libraries a program is linked against.
 
 ```sh
 # Generate <binary>.caps
@@ -134,11 +157,35 @@ isolate detect ./myapp
 
 # Specify output file
 isolate detect -o custom.caps ./myapp
-isolate detect ./myapp ./myapp.caps
 ```
 
 Options:
 - `-o, --output <file>`: Output capability file
+- `--dirs`: List the directories the libraries are in, instead of the files
+
+`detect` reads the binary; it never runs it. It follows the program's dependencies the way the run-time linker does, and the result matches `ldd`. A generated file looks like this (abridged):
+
+```ini
+user: auto
+memory: 128M
+processes: 5
+files: 512
+
+# Shared libraries: exactly the files this program is linked against
+filesystem: /libexec/ld-elf.so.1:r
+filesystem: /lib/libc.so.7:r
+filesystem: /lib/libsys.so.7:r
+
+# Guesses, most confident first. None of these is applied.
+# File operations detected
+# filesystem: /tmp:rw
+```
+
+Two kinds of line, and only one is live. **Facts**, the libraries, are live rules. **Guesses** from the program's name, imported symbols and embedded strings are comments for you to enable. A guess is never applied on its own: the strings in a binary name files such as private keys.
+
+A program that needs only its libraries runs from the generated file as it is. Most real programs also need a rule for their data or configuration, which you add.
+
+What `detect` cannot see: libraries a program loads at run time with `dlopen` (plugins, modules). It says when a program can do that. See [docs/design/06-detection.md](docs/design/06-detection.md).
 
 #### `isolate list`
 
@@ -202,6 +249,9 @@ isolate check
 #
 # Privileges:
 #   [OK] Running as root      Full isolation available
+#
+# Network rules (pf):
+#   [OK] pf                   Enabled, with isolate's anchor - network rules can be enforced
 ```
 
 ### Capability File Format
@@ -237,9 +287,9 @@ filesystem: /etc/resolv.conf:r # A single file
 # A rule names a directory or a file that exists on the host. It is
 # read-only (:r, the default) or read-write (:rw); nothing else.
 
-# Network access rules - parsed and listed, but NOT enforced (there is no
-# firewall integration yet). Use network_mode to control network access.
-network: tcp:8080:inbound     # Listen on TCP port 8080
+# Network rules, for a VNET jail (see "Network Rules" below). With any
+# rule present, everything not listed is blocked.
+network: tcp:8080:inbound     # Accept connections on TCP port 8080
 network: tcp:443:outbound     # Connect to TCP port 443
 network: udp:53:outbound      # DNS queries
 
@@ -318,6 +368,33 @@ doas isolate run --caps tenant2.caps -w /data/tenant2 ./myapp  # 10.0.100.2
 
 Each jail can reach only the network its own interface is attached to. Tenants on different subnets cannot reach each other unless the host routes between them.
 
+### Network Rules
+
+A VNET jail can reach whatever its interface reaches. Network rules narrow that to the connections you list:
+
+```ini
+network_mode: vnet:epair0b
+network_ip: 10.0.99.2/24
+
+network: tcp:5432:inbound              # accept connections on 5432
+network: tcp:10.0.0.5:443:outbound     # connect to one server
+network: udp:53:outbound               # DNS
+```
+
+With one or more rules, everything else to and from the jail is dropped. The address in a rule is the other end; host names are not accepted, and rules are IPv4.
+
+Rules are enforced with pf on the host end of the jail's epair, where all of the jail's traffic passes. That takes two things on the host, which isolate does not set up for you:
+
+```sh
+# /etc/pf.conf, before any rule that passes traffic
+anchor "isolate/*"
+
+sysrc pf_enable=YES
+service pf start
+```
+
+`isolate check` shows whether pf is ready. A capability file with rules is refused, rather than run unfiltered, when pf is not enabled, when the anchor line is missing, or when the jail is not a VNET jail on an epair. Details are in [docs/design/05-network.md](docs/design/05-network.md).
+
 ### Running as a Service
 
 isolate does not supervise programs or start them at boot. [`examples/rc.d/isolate`](examples/rc.d/isolate) is an `rc.d` script that does, by running `isolate run` under `daemon(8)`:
@@ -395,7 +472,9 @@ doas isolate stop app-tenant-b
 |--------|---------|
 | `main.zig` | CLI parsing and command dispatch |
 | `caps.zig` | Capability file parsing and validation |
-| `detect.zig` | ELF binary analysis for capability detection |
+| `detect.zig` | ELF reading and capability-file generation |
+| `libs.zig` | Shared-library closure of a binary |
+| `netrules.zig` | Network rules as pf rules |
 | `freebsd.zig` | FreeBSD jail implementation |
 | `syscheck.zig` | System capability detection (racct, VNET) |
 | `registry.zig` | Instance tracking and persistence |
@@ -422,7 +501,7 @@ The unit tests cover parsing and validation and create no jails. The end-to-end 
 zig build && doas sh tests/scenarios.sh
 ```
 
-They create real jails, users, mounts, limits and a network interface, check about 85 behaviours against the [design documents](docs/design/README.md), and verify at the end that nothing was left behind.
+They create real jails, users, mounts, limits and a network interface, check about 115 behaviours against the [design documents](docs/design/README.md), and verify at the end that nothing was left behind.
 
 ## Troubleshooting
 
@@ -498,8 +577,8 @@ Contributions are welcome! Please read the architecture and design documents bef
 
 ## Security Considerations
 
-- **Review capability files**: Auto-detection is heuristic; always review generated `.caps` files
-- **Network rules are not enforced**: only `network_mode` restricts network access. The default, `inherit`, gives the program the host's network
+- **Review capability files**: `detect` gets the libraries right and guesses at the rest; the guesses are comments until you enable them
+- **The default network is the host's**: without `network_mode: none` or `vnet`, the program can connect wherever the host can. Network rules need a VNET jail
 - **Check a file before relying on it**: `isolate run -n -v <binary>` prints the settings a run would use
 - **Known gaps**: each [design document](docs/design/README.md) ends with what is not covered
 - **Ephemeral users**: Use `user: auto` for privilege separation

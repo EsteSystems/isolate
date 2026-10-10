@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const caps = @import("caps.zig");
 const syscheck = @import("syscheck.zig");
 const registry = @import("registry.zig");
+const netrules = @import("netrules.zig");
 
 // Only compile on FreeBSD
 comptime {
@@ -950,6 +951,143 @@ fn execCapture(path: [:0]const u8, argv: []const ?[*:0]const u8, out: []u8) ![]u
     return out[0..len];
 }
 
+// ----------------------------------------------------------------------------
+// Network rules (pf)
+// ----------------------------------------------------------------------------
+
+/// What stands between a capability file's network rules and enforcing them
+pub const PfState = enum {
+    ready,
+    /// pfctl could not be asked (no pf in the kernel, or not root)
+    unavailable,
+    disabled,
+    /// pf runs, but the ruleset never looks at isolate's anchor
+    no_anchor,
+};
+
+pub fn pfState() PfState {
+    var buf: [16384]u8 = undefined;
+
+    const info_argv: [4]?[*:0]const u8 = .{ "/sbin/pfctl", "-s", "info", null };
+    const info = execCapture("/sbin/pfctl", &info_argv, &buf) catch return .unavailable;
+    if (std.mem.find(u8, info, "Status: Enabled") == null) return .disabled;
+
+    const rules_argv: [4]?[*:0]const u8 = .{ "/sbin/pfctl", "-s", "rules", null };
+    const rules = execCapture("/sbin/pfctl", &rules_argv, &buf) catch return .unavailable;
+    if (std.mem.find(u8, rules, netrules.anchor_line) == null) return .no_anchor;
+
+    return .ready;
+}
+
+fn anchorName(buf: []u8, jail_name: []const u8) ![:0]const u8 {
+    return std.fmt.bufPrintZ(buf, netrules.anchor_root ++ "/{s}", .{jail_name}) catch return error.InvalidPath;
+}
+
+/// Load an instance's network rules into its pf anchor. The capability
+/// file has already been checked by netrules.unenforceable(); what can
+/// still stand in the way is the host's pf, and then the run must not
+/// start: the program would have the whole network its interface reaches.
+pub fn applyNetworkRules(
+    io: std.Io,
+    jail_name: []const u8,
+    jail_path: []const u8,
+    network_config: caps.NetworkConfig,
+    rules: []const caps.NetworkRule,
+) !void {
+    if (rules.len == 0) return;
+
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+
+    var if_buf: [32]u8 = undefined;
+    const jail_interface = network_config.interface orelse return error.JailParamFailed;
+    const host_interface = netrules.hostSide(&if_buf, jail_interface) orelse return error.JailParamFailed;
+
+    switch (pfState()) {
+        .ready => {},
+        .unavailable => {
+            stdout.print("Error: The capability file has network rules, but pf is not available (kldload pf).\n", .{}) catch {};
+            return error.JailParamFailed;
+        },
+        .disabled => {
+            stdout.print("Error: The capability file has network rules, but pf is not enabled (pfctl -e; pf_enable=YES).\n", .{}) catch {};
+            return error.JailParamFailed;
+        },
+        .no_anchor => {
+            stdout.print("Error: The capability file has network rules, but the pf ruleset does not use isolate's anchor.\n", .{}) catch {};
+            stdout.print("Add this line to /etc/pf.conf, before any rule that passes traffic, and reload:\n    {s}\n", .{netrules.anchor_line}) catch {};
+            return error.JailParamFailed;
+        },
+    }
+
+    // The rules go through a file in the instance directory
+    var pf_text_buf: [8192]u8 = undefined;
+    var rules_writer: std.Io.Writer = .fixed(&pf_text_buf);
+    netrules.write(&rules_writer, host_interface, rules) catch return error.JailParamFailed;
+
+    var file_buf: [PATH_MAX]u8 = undefined;
+    const rules_file = std.fmt.bufPrintZ(&file_buf, "{s}/pf.rules", .{instanceDir(jail_path)}) catch return error.InvalidPath;
+    writeFile(rules_file, rules_writer.buffered(), 0o600) catch return error.JailParamFailed;
+
+    var anchor_buf: [128]u8 = undefined;
+    const anchor = try anchorName(&anchor_buf, jail_name);
+
+    stdout.print("Enforcing {d} network rule(s) on {s} (pf anchor {s})\n", .{ rules.len, host_interface, anchor }) catch {};
+    const load_argv: [6]?[*:0]const u8 = .{ "/sbin/pfctl", "-a", anchor.ptr, "-f", rules_file.ptr, null };
+    safeExec("/sbin/pfctl", &load_argv) catch {
+        stdout.print("Error: pf rejected the network rules\n", .{}) catch {};
+        return error.JailParamFailed;
+    };
+
+    // Connections an earlier user of this interface had open must not carry
+    // over: pf lets packets of an existing state through without looking at
+    // the rules again
+    var host_if_buf: [32]u8 = undefined;
+    const host_if_z = std.fmt.bufPrintZ(&host_if_buf, "{s}", .{host_interface}) catch return error.InvalidPath;
+    const flush_argv: [6]?[*:0]const u8 = .{ "/sbin/pfctl", "-i", host_if_z.ptr, "-F", "states", null };
+    safeExec("/sbin/pfctl", &flush_argv) catch {};
+}
+
+/// Remove an instance's pf anchor. Harmless if there is none, or no pf.
+pub fn removeNetworkRules(jail_name: []const u8) void {
+    var anchor_buf: [128]u8 = undefined;
+    const anchor = anchorName(&anchor_buf, jail_name) catch return;
+    const argv: [6]?[*:0]const u8 = .{ "/sbin/pfctl", "-a", anchor.ptr, "-F", "rules", null };
+    safeExec("/sbin/pfctl", &argv) catch {};
+}
+
+/// Same, for the jail of the instance whose jailed process had this PID
+pub fn removeNetworkRulesForPid(pid: i32) void {
+    var name_buf: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, jail_name_prefix ++ "{d}", .{pid}) catch return;
+    removeNetworkRules(name);
+}
+
+/// Remove the pf anchors of isolate jails that no longer exist. Returns
+/// the number removed.
+pub fn purgeStaleNetworkRules() u32 {
+    var buf: [16384]u8 = undefined;
+    const argv: [6]?[*:0]const u8 = .{ "/sbin/pfctl", "-a", netrules.anchor_root, "-s", "Anchors", null };
+    const listing = execCapture("/sbin/pfctl", &argv, &buf) catch return 0;
+
+    var purged: u32 = 0;
+    var lines = std.mem.tokenizeAny(u8, listing, " \t\r\n");
+    while (lines.next()) |anchor| {
+        const prefix = netrules.anchor_root ++ "/";
+        if (!std.mem.startsWith(u8, anchor, prefix)) continue;
+        const jail_name = anchor[prefix.len..];
+        if (pidFromName(jail_name, jail_name_prefix) == null) continue;
+
+        var name_z: [64]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&name_z, "{s}", .{jail_name}) catch continue;
+        if (c.jail_getid(z.ptr) >= 0) continue; // jail still exists
+
+        removeNetworkRules(jail_name);
+        purged += 1;
+    }
+    return purged;
+}
+
 /// Whether jail `jid` has a network stack of its own
 fn jailHasOwnVnet(jid: i32) bool {
     var jid_val: c_int = jid;
@@ -1090,6 +1228,7 @@ pub fn removeStrayJails(io: std.Io, managed_jids: []const i32) u32 {
         stdout.print("Removing unregistered jail {s} (JID {d})\n", .{ it.name(), jid }) catch {};
         removeJail(jid);
         removeResourceLimits(it.name());
+        removeNetworkRules(it.name());
         removed += 1;
     }
     return removed;
@@ -1182,6 +1321,7 @@ pub fn teardownInstance(io: std.Io, pid: i32, jail_id: i32, jail_path: []const u
         removeJail(jail_id);
     }
     removeResourceLimitsForPid(pid);
+    removeNetworkRulesForPid(pid);
 
     if (trustedInstanceDir(jail_path)) |inst_dir| {
         stdout.print("Removing instance directory {s}\n", .{inst_dir}) catch {};
@@ -1342,6 +1482,51 @@ fn restrictDevfs(dev_path: []const u8) !void {
     }
 }
 
+/// The rule among `earlier` whose directory contains `path`, if any. With
+/// several, the innermost. The private /tmp never counts as containing a
+/// host path.
+fn coveringRule(earlier: []const caps.FileRule, path: []const u8) ?caps.FileRule {
+    var best: ?caps.FileRule = null;
+    for (earlier) |rule| {
+        if (std.mem.eql(u8, rule.path, "/tmp")) continue;
+        if (!isPathUnder(path, rule.path) or path.len == rule.path.len) continue;
+        if (best == null or rule.path.len > best.?.path.len) best = rule;
+    }
+    return best;
+}
+
+/// nullfs mounts a file onto a file. Make sure one exists at `target`: if
+/// the path is already there (it lies inside a directory another rule
+/// mounted) it is used as it is, otherwise an empty file is created.
+fn createMountPointForFile(target: [:0]const u8) !void {
+    var st: std.c.Stat = undefined;
+    if (stat(target.ptr, &st) == 0) return;
+
+    mkdirp(std.fs.path.dirname(target) orelse return error.InvalidPath) catch return error.FilesystemSetupFailed;
+    const fd = c.open(target.ptr, c.O_WRONLY | c.O_CREAT, @as(c_uint, 0o644));
+    if (fd < 0) return error.FilesystemSetupFailed;
+    _ = c.close(fd);
+}
+
+/// Make the program available in the jail at the absolute path it has on
+/// the host, read-only, so that it runs from where it expects to be: many
+/// programs find their own files relative to their location. If a rule has
+/// already mounted that path or a directory containing it, nothing is done.
+fn mountProgram(io: std.Io, jail_path: []const u8, program_path: []const u8) !void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+
+    var target_buf: [PATH_MAX]u8 = undefined;
+    const target = std.fmt.bufPrintZ(&target_buf, "{s}{s}", .{ jail_path, program_path }) catch return error.InvalidPath;
+
+    var st: std.c.Stat = undefined;
+    if (stat(target.ptr, &st) == 0 and std.c.S.ISREG(st.mode) and st.size > 0) return;
+
+    try createMountPointForFile(target);
+    stdout.print("Mounting {s} -> {s} (ro, the program)\n", .{ program_path, target }) catch {};
+    mountNullfs(program_path, target, true) catch return error.MountFailed;
+}
+
 /// Mount the host directory or file named by a filesystem rule at the same
 /// path inside the jail. Any failure is an error.
 fn mountRule(io: std.Io, jail_path: []const u8, rule: caps.FileRule) !void {
@@ -1363,11 +1548,7 @@ fn mountRule(io: std.Io, jail_path: []const u8, rule: caps.FileRule) !void {
     if (std.c.S.ISDIR(st.mode)) {
         mkdirp(target) catch return error.FilesystemSetupFailed;
     } else if (std.c.S.ISREG(st.mode)) {
-        // nullfs mounts a file onto a file: create an empty one to mount on
-        mkdirp(std.fs.path.dirname(target) orelse return error.InvalidPath) catch return error.FilesystemSetupFailed;
-        const fd = c.open(target.ptr, c.O_WRONLY | c.O_CREAT, @as(c_uint, 0o644));
-        if (fd < 0) return error.FilesystemSetupFailed;
-        _ = c.close(fd);
+        try createMountPointForFile(target);
     } else {
         stdout.print("Error: {s} (filesystem rule) is neither a directory nor a regular file\n", .{rule.path}) catch {};
         return error.MountFailed;
@@ -1430,23 +1611,6 @@ pub fn setupFilesystemIsolation(
         stdout.print("Workspace mounted successfully\n", .{}) catch {};
     }
 
-    // Copy target binary into jail
-    const binary_name = if (std.mem.lastIndexOfScalar(u8, target_binary, '/')) |idx|
-        target_binary[idx + 1 ..]
-    else
-        target_binary;
-
-    const dst_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ jail_path, binary_name }) catch return error.InvalidPath;
-    copyFile(target_binary, dst_path) catch return error.FilesystemSetupFailed;
-
-    // Make binary executable
-    {
-        var buf: [PATH_MAX]u8 = undefined;
-        @memcpy(buf[0..dst_path.len], dst_path);
-        buf[dst_path.len] = 0;
-        _ = std.c.chmod(@ptrCast(&buf), 0o755);
-    }
-
     // The jail's user database: root and the program's user. FreeBSD's libc
     // does not read /etc/passwd; getpwuid() and friends read the hashed
     // /etc/pwd.db, so that is generated too. Without it a program cannot
@@ -1475,7 +1639,36 @@ pub fn setupFilesystemIsolation(
     // stops the run: the program must never start with less, or other,
     // access than its capability file states.
     stdout.print("Processing capability filesystem rules...\n", .{}) catch {};
-    for (capability.file_rules.items) |rule| {
+
+    // Mount shorter paths first, so that a rule for a directory is in place
+    // before a rule for something inside it, whatever order the file lists
+    // them in. (An ancestor's path is always the shorter one.)
+    var ordered_buf: [caps.MAX_FILE_RULES]caps.FileRule = undefined;
+    const rule_count = @min(capability.file_rules.items.len, ordered_buf.len);
+    const ordered = ordered_buf[0..rule_count];
+    @memcpy(ordered, capability.file_rules.items[0..rule_count]);
+    std.mem.sort(caps.FileRule, ordered, {}, struct {
+        fn shorterFirst(_: void, a: caps.FileRule, b: caps.FileRule) bool {
+            return a.path.len < b.path.len;
+        }
+    }.shorterFirst);
+
+    for (ordered, 0..) |rule, index| {
+        // A rule for something inside a directory that an earlier rule
+        // already mounts shows the same host files, so there is nothing to
+        // mount: nullfs will not mount a file onto itself. That is fine as
+        // long as the inner rule asks for no more than the outer one gives.
+        // (/tmp is not such a directory: it is private to the instance, so
+        // a rule for a host path under /tmp is a mount of its own.)
+        if (coveringRule(ordered[0..index], rule.path)) |outer| {
+            if (rule.permissions.write and !outer.permissions.write) {
+                stdout.print("Error: The rule {s}:rw lies inside the read-only rule {s}; make that one :rw or remove it\n", .{ rule.path, outer.path }) catch {};
+                return error.FilesystemSetupFailed;
+            }
+            stdout.print("{s} is already available through the rule for {s}\n", .{ rule.path, outer.path }) catch {};
+            continue;
+        }
+
         // Security: a /tmp rule mounts an instance-specific directory, never
         // the host's /tmp. This prevents cross-instance information leakage.
         if (std.mem.eql(u8, rule.path, "/tmp")) {
@@ -1502,6 +1695,12 @@ pub fn setupFilesystemIsolation(
 
         try mountRule(io, jail_path, rule);
     }
+
+    // The program itself, at the path it has on the host
+    mountProgram(io, jail_path, target_binary) catch |err| {
+        stdout.print("Error: Could not make {s} available in the jail\n", .{target_binary}) catch {};
+        return err;
+    };
 
     // Set permissions on tmp again after mounts
     {
@@ -1644,6 +1843,14 @@ pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_
         return error.ResourceLimitFailed;
     };
 
+    // Enforce network rules, before the program can send a packet
+    applyNetworkRules(io, jail_name, jail_path, capability.network_config, capability.network_rules.items) catch {
+        cleanupIsolation(io);
+        removeResourceLimits(jail_name);
+        removeNetworkRules(jail_name);
+        return error.JailParamFailed;
+    };
+
     // Attach to jail
     attachToJail(io, jid) catch {
         cleanupIsolation(io);
@@ -1742,6 +1949,20 @@ test "trustedInstanceDir accepts only isolate's own layout" {
     for (bad) |path| {
         try std.testing.expect(trustedInstanceDir(path) == null);
     }
+}
+
+test "coveringRule" {
+    const rules = [_]caps.FileRule{
+        .{ .path = "/tmp", .permissions = caps.Permission.read_write },
+        .{ .path = "/etc", .permissions = caps.Permission.read_only },
+        .{ .path = "/etc/ssh", .permissions = caps.Permission.read_write },
+    };
+    try std.testing.expectEqualStrings("/etc/ssh", coveringRule(&rules, "/etc/ssh/ssh_config").?.path);
+    try std.testing.expectEqualStrings("/etc", coveringRule(&rules, "/etc/hosts").?.path);
+    try std.testing.expect(coveringRule(&rules, "/etc") == null); // not inside itself
+    try std.testing.expect(coveringRule(&rules, "/etcetera/x") == null);
+    try std.testing.expect(coveringRule(&rules, "/tmp/.X11-unix") == null); // /tmp is private
+    try std.testing.expect(coveringRule(&rules, "/usr/lib") == null);
 }
 
 test "pidFromName" {

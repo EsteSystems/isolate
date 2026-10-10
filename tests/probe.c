@@ -10,6 +10,8 @@
  *   probe ignore-term      ignore SIGTERM and SIGINT, sleep until killed
  *   probe shm              create, attach and remove a System V shared memory segment
  *   probe whoami           look the current uid up in the user database
+ *   probe listen s port... listen on each TCP port for s seconds
+ *   probe self             print argv[0]
  */
 
 #include <sys/types.h>
@@ -197,6 +199,30 @@ probe_whoami(void)
 	return (0);
 }
 
+static int
+probe_listen(int argc, char **argv)
+{
+	int seconds = argc > 0 ? atoi(argv[0]) : 5;
+
+	for (int i = 1; i < argc; i++) {
+		struct sockaddr_in a;
+		int one = 1;
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_port = htons((unsigned short)atoi(argv[i]));
+		setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		if (s < 0 || bind(s, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(s, 8) < 0) {
+			printf("listen: port %s failed: %s\n", argv[i], strerror(errno));
+			return (1);
+		}
+		printf("listen: port %s\n", argv[i]);
+	}
+	sleep((unsigned)seconds);
+	return (0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -221,6 +247,12 @@ main(int argc, char **argv)
 		return (probe_ignore_term());
 	if (strcmp(argv[1], "shm") == 0)
 		return (probe_shm());
+	if (strcmp(argv[1], "listen") == 0)
+		return (probe_listen(argc - 2, argv + 2));
+	if (strcmp(argv[1], "self") == 0) {
+		printf("self: %s\n", argv[0]);
+		return (0);
+	}
 	if (strcmp(argv[1], "whoami") == 0)
 		return (probe_whoami());
 	return (2);
