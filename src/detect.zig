@@ -579,7 +579,7 @@ pub fn detectCapabilities(
     binary_path: []const u8,
     output_path: ?[]const u8,
 ) DetectError!void {
-    var stdout_file = std.Io.File.stdout().writer(io, &.{});
+    var stdout_file = std.Io.File.stdout().writerStreaming(io, &.{});
     const stdout = &stdout_file.interface;
 
     stdout.print("Detecting capabilities for: {s}\n", .{binary_path}) catch {};

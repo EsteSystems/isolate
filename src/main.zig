@@ -44,14 +44,17 @@ const c = c_api.c;
 pub const version = "0.3.0-zig";
 
 /// Unbuffered stdout writer. Unbuffered so that nothing is left behind in a
-/// buffer across fork()/execv()/_exit() in the isolation path.
+/// buffer across fork()/execv()/_exit() in the isolation path. Streaming
+/// (write(2), not pwrite(2)): a positional writer keeps its own offset, so
+/// with output redirected to a file every writer - and the jailed program
+/// sharing the descriptor - would overwrite the others from offset 0.
 fn stdoutWriter(io: std.Io) std.Io.File.Writer {
-    return std.Io.File.stdout().writer(io, &.{});
+    return std.Io.File.stdout().writerStreaming(io, &.{});
 }
 
 /// Unbuffered stderr writer.
 fn stderrWriter(io: std.Io) std.Io.File.Writer {
-    return std.Io.File.stderr().writer(io, &.{});
+    return std.Io.File.stderr().writerStreaming(io, &.{});
 }
 
 /// Subcommands
@@ -696,7 +699,7 @@ fn stopInstance(io: std.Io, allocator: std.mem.Allocator, name: []const u8, forc
         return 0;
     }
 
-    freebsd.teardownInstance(io, inst.jail_id, inst.jail_path, inst.username);
+    freebsd.teardownInstance(io, inst.pid, inst.jail_id, inst.jail_path, inst.username);
     reg.unregister(name);
     try stdout.print("Instance '{s}' stopped and unregistered.\n", .{name});
 
@@ -728,7 +731,7 @@ fn cleanOrphans(io: std.Io, allocator: std.mem.Allocator, reg: *registry.Registr
             if (inst.manager_pid > 0 and c.kill(inst.manager_pid, 0) == 0) continue;
 
             try stdout.print("Instance '{s}' is orphaned (state: {s}, isolate process gone)\n", .{ inst.name, @tagName(inst.state) });
-            freebsd.teardownInstance(io, inst.jail_id, inst.jail_path, inst.username);
+            freebsd.teardownInstance(io, inst.pid, inst.jail_id, inst.jail_path, inst.username);
             reg.unregister(inst.name);
             cleaned += 1;
         }
@@ -765,6 +768,11 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
 
     // Also clean any orphaned instance directories
     if (builtin.os.tag == .freebsd and c.geteuid() == 0) {
+        const purged = freebsd.purgeStaleLimits();
+        if (purged > 0) {
+            try stdout.print("Removed resource limits of {d} jail(s) that no longer exist.\n", .{purged});
+        }
+
         try stdout.print("Checking for orphaned instance directories...\n", .{});
 
         // Instances that are still running keep their directories
@@ -1109,6 +1117,7 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
 
             // Cleanup using native Zig implementation
             freebsd.cleanupIsolation(io);
+            freebsd.removeResourceLimitsForPid(pid);
 
             // Unregister instance
             reg.unregister(instance.name);
