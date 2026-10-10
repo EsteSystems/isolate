@@ -227,7 +227,7 @@ pub fn copyFile(src: []const u8, dst: []const u8) !void {
 /// filesystem (FTS_XDEV): a mount that is still in place under `path` - a
 /// nullfs mount of a host directory, the workspace, devfs - keeps its
 /// contents; only the mount point directory itself is attempted (and fails
-/// harmlessly with EBUSY).
+/// with EBUSY). Returns an error if anything could not be removed.
 pub fn rmrf(path: []const u8) !void {
     var path_buf: [PATH_MAX]u8 = undefined;
     if (path.len >= PATH_MAX) return error.InvalidPath;
@@ -237,10 +237,13 @@ pub fn rmrf(path: []const u8) !void {
 
     var paths: [2][*c]u8 = .{ &path_buf, null };
 
-    const fts = c.fts_open(@ptrCast(&paths), c.FTS_PHYSICAL | c.FTS_NOCHDIR | c.FTS_NOSTAT | c.FTS_XDEV, null);
+    // No FTS_NOSTAT: with it, fts reports regular files as FTS_NSOK and
+    // needs stat data it does not have for FTS_XDEV
+    const fts = c.fts_open(@ptrCast(&paths), c.FTS_PHYSICAL | c.FTS_NOCHDIR | c.FTS_XDEV, null);
     if (fts == null) return error.FilesystemSetupFailed;
     defer _ = c.fts_close(fts);
 
+    var failed = false;
     while (c.fts_read(fts)) |ent| {
         switch (ent.*.fts_info) {
             c.FTS_D => {
@@ -248,15 +251,17 @@ pub fn rmrf(path: []const u8) !void {
             },
             c.FTS_DP => {
                 // Directory after children processed - remove it
-                _ = c.rmdir(ent.*.fts_accpath);
+                if (c.rmdir(ent.*.fts_accpath) != 0) failed = true;
             },
-            c.FTS_F, c.FTS_SL, c.FTS_SLNONE, c.FTS_DEFAULT => {
+            c.FTS_F, c.FTS_SL, c.FTS_SLNONE, c.FTS_DEFAULT, c.FTS_NSOK => {
                 // File or symlink - remove it
-                _ = c.unlink(ent.*.fts_accpath);
+                if (c.unlink(ent.*.fts_accpath) != 0) failed = true;
             },
             else => {},
         }
     }
+
+    if (failed) return error.FilesystemSetupFailed;
 }
 
 // ============================================================================
@@ -391,9 +396,9 @@ fn unmountAllUnder(root: []const u8) void {
 
 /// Tear down a per-instance directory: unmount everything mounted below
 /// it, then remove the tree (without crossing into anything still mounted).
-pub fn cleanupInstanceDir(inst_dir: []const u8) void {
+pub fn cleanupInstanceDir(inst_dir: []const u8) !void {
     unmountAllUnder(inst_dir);
-    rmrf(inst_dir) catch {};
+    try rmrf(inst_dir);
 }
 
 // ============================================================================
@@ -1068,7 +1073,9 @@ pub fn cleanupIsolation(io: std.Io) void {
     if (jail_path.len > 0) {
         const inst_dir = instanceDir(jail_path);
         stdout.print("Cleaning up instance directory: {s}\n", .{inst_dir}) catch {};
-        cleanupInstanceDir(inst_dir);
+        cleanupInstanceDir(inst_dir) catch {
+            stdout.print("Warning: Could not fully remove {s} ('isolate clean' will retry)\n", .{inst_dir}) catch {};
+        };
         jail_state.jail_root_path[0] = 0;
     }
 
@@ -1139,7 +1146,10 @@ pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_
 
     stdout.print("Creating jail filesystem: {s}\n", .{jail_path}) catch {};
 
-    mkdirp(jail_path) catch return error.FilesystemSetupFailed;
+    mkdirp(jail_path) catch {
+        cleanupIsolation(io);
+        return error.FilesystemSetupFailed;
+    };
 
     // Set up filesystem isolation
     setupFilesystemIsolation(io, capability, jail_path, target_binary, target_uid, target_gid, username) catch {

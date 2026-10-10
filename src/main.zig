@@ -729,7 +729,10 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
 
             if (builtin.os.tag == .freebsd) {
                 try stdout.print("Removing orphaned instance directory {s}\n", .{path});
-                freebsd.cleanupInstanceDir(path);
+                freebsd.cleanupInstanceDir(path) catch {
+                    try stderr.print("Warning: Could not fully remove {s}\n", .{path});
+                    continue;
+                };
                 cleaned_dirs += 1;
             }
         }
