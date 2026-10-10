@@ -249,14 +249,19 @@ fn checkProcessState(pid: i64, jail_id: i64) InstanceState {
         // Check if jail exists
         const c = @cImport({
             @cInclude("sys/param.h");
+            @cInclude("sys/uio.h");
             @cInclude("sys/jail.h");
         });
 
-        // Try to get jail info - if it fails, jail doesn't exist
-        const jid: c_int = @intCast(jail_id);
-        if (c.jail_attach(jid) == 0) {
-            // We accidentally attached! This shouldn't happen in practice
-            // since we're not root here, but handle it anyway
+        // Look the jail up by jid with jail_get(2), which only reads. The
+        // previous jail_attach(2) probe succeeds when run as root (doas
+        // isolate stop/clean) and moves this very process into the jail.
+        var jid: c_int = @intCast(jail_id);
+        var iov = [_]c.struct_iovec{
+            .{ .iov_base = @ptrCast(@constCast("jid")), .iov_len = 4 },
+            .{ .iov_base = @ptrCast(&jid), .iov_len = @sizeOf(c_int) },
+        };
+        if (c.jail_get(&iov, iov.len, 0) >= 0) {
             return .running;
         }
 

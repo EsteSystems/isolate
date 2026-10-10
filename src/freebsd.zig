@@ -791,6 +791,14 @@ pub fn switchToUser(io: std.Io, uid: u32, gid: u32, username: []const u8) !void 
     const stdout = &stdout_file.interface;
     stdout.print("Switching to user {s} (UID {d}, GID {d})\n", .{ username, uid, gid }) catch {};
 
+    // Drop root's supplementary groups (wheel, operator, ...) first:
+    // setgid/setuid alone leave them in place, and they would carry into
+    // the jailed process
+    const groups = [_]c.gid_t{gid};
+    if (c.setgroups(1, &groups) != 0) {
+        return error.PermissionDenied;
+    }
+
     // Set GID first (must be done before dropping privileges)
     if (c.setgid(gid) != 0) {
         return error.PermissionDenied;
