@@ -174,6 +174,16 @@ check LIF-6 "stop -f succeeds" rc_is 0
 check LIF-6 "  and isolate exits" wait_gone $M
 check LIF-1 "nothing is left after stop -f" clean_host
 
+"$I" run -c "$BASECAPS" -N scenario-opts "$W/probe" ignore-term >"$W/opts.log" 2>&1 &
+M=$!; sleep 2
+T0=$(date +%s); OUT=$("$I" stop -t 1 scenario-opts 2>&1); RC=$?; T1=$(date +%s)
+check LIF-6 "stop -t 1 gives up after about a second" test $((T1 - T0)) -le 3
+check LIF-6 "  and reports that the program is still running" rc_is 1
+OUT=$("$I" stop -s USR1 -t 5 scenario-opts 2>&1); RC=$?
+check LIF-6 "stop -s USR1 ends a program that ignores SIGTERM" rc_is 0
+check LIF-6 "  and isolate exits" wait_gone $M
+check LIF-1 "nothing is left after stop -s" clean_host
+
 "$I" run -c "$BASECAPS" -N scenario-orphan "$W/probe" ignore-term >"$W/orphan.log" 2>&1 &
 M=$!; sleep 2
 kill -9 $M; sleep 1

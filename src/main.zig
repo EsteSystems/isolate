@@ -91,6 +91,40 @@ const DetectOptions = struct {
 const StopOptions = struct {
     force: bool = false,
     name: ?[]const u8 = null,
+    /// Signal sent to the program to ask it to stop
+    signal: StopSignal = .{ .number = c.SIGTERM, .name = "TERM" },
+    /// How long to wait for the program to exit after signalling it
+    timeout_seconds: u32 = 5,
+};
+
+/// A signal `isolate stop` can send, by number and by the name it is reported with
+const StopSignal = struct {
+    number: c_int,
+    name: []const u8,
+
+    const known = [_]StopSignal{
+        .{ .number = c.SIGTERM, .name = "TERM" },
+        .{ .number = c.SIGINT, .name = "INT" },
+        .{ .number = c.SIGQUIT, .name = "QUIT" },
+        .{ .number = c.SIGHUP, .name = "HUP" },
+        .{ .number = c.SIGUSR1, .name = "USR1" },
+        .{ .number = c.SIGUSR2, .name = "USR2" },
+        .{ .number = c.SIGKILL, .name = "KILL" },
+    };
+
+    /// "INT", "SIGINT", "int" or the signal's number; null for anything else
+    fn parse(text: []const u8) ?StopSignal {
+        var name = text;
+        if (name.len > 3 and std.ascii.eqlIgnoreCase(name[0..3], "SIG")) name = name[3..];
+        for (known) |sig| {
+            if (std.ascii.eqlIgnoreCase(name, sig.name)) return sig;
+        }
+        const number = std.fmt.parseInt(c_int, text, 10) catch return null;
+        for (known) |sig| {
+            if (sig.number == number) return sig;
+        }
+        return null;
+    }
 };
 
 /// Parsed arguments with owned memory
@@ -273,6 +307,20 @@ fn parseStopArgs(opts: *StopOptions, args: []const [:0]const u8) !void {
         if (std.mem.startsWith(u8, arg, "-")) {
             if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
                 opts.force = true;
+            } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--signal")) {
+                i += 1;
+                if (i >= args.len) return error.MissingArgument;
+                opts.signal = StopSignal.parse(args[i]) orelse {
+                    std.debug.print("Unknown signal: {s} (use TERM, INT, QUIT, HUP, USR1, USR2 or KILL)\n", .{args[i]});
+                    return error.UnknownOption;
+                };
+            } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--timeout")) {
+                i += 1;
+                if (i >= args.len) return error.MissingArgument;
+                opts.timeout_seconds = std.fmt.parseInt(u32, args[i], 10) catch {
+                    std.debug.print("Invalid timeout: {s} (seconds)\n", .{args[i]});
+                    return error.UnknownOption;
+                };
             } else {
                 std.debug.print("Unknown option: {s}\n", .{arg});
                 return error.UnknownOption;
@@ -634,7 +682,7 @@ fn cmdStop(io: std.Io, allocator: std.mem.Allocator, opts: StopOptions) !u8 {
 
     if (opts.name == null) {
         try stderr.print("Error: No instance name specified\n", .{});
-        try stderr.print("Usage: isolate stop <name>\n", .{});
+        try stderr.print("Usage: isolate stop [-f] [-s signal] [-t seconds] <name>\n", .{});
         try stderr.print("Run 'isolate list' to see running instances.\n", .{});
         return 1;
     }
@@ -650,13 +698,15 @@ fn cmdStop(io: std.Io, allocator: std.mem.Allocator, opts: StopOptions) !u8 {
         try stderr.print("Error: Stopping instances is only supported on FreeBSD\n", .{});
         return 1;
     } else {
-        return stopInstance(io, allocator, opts.name.?, opts.force);
+        return stopInstance(io, allocator, opts);
     }
 }
 
 /// Stop a registered instance. Cleans up after it only if the isolate
 /// process that started it is no longer around to do so itself.
-fn stopInstance(io: std.Io, allocator: std.mem.Allocator, name: []const u8, force: bool) !u8 {
+fn stopInstance(io: std.Io, allocator: std.mem.Allocator, opts: StopOptions) !u8 {
+    const name = opts.name.?;
+    const force = opts.force;
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
     var stderr_file = stderrWriter(io);
@@ -684,19 +734,20 @@ fn stopInstance(io: std.Io, allocator: std.mem.Allocator, name: []const u8, forc
     // Signal the jailed process only while its jail still exists: once
     // the jail is gone, the PID may already belong to another process
     if (inst.state == .running and freebsd.jailBelongsTo(inst.jail_id, inst.pid)) {
-        if (c.kill(inst.pid, c.SIGTERM) < 0) {
-            try stderr.print("Warning: Failed to send SIGTERM to PID {d}\n", .{inst.pid});
+        if (c.kill(inst.pid, opts.signal.number) < 0) {
+            try stderr.print("Warning: Failed to send SIG{s} to PID {d}\n", .{ opts.signal.name, inst.pid });
         } else {
-            try stdout.print("Sent SIGTERM to PID {d}, waiting for it to exit...\n", .{inst.pid});
-            var waited: u32 = 0;
-            while (waited < 50 and c.kill(inst.pid, 0) == 0) : (waited += 1) {
+            try stdout.print("Sent SIG{s} to PID {d}, waiting up to {d} seconds for it to exit...\n", .{ opts.signal.name, inst.pid, opts.timeout_seconds });
+            var waited: u64 = 0;
+            const ticks = @as(u64, opts.timeout_seconds) * 10;
+            while (waited < ticks and c.kill(inst.pid, 0) == 0) : (waited += 1) {
                 io.sleep(.fromMilliseconds(100), .awake) catch {};
             }
         }
 
         if (c.kill(inst.pid, 0) == 0) {
             if (!force) {
-                try stderr.print("Process {d} is still running after 5 seconds.\n", .{inst.pid});
+                try stderr.print("Process {d} is still running after {d} seconds.\n", .{ inst.pid, opts.timeout_seconds });
                 try stderr.print("Use -f/--force to remove the jail, which kills everything inside it.\n", .{});
                 return 1;
             }
@@ -1277,6 +1328,32 @@ test "parseRunArgs: -- ends options" {
     try std.testing.expectEqualStrings("-odd-name", opts.target_binary.?);
     try std.testing.expectEqual(@as(usize, 1), opts.binary_args.len);
     try std.testing.expectEqualStrings("-x", opts.binary_args[0]);
+}
+
+test "parseStopArgs: signal and timeout" {
+    const allocator = std.testing.allocator;
+
+    var plain = try parseArgs(allocator, &.{ "isolate", "stop", "pg" });
+    defer plain.deinit();
+    try std.testing.expectEqualStrings("pg", plain.stop_opts.name.?);
+    try std.testing.expectEqual(@as(c_int, c.SIGTERM), plain.stop_opts.signal.number);
+    try std.testing.expectEqual(@as(u32, 5), plain.stop_opts.timeout_seconds);
+    try std.testing.expect(!plain.stop_opts.force);
+
+    var fast = try parseArgs(allocator, &.{ "isolate", "stop", "-s", "SIGINT", "--timeout", "60", "-f", "pg" });
+    defer fast.deinit();
+    try std.testing.expectEqual(@as(c_int, c.SIGINT), fast.stop_opts.signal.number);
+    try std.testing.expectEqualStrings("INT", fast.stop_opts.signal.name);
+    try std.testing.expectEqual(@as(u32, 60), fast.stop_opts.timeout_seconds);
+    try std.testing.expect(fast.stop_opts.force);
+
+    var by_number = try parseArgs(allocator, &.{ "isolate", "stop", "-s", "2", "pg" });
+    defer by_number.deinit();
+    try std.testing.expectEqual(@as(c_int, c.SIGINT), by_number.stop_opts.signal.number);
+
+    try std.testing.expectError(error.UnknownOption, parseArgs(allocator, &.{ "isolate", "stop", "-s", "NOPE", "pg" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(allocator, &.{ "isolate", "stop", "-t", "soon", "pg" }));
+    try std.testing.expectError(error.MissingArgument, parseArgs(allocator, &.{ "isolate", "stop", "-s" }));
 }
 
 test "parseRunArgs: errors" {
