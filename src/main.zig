@@ -423,6 +423,14 @@ fn cmdRun(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions) !u8 {
 
     const target_binary = opts.target_binary.?;
 
+    if (opts.name) |name| {
+        if (!registry.isValidInstanceName(name)) {
+            try stderr.print("Error: Invalid instance name '{s}'\n", .{name});
+            try stderr.print("Use letters, digits, '.', '_' and '-' (not starting with '.'), at most 64 characters.\n", .{});
+            return 1;
+        }
+    }
+
     // Determine capability file
     var caps_file_buf: [c_api.PATH_MAX]u8 = undefined;
     const caps_file = if (opts.caps_file) |cf|
@@ -845,7 +853,20 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             io.random(&random_bytes);
             const suffix = std.fmt.bytesToHex(random_bytes, .lower);
 
-            const formatted = std.fmt.bufPrint(&name_buf, "{s}-{s}", .{ process_name, suffix }) catch "isolate-instance";
+            // Keep the name valid for the registry: replace anything outside
+            // the allowed character set and leave room for the suffix
+            var base_buf: [64 - 9]u8 = undefined;
+            const base_len = @min(process_name.len, base_buf.len);
+            for (process_name[0..base_len], 0..) |ch, i| {
+                base_buf[i] = switch (ch) {
+                    'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => ch,
+                    else => '-',
+                };
+            }
+            var base: []const u8 = base_buf[0..base_len];
+            if (base.len == 0 or base[0] == '.') base = "app";
+
+            const formatted = std.fmt.bufPrint(&name_buf, "{s}-{s}", .{ base, suffix }) catch "isolate-instance";
             break :blk formatted;
         };
 

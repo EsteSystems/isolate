@@ -15,6 +15,36 @@ extern "c" fn kill(pid: std.c.pid_t, sig: c_int) c_int;
 pub const REGISTRY_DIR = "/var/run/isolate";
 pub const REGISTRY_DIR_FALLBACK = "/tmp/isolate-registry";
 
+/// Instance names become registry file names (<name>.json) and appear in
+/// paths: letters, digits, '.', '_' and '-' only, not starting with '.',
+/// at most 64 bytes.
+pub fn isValidInstanceName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or name[0] == '.') return false;
+    for (name) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Write `s` as a JSON string literal
+fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\t' => try writer.writeAll("\\t"),
+            0...8, 11, 12, 14...0x1f => try writer.print("\\u{x:0>4}", .{ch}),
+            else => try writer.writeByte(ch),
+        }
+    }
+    try writer.writeByte('"');
+}
+
 /// Instance state
 pub const InstanceState = enum {
     running,
@@ -83,6 +113,7 @@ pub const Registry = struct {
 
     /// Register a new instance
     pub fn register(self: *Self, instance: Instance) !void {
+        if (!isValidInstanceName(instance.name)) return error.InvalidInstanceName;
         try self.ensureDir();
 
         var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -95,40 +126,28 @@ pub const Registry = struct {
         var file_writer = file.writer(self.io, &write_buf);
         const writer = &file_writer.interface;
 
-        // Format workspace_path to a stack buffer to avoid memory leak
-        var ws_buf: [512]u8 = undefined;
-        const ws_str: []const u8 = if (instance.workspace_path) |wp|
-            std.fmt.bufPrint(&ws_buf, "\"{s}\"", .{wp}) catch "null"
-        else
-            "null";
-
-        try writer.print(
-            \\{{
-            \\  "name": "{s}",
-            \\  "pid": {d},
-            \\  "jail_id": {d},
-            \\  "jail_path": "{s}",
-            \\  "username": "{s}",
-            \\  "binary_path": "{s}",
-            \\  "start_time": {d},
-            \\  "workspace_path": {s}
-            \\}}
-        , .{
-            instance.name,
-            instance.pid,
-            instance.jail_id,
-            instance.jail_path,
-            instance.username,
-            instance.binary_path,
-            instance.start_time,
-            ws_str,
-        });
+        try writer.writeAll("{\n  \"name\": ");
+        try writeJsonString(writer, instance.name);
+        try writer.print(",\n  \"pid\": {d},\n  \"jail_id\": {d},\n  \"jail_path\": ", .{ instance.pid, instance.jail_id });
+        try writeJsonString(writer, instance.jail_path);
+        try writer.writeAll(",\n  \"username\": ");
+        try writeJsonString(writer, instance.username);
+        try writer.writeAll(",\n  \"binary_path\": ");
+        try writeJsonString(writer, instance.binary_path);
+        try writer.print(",\n  \"start_time\": {d},\n  \"workspace_path\": ", .{instance.start_time});
+        if (instance.workspace_path) |wp| {
+            try writeJsonString(writer, wp);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll("\n}\n");
 
         try writer.flush();
     }
 
     /// Unregister an instance
     pub fn unregister(self: *Self, name: []const u8) void {
+        if (!isValidInstanceName(name)) return;
         var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ self.registry_dir, name }) catch return;
         Io.Dir.deleteFileAbsolute(self.io, path) catch {};
@@ -216,6 +235,7 @@ pub const Registry = struct {
 
     /// Get instance by name
     pub fn get(self: *Self, name: []const u8) !?InstanceInfo {
+        if (!isValidInstanceName(name)) return null;
         var filename_buf: [256]u8 = undefined;
         const filename = try std.fmt.bufPrint(&filename_buf, "{s}.json", .{name});
         return self.loadInstance(filename) catch null;
@@ -284,16 +304,42 @@ fn checkProcessState(pid: i64, jail_id: i64) InstanceState {
     }
 }
 
-/// Simple JSON string extraction
+/// Simple JSON string extraction (handles the escapes writeJsonString emits)
 fn extractJsonString(allocator: Allocator, json: []const u8, key: []const u8) ![]const u8 {
     var search_buf: [64]u8 = undefined;
     const search = try std.fmt.bufPrint(&search_buf, "\"{s}\": \"", .{key});
 
     const start_idx = std.mem.find(u8, json, search) orelse return error.KeyNotFound;
-    const value_start = start_idx + search.len;
-    const value_end = std.mem.findPos(u8, json, value_start, "\"") orelse return error.InvalidJson;
 
-    return allocator.dupe(u8, json[value_start..value_end]);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i = start_idx + search.len;
+    while (i < json.len) : (i += 1) {
+        const ch = json[i];
+        if (ch == '"') return out.toOwnedSlice(allocator);
+        if (ch != '\\') {
+            try out.append(allocator, ch);
+            continue;
+        }
+        i += 1;
+        if (i >= json.len) return error.InvalidJson;
+        switch (json[i]) {
+            '"', '\\', '/' => |e| try out.append(allocator, e),
+            'n' => try out.append(allocator, '\n'),
+            't' => try out.append(allocator, '\t'),
+            'r' => try out.append(allocator, '\r'),
+            'u' => {
+                if (i + 4 >= json.len) return error.InvalidJson;
+                const code = std.fmt.parseInt(u16, json[i + 1 .. i + 5], 16) catch return error.InvalidJson;
+                if (code > 0xff) return error.InvalidJson;
+                try out.append(allocator, @intCast(code));
+                i += 4;
+            },
+            else => return error.InvalidJson,
+        }
+    }
+    return error.InvalidJson;
 }
 
 /// Simple JSON int extraction
@@ -328,6 +374,39 @@ test "extractJsonString" {
     defer allocator.free(name);
 
     try std.testing.expectEqualStrings("test-123", name);
+}
+
+test "extractJsonString unescapes" {
+    const json =
+        \\{"name": "a\"b\\c\u0001"}
+    ;
+    const allocator = std.testing.allocator;
+    const name = try extractJsonString(allocator, json, "name");
+    defer allocator.free(name);
+    try std.testing.expectEqualStrings("a\"b\\c\x01", name);
+}
+
+test "writeJsonString round trip" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("{\"name\": ");
+    try writeJsonString(&w, "x\"y\\z\n");
+    try w.writeAll("}");
+    const name = try extractJsonString(allocator, w.buffered(), "name");
+    defer allocator.free(name);
+    try std.testing.expectEqualStrings("x\"y\\z\n", name);
+}
+
+test "isValidInstanceName" {
+    try std.testing.expect(isValidInstanceName("myapp-abc123"));
+    try std.testing.expect(isValidInstanceName("tenant_1.prod"));
+    try std.testing.expect(!isValidInstanceName(""));
+    try std.testing.expect(!isValidInstanceName(".hidden"));
+    try std.testing.expect(!isValidInstanceName("../../etc/passwd"));
+    try std.testing.expect(!isValidInstanceName("a/b"));
+    try std.testing.expect(!isValidInstanceName("with space"));
+    try std.testing.expect(!isValidInstanceName("x" ** 65));
 }
 
 test "extractJsonInt" {
