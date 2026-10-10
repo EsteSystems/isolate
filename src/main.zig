@@ -585,12 +585,12 @@ fn cmdList(io: std.Io, allocator: std.mem.Allocator) !u8 {
 
         // Truncate binary path if too long
         var binary_display: [30]u8 = undefined;
-        const binary_path = if (inst.binary_path.len > 29) blk: {
-            @memcpy(binary_display[0..27], inst.binary_path[inst.binary_path.len - 27 ..]);
-            binary_display[0] = '.';
-            binary_display[1] = '.';
-            binary_display[2] = '.';
-            break :blk binary_display[0..30];
+        const binary_path = if (inst.binary_path.len > binary_display.len) blk: {
+            // "..." followed by the tail of the path
+            const tail_len = binary_display.len - 3;
+            @memcpy(binary_display[0..3], "...");
+            @memcpy(binary_display[3..], inst.binary_path[inst.binary_path.len - tail_len ..]);
+            break :blk binary_display[0..];
         } else inst.binary_path;
 
         // Format the numbers first: a width on {d} prints a leading '+'
