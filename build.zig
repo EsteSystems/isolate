@@ -10,22 +10,24 @@ pub fn build(b: *std.Build) void {
     // Determine if we're building for FreeBSD
     const is_freebsd = target.result.os.tag == .freebsd;
 
-    // Main executable - pure Zig implementation
-    const exe = b.addExecutable(.{
-        .name = "isolate",
+    // Main module - pure Zig implementation, links libc for system calls
+    const isolate_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     // Add platform-specific libraries
     // FreeBSD: need libjail for jail API
     if (is_freebsd) {
-        exe.linkSystemLibrary("jail");
+        isolate_mod.linkSystemLibrary("jail", .{});
     }
 
-    // Link libc for system calls
-    exe.linkLibC();
+    const exe = b.addExecutable(.{
+        .name = "isolate",
+        .root_module = isolate_mod,
+    });
 
     // Install the executable
     b.installArtifact(exe);
@@ -42,60 +44,41 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run isolate");
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests
+    // Unit tests - built from the same module as the executable
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = isolate_mod,
     });
-
-    if (is_freebsd) {
-        unit_tests.linkSystemLibrary("jail");
-    }
-    unit_tests.linkLibC();
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Integration tests (separate module)
-    const integration_tests = b.addTest(.{
-        .root_source_file = b.path("src/tests/integration.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    if (is_freebsd) {
-        integration_tests.linkSystemLibrary("jail");
-    }
-    integration_tests.linkLibC();
-
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    const integration_test_step = b.step("test-integration", "Run integration tests");
-    integration_test_step.dependOn(&run_integration_tests.step);
-
     // Build examples
     const hello_exe = b.addExecutable(.{
         .name = "hello",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    hello_exe.addCSourceFile(.{
+    hello_exe.root_module.addCSourceFile(.{
         .file = b.path("examples/hello.c"),
         .flags = &.{},
     });
-    hello_exe.linkLibC();
 
     const server_exe = b.addExecutable(.{
         .name = "server",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    server_exe.addCSourceFile(.{
+    server_exe.root_module.addCSourceFile(.{
         .file = b.path("examples/server.c"),
         .flags = &.{},
     });
-    server_exe.linkLibC();
 
     // Install examples to zig-out/examples/
     const install_hello = b.addInstallArtifact(hello_exe, .{

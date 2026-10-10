@@ -1,0 +1,16 @@
+.{
+    .name = .isolate,
+    .version = "0.3.0",
+    .fingerprint = 0x5bf88932bbfdd77e, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "docs",
+        "LICENSE",
+        "README.md",
+    },
+}

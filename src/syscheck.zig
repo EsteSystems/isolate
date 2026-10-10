@@ -93,7 +93,7 @@ pub fn detect() SystemCapabilities {
 }
 
 /// Print system capabilities check results
-pub fn printCheck(caps: SystemCapabilities, writer: anytype) !void {
+pub fn printCheck(caps: SystemCapabilities, writer: *std.Io.Writer) !void {
     try writer.print("isolate System Check\n", .{});
     try writer.print("====================\n\n", .{});
 
@@ -173,7 +173,7 @@ pub fn printCheck(caps: SystemCapabilities, writer: anytype) !void {
 }
 
 /// Print warning if racct is not enabled (for use before setting resource limits)
-pub fn warnIfRacctDisabled(caps: SystemCapabilities, writer: anytype) !void {
+pub fn warnIfRacctDisabled(caps: SystemCapabilities, writer: *std.Io.Writer) !void {
     if (!caps.racct_enabled) {
         try writer.print(
             \\
@@ -192,7 +192,7 @@ pub fn warnIfRacctDisabled(caps: SystemCapabilities, writer: anytype) !void {
 }
 
 /// Print warning if VNET is not available (for use when --vnet is requested)
-pub fn warnIfVnetUnavailable(caps: SystemCapabilities, writer: anytype) !void {
+pub fn warnIfVnetUnavailable(caps: SystemCapabilities, writer: *std.Io.Writer) !void {
     if (!caps.vnet_available) {
         try writer.print(
             \\

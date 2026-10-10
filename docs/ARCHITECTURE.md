@@ -47,7 +47,7 @@ src/
 ├── detect.zig      ELF binary analysis for capability detection
 ├── freebsd.zig     FreeBSD jail implementation
 ├── registry.zig    Instance tracking and persistence
-├── platform.zig    Platform detection and abstraction
+├── syscheck.zig    Kernel feature detection (racct, VNET)
 └── c_api.zig       C library bindings for system calls
 ```
 
@@ -59,18 +59,18 @@ main.zig
 ├── detect.zig
 ├── registry.zig
 ├── freebsd.zig (conditional: FreeBSD only)
-├── platform.zig
+├── syscheck.zig (conditional: FreeBSD only)
 └── c_api.zig
 
 freebsd.zig
 ├── caps.zig
-└── c_api.zig
+└── syscheck.zig
 
 detect.zig
 └── (standalone, uses std only)
 
 registry.zig
-└── c_api.zig (for process state checking)
+└── (standalone, uses std and libjail)
 
 caps.zig
 └── (standalone, uses std only)
@@ -87,27 +87,30 @@ pub const Capabilities = struct {
     allocator: Allocator,
 
     // User context
-    username: ?[]const u8,        // Specific user or null for auto
-    auto_user: bool,              // Create ephemeral user
-
-    // Resource limits
-    memory_limit: u64,            // Bytes (0 = unlimited)
-    process_limit: u32,           // Max processes
-    file_limit: u32,              // Max file descriptors
-
-    // Access rules
-    network_rules: ArrayList(NetworkRule),
-    file_rules: ArrayList(FileRule),
-    env_vars: ArrayList(EnvVar),
+    username: []const u8,         // "auto" or an existing user name
+    create_user: bool,            // Create ephemeral user (username == "auto")
 
     // Workspace
     workspace_path: ?[]const u8,  // Host path for /workspace mount
+
+    // Network isolation mode (inherit, none, vnet) and VNET settings
+    network_config: NetworkConfig,
+
+    // Access rules
+    network_rules: ArrayList(NetworkRule),  // Parsed and listed, not enforced
+    file_rules: ArrayList(FileRule),
+    env_vars: ArrayList(EnvVar),
+    env_clear: bool,              // Start from an empty environment
+
+    // Resource limits (null = unlimited)
+    limits: ResourceLimits,       // memory_bytes, max_processes, max_files
 };
 
 pub const NetworkRule = struct {
-    protocol: Protocol,           // tcp, udp, unix
-    port: u16,
-    direction: Direction,         // inbound, outbound
+    protocol: Protocol,           // tcp, udp, unix, none
+    address: []const u8,          // Optional address or socket path
+    port: ?u16,
+    direction: Direction,         // inbound, outbound, both
 };
 
 pub const FileRule = struct {
@@ -123,7 +126,8 @@ The registry tracks running instances for management:
 ```zig
 pub const Instance = struct {
     name: []const u8,             // Unique instance identifier
-    pid: i32,                     // Process ID
+    pid: i32,                     // Process ID (inside the jail)
+    manager_pid: i32,             // The isolate process waiting for it
     jail_id: i32,                 // FreeBSD jail ID
     jail_path: []const u8,        // Jail filesystem root
     username: []const u8,         // Ephemeral user (if created)
@@ -233,9 +237,10 @@ pub const CapabilityType = enum {
 Creation:
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Generate unique jail name (isolate-<pid>)                │
-│ 2. Create jail root: /tmp/isolate-<name>/                   │
-│ 3. Create directory structure:                              │
-│    /tmp/isolate-<name>/                                     │
+│ 2. Create instance dir: /var/run/isolate/inst-XXXXXX/      │
+│    (mkdtemp; root-owned parent, unpredictable name)         │
+│ 3. Create jail root inside it:                              │
+│    /var/run/isolate/inst-XXXXXX/root/                       │
 │    ├── bin/           (empty or minimal)                    │
 │    ├── lib/           (nullfs mount)                        │
 │    ├── libexec/       (nullfs mount)                        │
@@ -323,7 +328,7 @@ Each file contains:
   "name": "myapp-abc123",
   "pid": 12345,
   "jail_id": 5,
-  "jail_path": "/tmp/isolate-isolate-12345",
+  "jail_path": "/var/run/isolate/inst-a1B2c3/root",
   "username": "app-12345",
   "binary_path": "/usr/local/bin/myapp",
   "start_time": 1699900000,
@@ -420,7 +425,7 @@ isolate protects against:
 1. **Filesystem escape**: Jail root is isolated, only explicit mounts accessible
 2. **Privilege escalation**: Ephemeral unprivileged users, no setuid binaries
 3. **Resource exhaustion**: rctl limits on memory, processes, file descriptors
-4. **Network abuse**: Explicit network rules required for access
+4. **Network abuse**: `network_mode: none` or an isolated VNET stack; `network:` rules are not enforced yet
 5. **Cross-tenant access**: Separate jails, users, and workspaces per instance
 
 ### Trust Boundaries
@@ -452,7 +457,7 @@ isolate protects against:
 Applications run with minimum required privileges:
 
 1. **Explicit grants**: Only capabilities in `.caps` file are available
-2. **Default deny**: No network, limited filesystem by default
+2. **Nothing mounted by default**: only `filesystem:` rules expose host directories; the network is inherited from the host unless `network_mode` is `none` or `vnet`
 3. **Ephemeral identity**: New user per instance, deleted on exit
 4. **Resource bounds**: Hard limits prevent exhaustion attacks
 
@@ -461,7 +466,7 @@ Applications run with minimum required privileges:
 ### Interface Design
 
 ```zig
-// platform.zig defines the abstraction
+// Planned: a platform.zig module defining the abstraction
 pub const Platform = enum {
     freebsd,
     linux,      // Planned

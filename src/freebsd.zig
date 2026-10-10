@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const caps = @import("caps.zig");
 const syscheck = @import("syscheck.zig");
+const registry = @import("registry.zig");
 
 // Only compile on FreeBSD
 comptime {
@@ -25,7 +26,6 @@ const c = @cImport({
     @cInclude("sys/jail.h");
     @cInclude("sys/mount.h");
     @cInclude("sys/uio.h");
-    @cInclude("sys/stat.h");
     @cInclude("sys/wait.h");
     @cInclude("jail.h"); // For jailparam functions
     @cInclude("pwd.h");
@@ -41,6 +41,31 @@ const c = @cImport({
 });
 
 pub const PATH_MAX = c.PATH_MAX;
+
+/// Root-owned directory that holds the per-instance directories. Only root
+/// can create entries in /var/run, so nobody else can plant a path or a
+/// symlink here for root to follow.
+const runtime_dir = registry.REGISTRY_DIR;
+
+/// The per-instance directory that contains the jail root (`<dir>/root`)
+fn instanceDir(jail_path: []const u8) []const u8 {
+    return std.fs.path.dirname(jail_path) orelse jail_path;
+}
+
+// stat(2) against std.c.Stat; std.c.stat is missing its extern in Zig 0.16
+extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+
+// libc's environment pointer. FreeBSD has no clearenv(3); its setenv(3)
+// notices when `environ` has been replaced and continues from the new
+// array, so pointing it at an empty one clears the environment.
+extern var environ: [*c][*c]u8;
+var empty_environ = [_:null]?[*:0]u8{};
+
+/// Unbuffered stdout writer. Unbuffered so that nothing is left behind in a
+/// buffer across fork()/execv()/_exit() in the isolation path.
+fn stdoutWriter(io: std.Io) std.Io.File.Writer {
+    return std.Io.File.stdout().writer(io, &.{});
+}
 
 // ============================================================================
 // Error Types
@@ -73,7 +98,6 @@ var jail_state = struct {
     jail_id: i32 = -1,
     ephemeral_username: [64]u8 = [_]u8{0} ** 64,
     jail_root_path: [PATH_MAX]u8 = [_]u8{0} ** PATH_MAX,
-    instance_tmp_path: [PATH_MAX]u8 = [_]u8{0} ** PATH_MAX,
 
     pub fn setJailId(self: *@This(), jid: i32) void {
         self.jail_id = jid;
@@ -91,53 +115,44 @@ var jail_state = struct {
         self.jail_root_path[len] = 0;
     }
 
-    pub fn setInstanceTmpPath(self: *@This(), path: []const u8) void {
-        const len = @min(path.len, self.instance_tmp_path.len - 1);
-        @memcpy(self.instance_tmp_path[0..len], path[0..len]);
-        self.instance_tmp_path[len] = 0;
-    }
-
     pub fn getUsername(self: *const @This()) []const u8 {
-        const len = std.mem.indexOfScalar(u8, &self.ephemeral_username, 0) orelse self.ephemeral_username.len;
+        const len = std.mem.findScalar(u8, &self.ephemeral_username, 0) orelse self.ephemeral_username.len;
         return self.ephemeral_username[0..len];
     }
 
     pub fn getJailPath(self: *const @This()) []const u8 {
-        const len = std.mem.indexOfScalar(u8, &self.jail_root_path, 0) orelse self.jail_root_path.len;
+        const len = std.mem.findScalar(u8, &self.jail_root_path, 0) orelse self.jail_root_path.len;
         return self.jail_root_path[0..len];
     }
 
-    pub fn getInstanceTmpPath(self: *const @This()) []const u8 {
-        const len = std.mem.indexOfScalar(u8, &self.instance_tmp_path, 0) orelse self.instance_tmp_path.len;
-        return self.instance_tmp_path[0..len];
-    }
 }{};
 
-// Export functions for C interop (IPC between parent/child)
-pub export fn freebsd_get_jail_id() c_int {
+// Jail state accessors, used by the parent process once the child has
+// reported its state over the pipe
+pub fn freebsd_get_jail_id() c_int {
     return jail_state.jail_id;
 }
 
-pub export fn freebsd_set_jail_id(jid: c_int) void {
+pub fn freebsd_set_jail_id(jid: c_int) void {
     jail_state.setJailId(jid);
 }
 
-pub export fn freebsd_get_username() [*c]const u8 {
+pub fn freebsd_get_username() [*c]const u8 {
     return &jail_state.ephemeral_username;
 }
 
-pub export fn freebsd_set_username(name: [*c]const u8) void {
+pub fn freebsd_set_username(name: [*c]const u8) void {
     if (name != null) {
         const slice = std.mem.span(name);
         jail_state.setUsername(slice);
     }
 }
 
-pub export fn freebsd_get_jail_path() [*c]const u8 {
+pub fn freebsd_get_jail_path() [*c]const u8 {
     return &jail_state.jail_root_path;
 }
 
-pub export fn freebsd_set_jail_path(path: [*c]const u8) void {
+pub fn freebsd_set_jail_path(path: [*c]const u8) void {
     if (path != null) {
         const slice = std.mem.span(path);
         jail_state.setJailPath(slice);
@@ -162,7 +177,7 @@ pub fn mkdirp(path: []const u8) !void {
     while (i < path.len) : (i += 1) {
         if (path_buf[i] == '/') {
             path_buf[i] = 0;
-            const result = c.mkdir(&path_buf, 0o755);
+            const result = std.c.mkdir(@ptrCast(&path_buf), 0o755);
             if (result != 0 and std.c._errno().* != c.EEXIST) {
                 return error.FilesystemSetupFailed;
             }
@@ -171,7 +186,7 @@ pub fn mkdirp(path: []const u8) !void {
     }
 
     // Create final directory
-    const result = c.mkdir(&path_buf, 0o755);
+    const result = std.c.mkdir(@ptrCast(&path_buf), 0o755);
     if (result != 0 and std.c._errno().* != c.EEXIST) {
         return error.FilesystemSetupFailed;
     }
@@ -193,10 +208,10 @@ pub fn copyFile(src: []const u8, dst: []const u8) !void {
     if (src_fd < 0) return error.FilesystemSetupFailed;
     defer _ = c.close(src_fd);
 
-    var st: c.struct_stat = undefined;
-    if (c.fstat(src_fd, &st) < 0) return error.FilesystemSetupFailed;
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(src_fd, &st) < 0) return error.FilesystemSetupFailed;
 
-    const dst_fd = c.open(&dst_buf, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, st.st_mode);
+    const dst_fd = c.open(&dst_buf, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, st.mode));
     if (dst_fd < 0) return error.FilesystemSetupFailed;
     defer _ = c.close(dst_fd);
 
@@ -215,7 +230,11 @@ pub fn copyFile(src: []const u8, dst: []const u8) !void {
     }
 }
 
-/// Recursively remove a directory tree
+/// Recursively remove a directory tree. Never descends into another
+/// filesystem (FTS_XDEV): a mount that is still in place under `path` - a
+/// nullfs mount of a host directory, the workspace, devfs - keeps its
+/// contents; only the mount point directory itself is attempted (and fails
+/// with EBUSY). Returns an error if anything could not be removed.
 pub fn rmrf(path: []const u8) !void {
     var path_buf: [PATH_MAX]u8 = undefined;
     if (path.len >= PATH_MAX) return error.InvalidPath;
@@ -225,10 +244,13 @@ pub fn rmrf(path: []const u8) !void {
 
     var paths: [2][*c]u8 = .{ &path_buf, null };
 
-    const fts = c.fts_open(@ptrCast(&paths), c.FTS_PHYSICAL | c.FTS_NOCHDIR | c.FTS_NOSTAT, null);
+    // No FTS_NOSTAT: with it, fts reports regular files as FTS_NSOK and
+    // needs stat data it does not have for FTS_XDEV
+    const fts = c.fts_open(@ptrCast(&paths), c.FTS_PHYSICAL | c.FTS_NOCHDIR | c.FTS_XDEV, null);
     if (fts == null) return error.FilesystemSetupFailed;
     defer _ = c.fts_close(fts);
 
+    var failed = false;
     while (c.fts_read(fts)) |ent| {
         switch (ent.*.fts_info) {
             c.FTS_D => {
@@ -236,15 +258,17 @@ pub fn rmrf(path: []const u8) !void {
             },
             c.FTS_DP => {
                 // Directory after children processed - remove it
-                _ = c.rmdir(ent.*.fts_accpath);
+                if (c.rmdir(ent.*.fts_accpath) != 0) failed = true;
             },
-            c.FTS_F, c.FTS_SL, c.FTS_SLNONE, c.FTS_DEFAULT => {
+            c.FTS_F, c.FTS_SL, c.FTS_SLNONE, c.FTS_DEFAULT, c.FTS_NSOK => {
                 // File or symlink - remove it
-                _ = c.unlink(ent.*.fts_accpath);
+                if (c.unlink(ent.*.fts_accpath) != 0) failed = true;
             },
             else => {},
         }
     }
+
+    if (failed) return error.FilesystemSetupFailed;
 }
 
 // ============================================================================
@@ -334,6 +358,54 @@ pub fn unmount(path: []const u8) void {
         // Try force unmount
         _ = c.unmount(&path_buf, c.MNT_FORCE);
     }
+}
+
+/// Whether `path` is `root` itself or somewhere below it
+fn isPathUnder(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len == root.len or path[root.len] == '/';
+}
+
+/// Unmount every filesystem mounted at or below `root`, deepest first, so
+/// that nested mounts come off before the mounts they sit on. Uses the
+/// kernel's mount table rather than a fixed list of expected mount points:
+/// every `filesystem:` rule in the capability file adds a mount, and a
+/// mount that was missed here would otherwise have its host contents
+/// deleted by the following rmrf. Stops when nothing under `root` is
+/// mounted or when a mount cannot be removed even with MNT_FORCE.
+fn unmountAllUnder(root: []const u8) void {
+    var last_buf: [PATH_MAX]u8 = undefined;
+    var last: []const u8 = "";
+
+    while (true) {
+        var mounts: [*c]c.struct_statfs = null;
+        const count = c.getmntinfo(&mounts, c.MNT_NOWAIT);
+        if (count <= 0) return;
+
+        // Pick the deepest mount point under root
+        var deepest: ?[]const u8 = null;
+        for (mounts[0..@intCast(count)]) |*m| {
+            const mnt = std.mem.sliceTo(&m.f_mntonname, 0);
+            if (!isPathUnder(mnt, root)) continue;
+            if (deepest == null or mnt.len > deepest.?.len) deepest = mnt;
+        }
+        const target = deepest orelse return;
+
+        // No progress since the last attempt: give up rather than spin
+        if (std.mem.eql(u8, target, last)) return;
+        if (target.len >= last_buf.len) return;
+        @memcpy(last_buf[0..target.len], target);
+        last = last_buf[0..target.len];
+
+        unmount(target);
+    }
+}
+
+/// Tear down a per-instance directory: unmount everything mounted below
+/// it, then remove the tree (without crossing into anything still mounted).
+pub fn cleanupInstanceDir(inst_dir: []const u8) !void {
+    unmountAllUnder(inst_dir);
+    try rmrf(inst_dir);
 }
 
 // ============================================================================
@@ -472,8 +544,9 @@ fn getSystemCapabilities() syscheck.SystemCapabilities {
     return cached_sys_caps.?;
 }
 
-pub fn setResourceLimits(jail_name: []const u8, limits: caps.ResourceLimits) void {
-    const stdout = std.io.getStdOut().writer();
+pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.ResourceLimits) void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
     var rule_buf: [256]u8 = undefined;
     var out_buf: [256]u8 = undefined;
 
@@ -529,8 +602,9 @@ pub fn setResourceLimits(jail_name: []const u8, limits: caps.ResourceLimits) voi
 // ============================================================================
 
 /// Create a FreeBSD jail
-pub fn createJail(jail_name: []const u8, jail_path: []const u8, network_config: caps.NetworkConfig) !i32 {
-    const stdout = std.io.getStdOut().writer();
+pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, network_config: caps.NetworkConfig) !i32 {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
 
     var name_buf: [64]u8 = undefined;
     var path_buf: [PATH_MAX]u8 = undefined;
@@ -706,8 +780,9 @@ fn configureJailInterface(jid: i32, ifname: []const u8, ip: []const u8) !void {
 }
 
 /// Attach to a jail
-pub fn attachToJail(jid: i32) !void {
-    const stdout = std.io.getStdOut().writer();
+pub fn attachToJail(io: std.Io, jid: i32) !void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
     stdout.print("Attaching to jail JID {d}\n", .{jid}) catch {};
 
     if (c.jail_attach(jid) != 0) {
@@ -722,10 +797,56 @@ pub fn removeJail(jid: i32) void {
     }
 }
 
+/// Whether a jail with this id exists (a read-only jail_get(2) lookup)
+pub fn jailExists(jid: i32) bool {
+    var jid_val: c_int = jid;
+    var iov = [_]c.struct_iovec{
+        .{ .iov_base = @ptrCast(@constCast("jid")), .iov_len = 4 },
+        .{ .iov_base = @ptrCast(&jid_val), .iov_len = @sizeOf(c_int) },
+    };
+    return c.jail_get(&iov, iov.len, 0) >= 0;
+}
+
+/// Tear down what an instance left behind when the isolate process that
+/// managed it is gone: the jail (which kills anything still running in
+/// it), the instance directory, and the ephemeral user.
+pub fn teardownInstance(io: std.Io, jail_id: i32, jail_path: []const u8, username: []const u8) void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+
+    if (jail_id >= 0 and jailExists(jail_id)) {
+        stdout.print("Removing jail JID {d}\n", .{jail_id}) catch {};
+        removeJail(jail_id);
+    }
+
+    if (jail_path.len > 0) {
+        const inst_dir = instanceDir(jail_path);
+        stdout.print("Removing instance directory {s}\n", .{inst_dir}) catch {};
+        cleanupInstanceDir(inst_dir) catch {
+            stdout.print("Warning: Could not fully remove {s}\n", .{inst_dir}) catch {};
+        };
+    }
+
+    // Only users isolate created itself (app-<pid>) are deleted
+    if (std.mem.startsWith(u8, username, "app-")) {
+        stdout.print("Removing ephemeral user {s}\n", .{username}) catch {};
+        deleteUser(username);
+    }
+}
+
 /// Switch to a specific user (drop privileges)
-pub fn switchToUser(uid: u32, gid: u32, username: []const u8) !void {
-    const stdout = std.io.getStdOut().writer();
+pub fn switchToUser(io: std.Io, uid: u32, gid: u32, username: []const u8) !void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
     stdout.print("Switching to user {s} (UID {d}, GID {d})\n", .{ username, uid, gid }) catch {};
+
+    // Drop root's supplementary groups (wheel, operator, ...) first:
+    // setgid/setuid alone leave them in place, and they would carry into
+    // the jailed process
+    const groups = [_]c.gid_t{gid};
+    if (c.setgroups(1, &groups) != 0) {
+        return error.PermissionDenied;
+    }
 
     // Set GID first (must be done before dropping privileges)
     if (c.setgid(gid) != 0) {
@@ -742,13 +863,15 @@ pub fn switchToUser(uid: u32, gid: u32, username: []const u8) !void {
 // Environment Setup
 // ============================================================================
 
-pub fn setupEnvironment(capability: *const caps.Capabilities, username: []const u8) void {
-    const stdout = std.io.getStdOut().writer();
+pub fn setupEnvironment(io: std.Io, capability: *const caps.Capabilities, username: []const u8) void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
 
-    // Clear environment if requested
+    // Start from an empty environment if requested, so that nothing from
+    // the invoking root shell (doas/sudo) reaches the application
     if (capability.env_clear) {
         stdout.print("Clearing environment variables\n", .{}) catch {};
-        // In Zig we can't easily clear environ, so we'll set essential vars
+        environ = @ptrCast(&empty_environ);
     }
 
     // Set essential variables
@@ -786,6 +909,7 @@ pub fn setupEnvironment(capability: *const caps.Capabilities, username: []const 
 // ============================================================================
 
 pub fn setupFilesystemIsolation(
+    io: std.Io,
     capability: *const caps.Capabilities,
     jail_path: []const u8,
     target_binary: []const u8,
@@ -793,7 +917,8 @@ pub fn setupFilesystemIsolation(
     target_gid: u32,
     username: []const u8,
 ) !void {
-    const stdout = std.io.getStdOut().writer();
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
     var path_buf: [PATH_MAX]u8 = undefined;
 
     stdout.print("Setting up filesystem isolation in {s}\n", .{jail_path}) catch {};
@@ -817,7 +942,7 @@ pub fn setupFilesystemIsolation(
         var buf: [PATH_MAX]u8 = undefined;
         @memcpy(buf[0..formatted.len], formatted);
         buf[formatted.len] = 0;
-        _ = c.chmod(&buf, 0o1777);
+        _ = std.c.chmod(@ptrCast(&buf), 0o1777);
     }
 
     // Mount workspace if specified
@@ -846,7 +971,7 @@ pub fn setupFilesystemIsolation(
         var buf: [PATH_MAX]u8 = undefined;
         @memcpy(buf[0..dst_path.len], dst_path);
         buf[dst_path.len] = 0;
-        _ = c.chmod(&buf, 0o755);
+        _ = std.c.chmod(@ptrCast(&buf), 0o755);
     }
 
     // Create minimal passwd file
@@ -905,9 +1030,10 @@ pub fn setupFilesystemIsolation(
             // Security: Intercept /tmp mounts to use instance-specific directory
             // This prevents cross-instance information leakage
             if (std.mem.eql(u8, rule.path, "/tmp")) {
-                // Create instance-specific tmp directory on host
+                // Create the instance-specific tmp directory inside the
+                // per-instance directory, next to the jail root
                 var instance_tmp_buf: [PATH_MAX]u8 = undefined;
-                const instance_tmp = std.fmt.bufPrint(&instance_tmp_buf, "/tmp{s}", .{jail_path}) catch continue;
+                const instance_tmp = std.fmt.bufPrint(&instance_tmp_buf, "{s}/tmp", .{instanceDir(jail_path)}) catch continue;
 
                 stdout.print("Creating isolated tmp: {s}\n", .{instance_tmp}) catch {};
                 mkdirp(instance_tmp) catch {
@@ -920,11 +1046,8 @@ pub fn setupFilesystemIsolation(
                     var tmp_buf: [PATH_MAX]u8 = undefined;
                     @memcpy(tmp_buf[0..instance_tmp.len], instance_tmp);
                     tmp_buf[instance_tmp.len] = 0;
-                    _ = c.chmod(&tmp_buf, 0o1777);
+                    _ = std.c.chmod(@ptrCast(&tmp_buf), 0o1777);
                 }
-
-                // Store path for cleanup
-                jail_state.setInstanceTmpPath(instance_tmp);
 
                 // Mount instance-specific tmp as /tmp in jail
                 const mount_path = std.fmt.bufPrint(&path_buf, "{s}/tmp", .{jail_path}) catch continue;
@@ -942,8 +1065,8 @@ pub fn setupFilesystemIsolation(
             @memcpy(src_buf[0..rule.path.len], rule.path);
             src_buf[rule.path.len] = 0;
 
-            var st: c.struct_stat = undefined;
-            if (c.stat(&src_buf, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR) {
+            var st: std.c.Stat = undefined;
+            if (stat(@ptrCast(&src_buf), &st) == 0 and std.c.S.ISDIR(st.mode)) {
                 const mount_path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ jail_path, rule.path }) catch continue;
 
                 mkdirp(mount_path) catch continue;
@@ -968,7 +1091,7 @@ pub fn setupFilesystemIsolation(
         var buf: [PATH_MAX]u8 = undefined;
         @memcpy(buf[0..tmp_path.len], tmp_path);
         buf[tmp_path.len] = 0;
-        _ = c.chmod(&buf, 0o1777);
+        _ = std.c.chmod(@ptrCast(&buf), 0o1777);
     }
 
     stdout.print("Jail filesystem setup complete\n", .{}) catch {};
@@ -978,9 +1101,9 @@ pub fn setupFilesystemIsolation(
 // Cleanup
 // ============================================================================
 
-pub fn cleanupIsolation() void {
-    const stdout = std.io.getStdOut().writer();
-    var path_buf: [PATH_MAX]u8 = undefined;
+pub fn cleanupIsolation(io: std.Io) void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
 
     const jid = jail_state.jail_id;
     if (jid >= 0) {
@@ -989,35 +1112,16 @@ pub fn cleanupIsolation() void {
         jail_state.jail_id = -1;
     }
 
-    // Cleanup jail filesystem
+    // Cleanup jail filesystem: the whole per-instance directory (jail
+    // root, isolated tmp), after unmounting everything below it
     const jail_path = jail_state.getJailPath();
     if (jail_path.len > 0) {
-        stdout.print("Cleaning up jail filesystem: {s}\n", .{jail_path}) catch {};
-
-        // Unmount filesystems (best effort)
-        const mount_points = [_][]const u8{
-            "/tmp", "/workspace", "/dev", "/bin", "/lib",
-            "/libexec", "/usr/lib", "/usr/local/lib",
+        const inst_dir = instanceDir(jail_path);
+        stdout.print("Cleaning up instance directory: {s}\n", .{inst_dir}) catch {};
+        cleanupInstanceDir(inst_dir) catch {
+            stdout.print("Warning: Could not fully remove {s} ('isolate clean' will retry)\n", .{inst_dir}) catch {};
         };
-
-        for (mount_points) |mp| {
-            if (std.fmt.bufPrint(&path_buf, "{s}{s}", .{ jail_path, mp })) |formatted| {
-                unmount(formatted);
-            } else |_| {}
-        }
-
-        // Remove jail directory tree
-        rmrf(jail_path) catch {};
-
         jail_state.jail_root_path[0] = 0;
-    }
-
-    // Cleanup instance-specific tmp directory
-    const instance_tmp = jail_state.getInstanceTmpPath();
-    if (instance_tmp.len > 0) {
-        stdout.print("Cleaning up instance tmp: {s}\n", .{instance_tmp}) catch {};
-        rmrf(instance_tmp) catch {};
-        jail_state.instance_tmp_path[0] = 0;
     }
 
     // Cleanup ephemeral user
@@ -1029,17 +1133,13 @@ pub fn cleanupIsolation() void {
     }
 }
 
-// Export for C code
-pub export fn freebsd_cleanup_isolation() void {
-    cleanupIsolation();
-}
-
 // ============================================================================
 // Main Isolation Entry Point
 // ============================================================================
 
-pub fn createIsolation(capability: *const caps.Capabilities, target_binary: []const u8) !void {
-    const stdout = std.io.getStdOut().writer();
+pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_binary: []const u8) !void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
     var jail_name_buf: [64]u8 = undefined;
     var username_buf: [64]u8 = undefined;
 
@@ -1070,44 +1170,61 @@ pub fn createIsolation(capability: *const caps.Capabilities, target_binary: []co
         stdout.print("Using existing user {s} (UID {d}, GID {d})\n", .{ username, target_uid, target_gid }) catch {};
     }
 
+    // Create the per-instance directory under the root-owned runtime
+    // directory with an unpredictable name. It must never live under /tmp:
+    // any local user can pre-create /tmp paths and plant symlinks there for
+    // the chmod/mount/copy below to follow as root.
+    mkdirp(runtime_dir) catch return error.FilesystemSetupFailed;
+
+    var inst_buf: [PATH_MAX]u8 = undefined;
+    const inst_template = std.fmt.bufPrintZ(&inst_buf, "{s}/inst-XXXXXX", .{runtime_dir}) catch return error.InvalidPath;
+    if (c.mkdtemp(inst_template.ptr) == null) return error.FilesystemSetupFailed;
+    // mkdtemp creates the directory 0700; the jail root must be traversable
+    // by the application user
+    _ = std.c.chmod(inst_template.ptr, 0o755);
+
     // Create jail filesystem
-    const jail_path = std.fmt.bufPrint(&jail_state.jail_root_path, "/tmp/isolate-{s}", .{jail_name}) catch return error.InvalidPath;
+    var jail_path_buf: [PATH_MAX]u8 = undefined;
+    const jail_path_tmp = std.fmt.bufPrint(&jail_path_buf, "{s}/root", .{inst_template}) catch return error.InvalidPath;
+    jail_state.setJailPath(jail_path_tmp);
+    const jail_path = jail_state.getJailPath();
 
     stdout.print("Creating jail filesystem: {s}\n", .{jail_path}) catch {};
 
-    // Clean up any previous jail
-    rmrf(jail_path) catch {};
-    mkdirp(jail_path) catch return error.FilesystemSetupFailed;
+    mkdirp(jail_path) catch {
+        cleanupIsolation(io);
+        return error.FilesystemSetupFailed;
+    };
 
     // Set up filesystem isolation
-    setupFilesystemIsolation(capability, jail_path, target_binary, target_uid, target_gid, username) catch {
-        cleanupIsolation();
+    setupFilesystemIsolation(io, capability, jail_path, target_binary, target_uid, target_gid, username) catch {
+        cleanupIsolation(io);
         return error.FilesystemSetupFailed;
     };
 
     // Create jail
-    const jid = createJail(jail_name, jail_path, capability.network_config) catch {
-        cleanupIsolation();
+    const jid = createJail(io, jail_name, jail_path, capability.network_config) catch {
+        cleanupIsolation(io);
         return error.JailCreateFailed;
     };
 
     // Set resource limits
-    setResourceLimits(jail_name, capability.limits);
+    setResourceLimits(io, jail_name, capability.limits);
 
     // Attach to jail
-    attachToJail(jid) catch {
-        cleanupIsolation();
+    attachToJail(io, jid) catch {
+        cleanupIsolation(io);
         return error.JailAttachFailed;
     };
 
     // Switch to target user
-    switchToUser(target_uid, target_gid, username) catch {
-        cleanupIsolation();
+    switchToUser(io, target_uid, target_gid, username) catch {
+        cleanupIsolation(io);
         return error.PermissionDenied;
     };
 
     // Set up environment
-    setupEnvironment(capability, username);
+    setupEnvironment(io, capability, username);
 
     stdout.print("FreeBSD isolation context created successfully\n", .{}) catch {};
     stdout.print("Running in jail {s} as user {s}\n", .{ jail_name, username }) catch {};
@@ -1130,8 +1247,8 @@ test "mkdirp creates nested directories" {
     @memcpy(path_buf[0..test_path.len], test_path);
     path_buf[test_path.len] = 0;
 
-    var st: c.struct_stat = undefined;
-    try std.testing.expect(c.stat(&path_buf, &st) == 0);
+    var st: std.c.Stat = undefined;
+    try std.testing.expect(stat(@ptrCast(&path_buf), &st) == 0);
 
     // Cleanup
     rmrf("/tmp/isolate-test-zig") catch {};
@@ -1165,12 +1282,19 @@ test "copyFile copies file correctly" {
     @memcpy(dst_buf[0..dst.len], dst);
     dst_buf[dst.len] = 0;
 
-    var st: c.struct_stat = undefined;
-    try std.testing.expect(c.stat(&dst_buf, &st) == 0);
+    var st: std.c.Stat = undefined;
+    try std.testing.expect(stat(@ptrCast(&dst_buf), &st) == 0);
 
     // Cleanup
     _ = c.unlink(&src_buf);
     _ = c.unlink(&dst_buf);
+}
+
+test "isPathUnder" {
+    try std.testing.expect(isPathUnder("/var/run/isolate/inst-abc", "/var/run/isolate/inst-abc"));
+    try std.testing.expect(isPathUnder("/var/run/isolate/inst-abc/root/lib", "/var/run/isolate/inst-abc"));
+    try std.testing.expect(!isPathUnder("/var/run/isolate/inst-abcdef", "/var/run/isolate/inst-abc"));
+    try std.testing.expect(!isPathUnder("/var/run", "/var/run/isolate/inst-abc"));
 }
 
 test "jail_state management" {
@@ -1183,12 +1307,8 @@ test "jail_state management" {
     jail_state.setJailPath("/tmp/test-jail");
     try std.testing.expectEqualStrings("/tmp/test-jail", jail_state.getJailPath());
 
-    jail_state.setInstanceTmpPath("/tmp/isolate-test-tmp");
-    try std.testing.expectEqualStrings("/tmp/isolate-test-tmp", jail_state.getInstanceTmpPath());
-
     // Reset
     jail_state.jail_id = -1;
     jail_state.ephemeral_username = [_]u8{0} ** 64;
     jail_state.jail_root_path = [_]u8{0} ** PATH_MAX;
-    jail_state.instance_tmp_path = [_]u8{0} ** PATH_MAX;
 }

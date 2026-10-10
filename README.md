@@ -51,7 +51,7 @@ doas ./zig-out/bin/isolate clean
 
 ### Requirements
 
-- Zig 0.13.0 or later
+- Zig 0.16.0 (pinned in `build.zig.zon`)
 - FreeBSD 13.0 or later (for jail support)
 - Root privileges for isolation (detection works without root)
 
@@ -113,7 +113,7 @@ isolate run -n ./myapp
 Options:
 - `-c, --caps <file>`: Capability file (default: `<binary>.caps`)
 - `-w, --workspace <dir>`: Workspace directory mounted as `/workspace`
-- `-N, --name <name>`: Instance name (default: auto-generated)
+- `-N, --name <name>`: Instance name (default: auto-generated); letters, digits, `.`, `_`, `-`, at most 64 characters
 - `--vnet <interface>`: Use VNET isolation with specified interface
 - `-v, --verbose`: Verbose output
 - `-n, --dry-run`: Show configuration without executing
@@ -155,16 +155,16 @@ Stop a running instance.
 # Graceful stop (SIGTERM)
 doas isolate stop myapp-abc123
 
-# Force stop (SIGKILL if needed)
+# Force: if the process ignores SIGTERM, remove the jail (kills everything in it)
 doas isolate stop -f myapp-abc123
 ```
 
 Options:
-- `-f, --force`: Send SIGKILL if SIGTERM doesn't work
+- `-f, --force`: If the process ignores SIGTERM, remove the jail (which kills everything inside it) and clean up
 
 #### `isolate clean`
 
-Clean up orphaned instances and jail directories.
+Clean up after instances whose `isolate run` process has died: remove their jails (and anything still running in them), instance directories and ephemeral users, and drop stale registry entries.
 
 ```sh
 doas isolate clean
@@ -212,7 +212,8 @@ filesystem: /usr/lib:r        # Read-only access to /usr/lib
 filesystem: /tmp:rw           # Read-write access to /tmp
 filesystem: /data:rw          # Application data directory
 
-# Network access rules (firewall-style, separate from isolation mode)
+# Network access rules - parsed and listed, but NOT enforced (there is no
+# firewall integration yet). Use network_mode to control network access.
 network: tcp:8080:inbound     # Listen on TCP port 8080
 network: tcp:443:outbound     # Connect to TCP port 443
 network: udp:53:outbound      # DNS queries
@@ -313,9 +314,6 @@ cc -o server server.c
 # Detect capabilities (will find network usage)
 ../zig-out/bin/isolate detect ./server
 
-# Edit server.caps to allow inbound connections
-echo "network: tcp:8080:inbound" >> ./server.caps
-
 # Run isolated server
 doas ../zig-out/bin/isolate run -v ./server
 
@@ -343,7 +341,7 @@ doas isolate stop app-tenant-b
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design documentation.
 
 ### Module Overview
 
@@ -355,7 +353,6 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 | `freebsd.zig` | FreeBSD jail implementation |
 | `syscheck.zig` | System capability detection (racct, VNET) |
 | `registry.zig` | Instance tracking and persistence |
-| `platform.zig` | Platform abstraction layer |
 | `c_api.zig` | C library bindings |
 
 ## Testing

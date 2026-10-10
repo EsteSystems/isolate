@@ -22,7 +22,7 @@ pub const CapabilityHint = struct {
     capability: []const u8,
     confidence: u8, // 0-100
 
-    pub fn format(self: CapabilityHint, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: CapabilityHint, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("[{d}%] {s}", .{ self.confidence, self.description });
     }
 };
@@ -37,14 +37,14 @@ pub const DetectionResult = struct {
 
     pub fn init(allocator: Allocator, binary_path: []const u8) Self {
         // Extract basename
-        const basename = if (std.mem.lastIndexOfScalar(u8, binary_path, '/')) |idx|
+        const basename = if (std.mem.findScalarLast(u8, binary_path, '/')) |idx|
             binary_path[idx + 1 ..]
         else
             binary_path;
 
         return .{
             .allocator = allocator,
-            .hints = std.ArrayList(CapabilityHint).init(allocator),
+            .hints = .empty,
             .binary_name = basename,
         };
     }
@@ -54,13 +54,13 @@ pub const DetectionResult = struct {
             self.allocator.free(hint.description);
             self.allocator.free(hint.capability);
         }
-        self.hints.deinit();
+        self.hints.deinit(self.allocator);
     }
 
     pub fn addHint(self: *Self, description: []const u8, capability: []const u8, confidence: u8) !void {
         if (self.hints.items.len >= MAX_CAPABILITY_HINTS) return;
 
-        try self.hints.append(.{
+        try self.hints.append(self.allocator, .{
             .description = try self.allocator.dupe(u8, description),
             .capability = try self.allocator.dupe(u8, capability),
             .confidence = confidence,
@@ -138,27 +138,28 @@ pub const DetectError = error{
 
 /// ELF analyzer for native binary analysis
 pub const ElfAnalyzer = struct {
+    io: std.Io,
     allocator: Allocator,
-    file: std.fs.File,
+    file: std.Io.File,
     header: elf.Elf64_Ehdr,
     section_headers: []elf.Elf64_Shdr,
     shstrtab: []const u8,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, path: []const u8) DetectError!Self {
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    pub fn init(io: std.Io, allocator: Allocator, path: []const u8) DetectError!Self {
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => DetectError.FileNotFound,
                 error.AccessDenied => DetectError.AccessDenied,
                 else => DetectError.IoError,
             };
         };
-        errdefer file.close();
+        errdefer file.close(io);
 
         // Read ELF header
         var header: elf.Elf64_Ehdr = undefined;
-        const bytes_read = file.read(std.mem.asBytes(&header)) catch {
+        const bytes_read = file.readPositionalAll(io, std.mem.asBytes(&header), 0) catch {
             return DetectError.IoError;
         };
 
@@ -178,9 +179,8 @@ pub const ElfAnalyzer = struct {
         };
         errdefer allocator.free(section_headers);
 
-        file.seekTo(header.e_shoff) catch return DetectError.IoError;
         const sh_bytes = std.mem.sliceAsBytes(section_headers);
-        const sh_read = file.read(sh_bytes) catch return DetectError.IoError;
+        const sh_read = file.readPositionalAll(io, sh_bytes, header.e_shoff) catch return DetectError.IoError;
         if (sh_read < sh_size) {
             return DetectError.InvalidElf;
         }
@@ -195,13 +195,13 @@ pub const ElfAnalyzer = struct {
         };
         errdefer allocator.free(shstrtab);
 
-        file.seekTo(shstrtab_hdr.sh_offset) catch return DetectError.IoError;
-        const strtab_read = file.read(shstrtab) catch return DetectError.IoError;
+        const strtab_read = file.readPositionalAll(io, shstrtab, shstrtab_hdr.sh_offset) catch return DetectError.IoError;
         if (strtab_read < shstrtab_hdr.sh_size) {
             return DetectError.InvalidElf;
         }
 
         return Self{
+            .io = io,
             .allocator = allocator,
             .file = file,
             .header = header,
@@ -213,7 +213,7 @@ pub const ElfAnalyzer = struct {
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.shstrtab);
         self.allocator.free(self.section_headers);
-        self.file.close();
+        self.file.close(self.io);
     }
 
     /// Find a section by name
@@ -240,19 +240,17 @@ pub const ElfAnalyzer = struct {
         const dynstr = try self.allocator.alloc(u8, dynstr_shdr.sh_size);
         defer self.allocator.free(dynstr);
 
-        self.file.seekTo(dynstr_shdr.sh_offset) catch return;
-        _ = self.file.read(dynstr) catch return;
+        _ = self.file.readPositionalAll(self.io, dynstr, dynstr_shdr.sh_offset) catch return;
 
         // Read .dynamic entries
         const entry_size = @sizeOf(elf.Elf64_Dyn);
         const num_entries = dynamic_shdr.sh_size / entry_size;
 
-        self.file.seekTo(dynamic_shdr.sh_offset) catch return;
-
         var i: usize = 0;
         while (i < num_entries) : (i += 1) {
             var dyn: elf.Elf64_Dyn = undefined;
-            const bytes = self.file.read(std.mem.asBytes(&dyn)) catch break;
+            const offset = dynamic_shdr.sh_offset + i * entry_size;
+            const bytes = self.file.readPositionalAll(self.io, std.mem.asBytes(&dyn), offset) catch break;
             if (bytes < entry_size) break;
 
             if (dyn.d_tag == elf.DT_NEEDED) {
@@ -260,7 +258,7 @@ pub const ElfAnalyzer = struct {
                 if (name_offset < dynstr.len) {
                     const lib_name = std.mem.sliceTo(dynstr[name_offset..], 0);
                     if (lib_name.len > 0) {
-                        try result.append(try self.allocator.dupe(u8, lib_name));
+                        try result.append(self.allocator, try self.allocator.dupe(u8, lib_name));
                     }
                 }
             } else if (dyn.d_tag == elf.DT_NULL) {
@@ -281,25 +279,23 @@ pub const ElfAnalyzer = struct {
         const dynstr = try self.allocator.alloc(u8, dynstr_shdr.sh_size);
         defer self.allocator.free(dynstr);
 
-        self.file.seekTo(dynstr_shdr.sh_offset) catch return;
-        _ = self.file.read(dynstr) catch return;
+        _ = self.file.readPositionalAll(self.io, dynstr, dynstr_shdr.sh_offset) catch return;
 
         // Read symbols
         const sym_size = @sizeOf(elf.Elf64_Sym);
         const num_syms = dynsym_shdr.sh_size / sym_size;
 
-        self.file.seekTo(dynsym_shdr.sh_offset) catch return;
-
         var i: usize = 0;
         while (i < num_syms) : (i += 1) {
             var sym: elf.Elf64_Sym = undefined;
-            const bytes = self.file.read(std.mem.asBytes(&sym)) catch break;
+            const offset = dynsym_shdr.sh_offset + i * sym_size;
+            const bytes = self.file.readPositionalAll(self.io, std.mem.asBytes(&sym), offset) catch break;
             if (bytes < sym_size) break;
 
             if (sym.st_name > 0 and sym.st_name < dynstr.len) {
                 const sym_name = std.mem.sliceTo(dynstr[sym.st_name..], 0);
                 if (sym_name.len > 0) {
-                    try result.append(try self.allocator.dupe(u8, sym_name));
+                    try result.append(self.allocator, try self.allocator.dupe(u8, sym_name));
                 }
             }
         }
@@ -317,8 +313,7 @@ pub const ElfAnalyzer = struct {
             const data = try self.allocator.alloc(u8, shdr.sh_size);
             defer self.allocator.free(data);
 
-            self.file.seekTo(shdr.sh_offset) catch continue;
-            const bytes_read = self.file.read(data) catch continue;
+            const bytes_read = self.file.readPositionalAll(self.io, data, shdr.sh_offset) catch continue;
             if (bytes_read < shdr.sh_size) continue;
 
             // Find printable strings
@@ -333,7 +328,7 @@ pub const ElfAnalyzer = struct {
                         if (str.len >= min_length) {
                             // Filter for interesting strings (paths, URLs, etc.)
                             if (isInterestingString(str)) {
-                                try result.append(try self.allocator.dupe(u8, str));
+                                try result.append(self.allocator, try self.allocator.dupe(u8, str));
                             }
                         }
                     }
@@ -367,17 +362,17 @@ pub const ElfAnalyzer = struct {
 
 /// Analyze library dependencies
 pub fn analyzeDependencies(allocator: Allocator, analyzer: *ElfAnalyzer, result: *DetectionResult) !void {
-    var libraries = std.ArrayList([]const u8).init(allocator);
+    var libraries: std.ArrayList([]const u8) = .empty;
     defer {
         for (libraries.items) |lib| allocator.free(lib);
-        libraries.deinit();
+        libraries.deinit(allocator);
     }
 
     try analyzer.getNeededLibraries(&libraries);
 
     for (libraries.items) |lib| {
         for (library_patterns) |pattern| {
-            if (std.mem.indexOf(u8, lib, pattern.pattern) != null) {
+            if (std.mem.find(u8, lib, pattern.pattern) != null) {
                 if (pattern.capability.len > 0) {
                     try result.addHint(pattern.description, pattern.capability, pattern.confidence);
                 }
@@ -389,10 +384,10 @@ pub fn analyzeDependencies(allocator: Allocator, analyzer: *ElfAnalyzer, result:
 
 /// Analyze dynamic symbols for system calls
 pub fn analyzeSymbols(allocator: Allocator, analyzer: *ElfAnalyzer, result: *DetectionResult) !void {
-    var symbols = std.ArrayList([]const u8).init(allocator);
+    var symbols: std.ArrayList([]const u8) = .empty;
     defer {
         for (symbols.items) |sym| allocator.free(sym);
-        symbols.deinit();
+        symbols.deinit(allocator);
     }
 
     try analyzer.getDynamicSymbols(&symbols);
@@ -440,10 +435,10 @@ pub fn analyzeSymbols(allocator: Allocator, analyzer: *ElfAnalyzer, result: *Det
 
 /// Analyze embedded strings for paths and URLs
 pub fn analyzeStrings(allocator: Allocator, analyzer: *ElfAnalyzer, result: *DetectionResult) !void {
-    var strings = std.ArrayList([]const u8).init(allocator);
+    var strings: std.ArrayList([]const u8) = .empty;
     defer {
         for (strings.items) |s| allocator.free(s);
-        strings.deinit();
+        strings.deinit(allocator);
     }
 
     try analyzer.extractStrings(4, &strings);
@@ -477,7 +472,7 @@ pub fn analyzeStrings(allocator: Allocator, analyzer: *ElfAnalyzer, result: *Det
 /// Analyze application patterns based on binary name
 pub fn analyzePatterns(result: *DetectionResult) !void {
     for (app_patterns) |pattern| {
-        if (std.mem.indexOf(u8, result.binary_name, pattern.pattern) != null) {
+        if (std.mem.find(u8, result.binary_name, pattern.pattern) != null) {
             try result.addHint(pattern.description, pattern.capability, pattern.confidence);
             break; // Only match first pattern
         }
@@ -486,18 +481,21 @@ pub fn analyzePatterns(result: *DetectionResult) !void {
 
 /// Generate capability file from detection results
 pub fn generateCapabilityFile(
+    io: std.Io,
     allocator: Allocator,
     binary_path: []const u8,
     output_path: []const u8,
     result: *DetectionResult,
 ) !void {
-    const file = try std.fs.cwd().createFile(output_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+    defer file.close(io);
 
-    const writer = file.writer();
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(io, &write_buf);
+    const writer = &file_writer.interface;
 
     // Get current time
-    const timestamp = std.time.timestamp();
+    const timestamp = std.Io.Timestamp.now(io, .real).toSeconds();
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const day_seconds = epoch_seconds.getDaySeconds();
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
@@ -522,7 +520,7 @@ pub fn generateCapabilityFile(
     try writer.writeAll("# Default resource limits (adjust based on application needs)\n");
     try writer.writeAll("memory: 128M    # Adjust based on application requirements\n");
     try writer.writeAll("processes: 5    # Adjust if application spawns child processes\n");
-    try writer.writeAll("files: 256      # File descriptor limit\n\n");
+    try writer.writeAll("files: 512      # File descriptor limit (512 is the minimum for fork)\n\n");
 
     // Sort hints by confidence
     result.sortByConfidence();
@@ -570,20 +568,24 @@ pub fn generateCapabilityFile(
     try writer.writeAll("# filesystem: /home/user:rw    # User home directory\n");
     try writer.writeAll("# env: PATH=/usr/bin:/bin      # Custom environment\n");
     try writer.writeAll("# cpu: 50                      # CPU limit (percentage)\n");
+
+    try writer.flush();
 }
 
 /// Main detection function
 pub fn detectCapabilities(
+    io: std.Io,
     allocator: Allocator,
     binary_path: []const u8,
     output_path: ?[]const u8,
 ) DetectError!void {
-    const stdout = std.io.getStdOut().writer();
+    var stdout_file = std.Io.File.stdout().writer(io, &.{});
+    const stdout = &stdout_file.interface;
 
     stdout.print("Detecting capabilities for: {s}\n", .{binary_path}) catch {};
 
     // Check if binary exists
-    std.fs.cwd().access(binary_path, .{}) catch |err| {
+    std.Io.Dir.cwd().access(io, binary_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("Error: Binary {s} not found\n", .{binary_path});
             return DetectError.FileNotFound;
@@ -607,7 +609,7 @@ pub fn detectCapabilities(
     defer result.deinit();
 
     // Try ELF analysis
-    if (ElfAnalyzer.init(allocator, binary_path)) |elf_result| {
+    if (ElfAnalyzer.init(io, allocator, binary_path)) |elf_result| {
         var analyzer = elf_result;
         defer analyzer.deinit();
 
@@ -637,7 +639,7 @@ pub fn detectCapabilities(
     }
 
     // Generate capability file
-    generateCapabilityFile(allocator, binary_path, output, &result) catch |err| {
+    generateCapabilityFile(io, allocator, binary_path, output, &result) catch |err| {
         std.debug.print("Error generating capability file: {}\n", .{err});
         return DetectError.IoError;
     };
@@ -700,7 +702,7 @@ test "library pattern matching" {
     var matches: usize = 0;
     for (test_libs) |lib| {
         for (library_patterns) |pattern| {
-            if (std.mem.indexOf(u8, lib, pattern.pattern) != null) {
+            if (std.mem.find(u8, lib, pattern.pattern) != null) {
                 matches += 1;
                 break;
             }
@@ -722,7 +724,7 @@ test "app pattern matching" {
     for (test_names) |test_case| {
         var found = false;
         for (app_patterns) |pattern| {
-            if (std.mem.indexOf(u8, test_case.name, pattern.pattern) != null) {
+            if (std.mem.find(u8, test_case.name, pattern.pattern) != null) {
                 found = true;
                 break;
             }

@@ -66,7 +66,7 @@ pub const Permission = packed struct {
         return perm;
     }
 
-    pub fn format(self: Permission, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: Permission, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.read) try writer.writeByte('r');
         if (self.write) try writer.writeByte('w');
         if (self.execute) try writer.writeByte('x');
@@ -95,7 +95,7 @@ pub const NetworkRule = struct {
         }
     };
 
-    pub fn format(self: NetworkRule, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: NetworkRule, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("{s}", .{@tagName(self.protocol)});
         if (self.address.len > 0) {
             try writer.print(":{s}", .{self.address});
@@ -114,8 +114,8 @@ pub const FileRule = struct {
     path: []const u8,
     permissions: Permission,
 
-    pub fn format(self: FileRule, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("{s}:{}", .{ self.path, self.permissions });
+    pub fn format(self: FileRule, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("{s}:{f}", .{ self.path, self.permissions });
     }
 };
 
@@ -193,11 +193,11 @@ pub const Capabilities = struct {
             .allocator = allocator,
             .username = "auto",
             .create_user = true,
-            .network_rules = std.ArrayList(NetworkRule).init(allocator),
+            .network_rules = .empty,
             .network_default_deny = false,
-            .file_rules = std.ArrayList(FileRule).init(allocator),
+            .file_rules = .empty,
             .fs_default_deny = false,
-            .env_vars = std.ArrayList(EnvVar).init(allocator),
+            .env_vars = .empty,
             .env_clear = false,
             .limits = .{},
         };
@@ -211,18 +211,18 @@ pub const Capabilities = struct {
                 self.allocator.free(rule.address);
             }
         }
-        self.network_rules.deinit();
+        self.network_rules.deinit(self.allocator);
 
         for (self.file_rules.items) |rule| {
             self.allocator.free(rule.path);
         }
-        self.file_rules.deinit();
+        self.file_rules.deinit(self.allocator);
 
         for (self.env_vars.items) |env| {
             self.allocator.free(env.name);
             self.allocator.free(env.value);
         }
-        self.env_vars.deinit();
+        self.env_vars.deinit(self.allocator);
 
         if (self.workspace_path) |wp| {
             self.allocator.free(wp);
@@ -245,7 +245,7 @@ pub const Capabilities = struct {
     }
 
     /// Print capabilities for debugging
-    pub fn print(self: *const Self, writer: anytype) !void {
+    pub fn print(self: *const Self, writer: *std.Io.Writer) !void {
         try writer.print("Capabilities:\n", .{});
         try writer.print("  User: {s}{s}\n", .{
             self.username,
@@ -271,12 +271,12 @@ pub const Capabilities = struct {
 
         try writer.print("  Network rules: {}\n", .{self.network_rules.items.len});
         for (self.network_rules.items) |rule| {
-            try writer.print("    {}\n", .{rule});
+            try writer.print("    {f}\n", .{rule});
         }
 
         try writer.print("  File rules: {}\n", .{self.file_rules.items.len});
         for (self.file_rules.items) |rule| {
-            try writer.print("    {}\n", .{rule});
+            try writer.print("    {f}\n", .{rule});
         }
 
         if (self.env_vars.items.len > 0) {
@@ -317,7 +317,7 @@ pub const ParseResult = struct {
         for (self.warnings.items) |w| {
             self.caps.allocator.free(w.message);
         }
-        self.warnings.deinit();
+        self.warnings.deinit(self.caps.allocator);
         self.caps.deinit();
     }
 };
@@ -429,7 +429,7 @@ pub fn parseNetworkRule(allocator: Allocator, rule_str: []const u8) ParseError!N
 /// Parse a file rule string (e.g., "/tmp:rw", "/etc/resolv.conf:r")
 pub fn parseFileRule(allocator: Allocator, rule_str: []const u8) ParseError!FileRule {
     // Find the last colon that separates path from permissions
-    const last_colon = std.mem.lastIndexOfScalar(u8, rule_str, ':');
+    const last_colon = std.mem.findScalarLast(u8, rule_str, ':');
 
     var path: []const u8 = undefined;
     var permissions: Permission = Permission.read_only;
@@ -442,7 +442,7 @@ pub fn parseFileRule(allocator: Allocator, rule_str: []const u8) ParseError!File
         path = rule_str;
     }
 
-    if (path.len == 0) return ParseError.InvalidFileRule;
+    if (!isSafeMountPath(path)) return ParseError.InvalidFileRule;
 
     return .{
         .path = try allocator.dupe(u8, path),
@@ -450,9 +450,23 @@ pub fn parseFileRule(allocator: Allocator, rule_str: []const u8) ParseError!File
     };
 }
 
+/// Filesystem rules name host directories that are nullfs-mounted into the
+/// jail at the same path. Only absolute, normalized paths below the root
+/// are accepted: "/" would mount the whole host over the jail root, and
+/// "." or ".." segments make a rule mean something other than it reads.
+pub fn isSafeMountPath(path: []const u8) bool {
+    if (path.len < 2 or path[0] != '/') return false;
+    var it = std.mem.splitScalar(u8, path[1..], '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0) return false;
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    }
+    return true;
+}
+
 /// Parse an environment variable (e.g., "MY_VAR=value")
 pub fn parseEnvVar(allocator: Allocator, env_str: []const u8) ParseError!EnvVar {
-    const eq_idx = std.mem.indexOfScalar(u8, env_str, '=') orelse {
+    const eq_idx = std.mem.findScalar(u8, env_str, '=') orelse {
         return ParseError.InvalidEnvVar;
     };
 
@@ -468,37 +482,39 @@ pub fn parseEnvVar(allocator: Allocator, env_str: []const u8) ParseError!EnvVar 
 }
 
 /// Load and parse a capability file
-pub fn load(allocator: Allocator, filename: []const u8) ParseError!ParseResult {
-    const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
+pub fn load(io: std.Io, allocator: Allocator, filename: []const u8) ParseError!ParseResult {
+    const file = std.Io.Dir.cwd().openFile(io, filename, .{}) catch |err| {
         return switch (err) {
             error.FileNotFound => ParseError.FileNotFound,
             error.AccessDenied => ParseError.PermissionDenied,
             else => ParseError.IoError,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    return loadFromReader(allocator, file.reader());
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    return loadFromReader(allocator, &file_reader.interface);
 }
 
 /// Load capabilities from any reader (useful for testing)
-pub fn loadFromReader(allocator: Allocator, reader: anytype) ParseError!ParseResult {
+pub fn loadFromReader(allocator: Allocator, reader: *std.Io.Reader) ParseError!ParseResult {
     var caps = Capabilities.init(allocator);
     errdefer caps.deinit();
 
-    var warnings = std.ArrayList(ParseResult.Warning).init(allocator);
+    var warnings: std.ArrayList(ParseResult.Warning) = .empty;
     errdefer {
         for (warnings.items) |w| {
             allocator.free(w.message);
         }
-        warnings.deinit();
+        warnings.deinit(allocator);
     }
 
-    var line_buf: [4096]u8 = undefined;
     var line_num: usize = 0;
 
-    while (reader.readUntilDelimiterOrEof(&line_buf, '\n') catch {
-        return ParseError.IoError;
+    // Lines are bounded by the reader's buffer; a longer line is an error
+    while (reader.takeDelimiter('\n') catch |err| switch (err) {
+        error.StreamTooLong, error.ReadFailed => return ParseError.IoError,
     }) |line| {
         line_num += 1;
 
@@ -509,16 +525,16 @@ pub fn loadFromReader(allocator: Allocator, reader: anytype) ParseError!ParseRes
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
         // Parse key: value
-        const colon_idx = std.mem.indexOfScalar(u8, trimmed, ':') orelse {
+        const colon_idx = std.mem.findScalar(u8, trimmed, ':') orelse {
             const msg = try std.fmt.allocPrint(allocator, "Invalid syntax (missing colon)", .{});
-            try warnings.append(.{ .line = line_num, .message = msg });
+            try warnings.append(allocator, .{ .line = line_num, .message = msg });
             continue;
         };
 
         const key = std.mem.trim(u8, trimmed[0..colon_idx], " \t");
         // Strip inline comments from value
         var value_with_comment = std.mem.trim(u8, trimmed[colon_idx + 1 ..], " \t");
-        const value = if (std.mem.indexOfScalar(u8, value_with_comment, '#')) |hash_idx|
+        const value = if (std.mem.findScalar(u8, value_with_comment, '#')) |hash_idx|
             std.mem.trim(u8, value_with_comment[0..hash_idx], " \t")
         else
             value_with_comment;
@@ -532,63 +548,63 @@ pub fn loadFromReader(allocator: Allocator, reader: anytype) ParseError!ParseRes
         } else if (std.mem.eql(u8, key, "memory")) {
             caps.limits.memory_bytes = parseMemorySize(value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid memory size: {s}", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "processes")) {
             caps.limits.max_processes = std.fmt.parseInt(u32, value, 10) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid process count: {s}", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "files")) {
             caps.limits.max_files = std.fmt.parseInt(u32, value, 10) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid file count: {s}", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "cpu")) {
             caps.limits.max_cpu_percent = std.fmt.parseInt(u8, value, 10) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid CPU percent: {s}", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "network")) {
             if (caps.network_rules.items.len >= MAX_NETWORK_RULES) {
                 const msg = try std.fmt.allocPrint(allocator, "Too many network rules (max {})", .{MAX_NETWORK_RULES});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             }
             const rule = parseNetworkRule(allocator, value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid network rule: {s}", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
-            try caps.network_rules.append(rule);
+            try caps.network_rules.append(allocator, rule);
         } else if (std.mem.eql(u8, key, "filesystem") or std.mem.eql(u8, key, "file")) {
             if (caps.file_rules.items.len >= MAX_FILE_RULES) {
                 const msg = try std.fmt.allocPrint(allocator, "Too many file rules (max {})", .{MAX_FILE_RULES});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             }
             const rule = parseFileRule(allocator, value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid file rule: {s}", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
-            try caps.file_rules.append(rule);
+            try caps.file_rules.append(allocator, rule);
         } else if (std.mem.eql(u8, key, "env")) {
             if (caps.env_vars.items.len >= MAX_ENV_VARS) {
                 const msg = try std.fmt.allocPrint(allocator, "Too many env vars (max {})", .{MAX_ENV_VARS});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             }
             const env = parseEnvVar(allocator, value) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid env var: {s}", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
                 continue;
             };
-            try caps.env_vars.append(env);
+            try caps.env_vars.append(allocator, env);
         } else if (std.mem.eql(u8, key, "network_default")) {
             caps.network_default_deny = std.mem.eql(u8, value, "deny");
         } else if (std.mem.eql(u8, key, "filesystem_default")) {
@@ -612,7 +628,7 @@ pub fn loadFromReader(allocator: Allocator, reader: anytype) ParseError!ParseRes
                 // No interface specified - will need --vnet CLI arg
             } else {
                 const msg = try std.fmt.allocPrint(allocator, "Invalid network_mode: {s} (use inherit, none, or vnet:<interface>)", .{value});
-                try warnings.append(.{ .line = line_num, .message = msg });
+                try warnings.append(allocator, .{ .line = line_num, .message = msg });
             }
         } else if (std.mem.eql(u8, key, "network_ip")) {
             // IP address to configure on VNET interface (e.g., "10.0.99.2/24")
@@ -621,7 +637,7 @@ pub fn loadFromReader(allocator: Allocator, reader: anytype) ParseError!ParseRes
             caps.workspace_path = try allocator.dupe(u8, value);
         } else {
             const msg = try std.fmt.allocPrint(allocator, "Unknown capability: {s}", .{key});
-            try warnings.append(.{ .line = line_num, .message = msg });
+            try warnings.append(allocator, .{ .line = line_num, .message = msg });
         }
     }
 
@@ -747,6 +763,16 @@ test "parseFileRule" {
     }
 }
 
+test "parseFileRule rejects unsafe paths" {
+    const allocator = std.testing.allocator;
+    const bad = [_][]const u8{ "/", "/:rw", "relative/path", "../etc:r", "/a/../etc:r", "/a/./b", "/a//b", "/etc/:r" };
+    for (bad) |rule| {
+        try std.testing.expectError(ParseError.InvalidFileRule, parseFileRule(allocator, rule));
+    }
+    try std.testing.expect(isSafeMountPath("/var/lib/app.d"));
+    try std.testing.expect(isSafeMountPath("/tmp"));
+}
+
 test "parseEnvVar" {
     const allocator = std.testing.allocator;
 
@@ -809,8 +835,8 @@ test "loadFromReader" {
         \\env_clear: true
     ;
 
-    var stream = std.io.fixedBufferStream(caps_content);
-    var result = try loadFromReader(allocator, stream.reader());
+    var reader: std.Io.Reader = .fixed(caps_content);
+    var result = try loadFromReader(allocator, &reader);
     defer result.deinit();
 
     const caps = &result.caps;
