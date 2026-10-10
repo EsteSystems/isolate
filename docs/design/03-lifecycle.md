@@ -13,7 +13,7 @@ Everything isolate creates for a run is removed when the run ends, however it en
 
 ## Out of scope
 
-- **Supervision.** isolate does not restart a program, run in the background, or start instances at boot.
+- **Supervision.** isolate does not restart a program, run in the background, or start instances at boot. `examples/rc.d/isolate` shows how to get all three from `daemon(8)` and `rc.d`; it is an example built on isolate, not part of what isolate guarantees.
 - **Surviving a reboot.** A reboot ends every instance; nothing is restored.
 - **Log management.** The program's output goes wherever isolate's own output goes.
 - **Concurrent administration.** Two `isolate` commands acting on the same instance at once are not coordinated beyond what is described below.
@@ -70,9 +70,9 @@ An instance is **running** if its jail exists or its `pid` exists, **orphaned** 
 
 ## Commands
 
-**`stop <name>`**
+**`stop [-f] [-s signal] [-t seconds] <name>`**
 
-1. If the jail still belongs to the instance, send `SIGTERM` to the program and wait up to five seconds.
+1. If the jail still belongs to the instance, send the signal (`SIGTERM` unless `-s` names another) to the program and wait up to five seconds, or the time given with `-t`.
 2. If the program is still running: without `-f`, report it and exit 1, leaving the instance registered. With `-f`, remove the jail, which kills everything inside it.
 3. If the manager is alive, it performs the cleanup. Otherwise `stop` removes the jail, limits, instance directory and ephemeral user itself and deletes the registry entry.
 
@@ -97,7 +97,7 @@ Steps 2 to 5 are what make `clean` work with an empty registry, which is the sit
 | LIF-3 | Cleanup never deletes or changes host data outside the instance directory. Mounts are removed before the directory tree, and removal never crosses a mount point. | Holds (tested): a workspace and an extra read-write rule keep their files. |
 | LIF-4 | `stop` and `clean` act only on things isolate created: a directory of the form `/var/run/isolate/inst-XXXXXX`, a user named `app-<digits>` with isolate's comment, and a jail named `isolate-<pid>`. | Holds (tested; unit tests): a jail and a user that merely look similar are left alone. |
 | LIF-5 | Only root can create or change registry entries. The registry is never read from a directory another user can write. | Holds (tested) |
-| LIF-6 | `stop` never unregisters an instance whose program is still running, unless `-f` is given. | Holds (tested) |
+| LIF-6 | `stop` never unregisters an instance whose program is still running, unless `-f` is given. | Holds (tested), also with `-t` and `-s`. |
 | LIF-7 | `isolate run` exits with the program's exit status, or 128 plus the signal number if a signal ended it. | Holds (tested): 7 for `exit 7`, 137 for `SIGKILL`. |
 | LIF-8 | The first termination signal to `isolate run` is passed to the program. The second kills it. In both cases isolate stays alive until it has cleaned up. | Holds (tested) with `SIGTERM` |
 | LIF-9 | Instance names are unique among registered instances. | Holds (tested; unit test): a second run with a name in use is refused before anything is created, and the first instance's entry is untouched. |
@@ -134,4 +134,5 @@ All six pass.
 - `clean` keeps an ephemeral user while any process has the pid in its name, so a reused pid can delay its removal until a later `clean`.
 - A directory newer than 60 seconds is never treated as orphaned, so `clean` run immediately after a crash may leave an unregistered directory for the next run of `clean`.
 - Ephemeral usernames are `app-<pid>`. If a user of that name already exists (left by a crash), it is reused and then deleted.
-- `stop` waits a fixed five seconds. It is not configurable.
+- A program started from a non-interactive shell's background job inherits ignored `SIGINT` and `SIGQUIT`, as with any Unix program. `stop -s INT` then has no effect on it.
+- Under `daemon(8)`, killing the `isolate run` process does not lead to a restart while the program is alive: the supervisor waits for the program's output to close. The program keeps running in its jail, unmanaged, until it exits or is stopped.

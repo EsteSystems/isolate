@@ -38,6 +38,7 @@ isolate is a single command-line program for FreeBSD. It has no daemon and keeps
 | `src/c_api.zig` | ~40 | A shared `@cImport` of the libc headers `main.zig` uses. |
 | `src/freebsd_proc.c` | ~25 | One function, the parent of a process, in C because `<sys/user.h>` cannot be imported into Zig 0.16. |
 | `tests/scenarios.sh`, `tests/probe.c` | | End-to-end checks that create real jails; see "Tests". |
+| `examples/rc.d/isolate` | | An `rc.d` script that runs instances under `daemon(8)`: started at boot, restarted on exit, logged to a file. |
 
 `freebsd.zig` and `syscheck.zig` compile only on FreeBSD. On other systems the program builds, and `detect`, `list` and the tests work, but `run` reports that it is not supported.
 
@@ -281,9 +282,9 @@ Output goes to stdout and stderr through unbuffered, streaming writers, so that 
 
 ## Tests
 
-`zig build test` runs the unit tests of every module: 46 on FreeBSD, 36 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry, generated capability files, and small helpers. None of them creates a jail.
+`zig build test` runs the unit tests of every module: 47 on FreeBSD, 37 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry, generated capability files, and small helpers. None of them creates a jail.
 
-`tests/scenarios.sh` does. It needs FreeBSD and root, creates real jails, users, mounts, limits and an epair interface, and makes about 80 checks, each labelled with the invariant it demonstrates. It refuses to start on a host that already has isolate leftovers, and its last check is that it left none. Run it with `doas sh tests/scenarios.sh` after `zig build`.
+`tests/scenarios.sh` does. It needs FreeBSD and root, creates real jails, users, mounts, limits and an epair interface, and makes about 85 checks, each labelled with the invariant it demonstrates. It refuses to start on a host that already has isolate leftovers, and its last check is that it left none. Run it with `doas sh tests/scenarios.sh` after `zig build`.
 
 ## Measurements
 
