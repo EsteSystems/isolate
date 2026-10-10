@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 
 /// Maximum limits for rule arrays
 pub const MAX_NETWORK_RULES = 16;
-pub const MAX_FILE_RULES = 32;
+pub const MAX_FILE_RULES = 128;
 pub const MAX_ENV_VARS = 32;
 pub const MAX_ENV_NAME = 255;
 pub const MAX_ENV_VALUE = 1023;
@@ -92,13 +92,11 @@ pub const NetworkRule = struct {
     pub const Protocol = enum {
         tcp,
         udp,
-        unix,
         none,
 
         pub fn fromString(s: []const u8) ?Protocol {
             if (std.mem.eql(u8, s, "tcp")) return .tcp;
             if (std.mem.eql(u8, s, "udp")) return .udp;
-            if (std.mem.eql(u8, s, "unix")) return .unix;
             if (std.mem.eql(u8, s, "none")) return .none;
             return null;
         }
@@ -376,7 +374,39 @@ pub fn parseMemorySize(size_str: []const u8) ParseError!usize {
     return @intFromFloat(value * @as(f64, @floatFromInt(multiplier)));
 }
 
-/// Parse a network rule string (e.g., "tcp:8080:inbound", "unix:/tmp/socket")
+/// An IPv4 address or network as it may appear in a rule: digits and dots,
+/// with an optional /prefix. Rule fields are separated by colons, so IPv6
+/// addresses cannot be written; rules are IPv4. Keeping the alphabet this
+/// small also means an address can be put into a pf rule as it is.
+pub fn isRuleAddress(text: []const u8) bool {
+    if (text.len == 0 or text.len > 18) return false;
+    var slash: ?usize = null;
+    for (text, 0..) |ch, i| {
+        switch (ch) {
+            '0'...'9', '.' => {},
+            '/' => {
+                if (slash != null) return false;
+                slash = i;
+            },
+            else => return false,
+        }
+    }
+    const host = text[0 .. slash orelse text.len];
+    var parts = std.mem.splitScalar(u8, host, '.');
+    var count: usize = 0;
+    while (parts.next()) |part| : (count += 1) {
+        _ = std.fmt.parseInt(u8, part, 10) catch return false;
+    }
+    if (count != 4) return false;
+    if (slash) |i| {
+        const bits = std.fmt.parseInt(u8, text[i + 1 ..], 10) catch return false;
+        if (bits > 32) return false;
+    }
+    return true;
+}
+
+/// Parse a network rule string: "tcp:8080:inbound", "udp:53:outbound",
+/// "tcp:10.0.0.5:5432:outbound", or "none"
 pub fn parseNetworkRule(allocator: Allocator, rule_str: []const u8) ParseError!NetworkRule {
     if (std.mem.eql(u8, rule_str, "none")) {
         return .{
@@ -400,35 +430,25 @@ pub fn parseNetworkRule(allocator: Allocator, rule_str: []const u8) ParseError!N
     var port: ?u16 = null;
     var direction: Direction = .both;
 
-    if (protocol == .unix) {
-        // Unix socket: unix:/path/to/socket
-        if (iter.next()) |path| {
-            address = try allocator.dupe(u8, path);
-        }
-    } else {
-        // TCP/UDP: tcp:8080 or tcp:192.168.1.1:80:inbound
-        if (iter.next()) |second| {
-            // Check if it's a port number or address
-            if (std.fmt.parseInt(u16, second, 10)) |p| {
-                port = p;
-                // Next could be direction
-                if (iter.next()) |dir_str| {
-                    direction = Direction.fromString(dir_str) orelse return ParseError.InvalidNetworkRule;
-                }
-            } else |_| {
-                // It's an address
-                address = try allocator.dupe(u8, second);
-                // Next should be port
-                if (iter.next()) |port_str| {
-                    port = std.fmt.parseInt(u16, port_str, 10) catch return ParseError.InvalidNetworkRule;
-                }
-                // Next could be direction
-                if (iter.next()) |dir_str| {
-                    direction = Direction.fromString(dir_str) orelse return ParseError.InvalidNetworkRule;
-                }
-            }
+    // tcp:8080, tcp:8080:inbound, tcp:192.168.1.1:80, tcp:192.168.1.1:80:inbound
+    const second = iter.next() orelse return ParseError.InvalidNetworkRule;
+    if (std.fmt.parseInt(u16, second, 10)) |p| {
+        port = p;
+    } else |_| {
+        if (!isRuleAddress(second)) return ParseError.InvalidNetworkRule;
+        address = try allocator.dupe(u8, second);
+        if (iter.next()) |port_str| {
+            port = std.fmt.parseInt(u16, port_str, 10) catch return ParseError.InvalidNetworkRule;
         }
     }
+    if (port != null) {
+        if (iter.next()) |dir_str| {
+            direction = Direction.fromString(dir_str) orelse return ParseError.InvalidNetworkRule;
+        }
+    }
+    // Nothing may follow: a rule that says more than isolate understands
+    // must not be half-applied
+    if (iter.next() != null) return ParseError.InvalidNetworkRule;
 
     return .{
         .protocol = protocol,
@@ -747,12 +767,21 @@ test "parseNetworkRule" {
         try std.testing.expectEqual(Direction.outbound, rule.direction);
     }
 
-    // Unix socket
+    // Address and port
     {
-        const rule = try parseNetworkRule(allocator, "unix:/tmp/socket");
+        const rule = try parseNetworkRule(allocator, "tcp:10.0.0.5:5432:outbound");
         defer if (rule.address.len > 0) allocator.free(rule.address);
-        try std.testing.expectEqual(NetworkRule.Protocol.unix, rule.protocol);
-        try std.testing.expectEqualStrings("/tmp/socket", rule.address);
+        try std.testing.expectEqualStrings("10.0.0.5", rule.address);
+        try std.testing.expectEqual(@as(?u16, 5432), rule.port);
+        try std.testing.expectEqual(Direction.outbound, rule.direction);
+    }
+
+    // A network, any port
+    {
+        const rule = try parseNetworkRule(allocator, "udp:192.168.0.0/16");
+        defer if (rule.address.len > 0) allocator.free(rule.address);
+        try std.testing.expectEqualStrings("192.168.0.0/16", rule.address);
+        try std.testing.expect(rule.port == null);
     }
 
     // None
@@ -814,6 +843,24 @@ test "parseNetworkRule rejects bad ports and directions" {
     try std.testing.expectError(ParseError.InvalidNetworkRule, parseNetworkRule(allocator, "tcp:8080:sideways"));
     try std.testing.expectError(ParseError.InvalidNetworkRule, parseNetworkRule(allocator, "tcp:10.0.0.1:notaport"));
     try std.testing.expectError(ParseError.InvalidNetworkRule, parseNetworkRule(allocator, "icmp:1"));
+    // Things a packet filter cannot express, or that are not plain IPv4
+    for ([_][]const u8{
+        "unix:/tmp/socket",           "tcp",                       "tcp:example.com:443",
+        "tcp:10.0.0.5:443:out:extra", "tcp:8080:inbound:extra",    "tcp:10.0.0.256:80",
+        "tcp:10.0.0.5/33:80",         "tcp:10.0.0.5 port 22:80",   "tcp:any:80",
+        "tcp:1.2.3:80",               "tcp:{ 10.0.0.1 }:80",
+    }) |bad| {
+        try std.testing.expectError(ParseError.InvalidNetworkRule, parseNetworkRule(allocator, bad));
+    }
+}
+
+test "isRuleAddress" {
+    for ([_][]const u8{ "10.0.0.5", "0.0.0.0/0", "192.168.1.0/24", "255.255.255.255/32" }) |ok| {
+        try std.testing.expect(isRuleAddress(ok));
+    }
+    for ([_][]const u8{ "", "10.0.0", "10.0.0.5/", "10.0.0.5/8/8", "::1", "localhost", "10.0.0.5;", "1.2.3.4.5" }) |bad| {
+        try std.testing.expect(!isRuleAddress(bad));
+    }
 }
 
 test "parseEnvVar rejects over-long entries" {

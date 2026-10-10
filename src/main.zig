@@ -1,4 +1,4 @@
-//! isolate - Infrastructureless container runner
+//! isolate - a sandbox launcher for FreeBSD
 //!
 //! This is the main entry point for the isolate tool. It provides process
 //! isolation using FreeBSD jails.
@@ -19,6 +19,7 @@ const c_api = @import("c_api.zig");
 const caps = @import("caps.zig");
 const detect = @import("detect.zig");
 const registry = @import("registry.zig");
+const netrules = @import("netrules.zig");
 const syscheck = if (builtin.os.tag == .freebsd) @import("syscheck.zig") else struct {
     pub const SystemCapabilities = struct {
         racct_enabled: bool,
@@ -85,6 +86,8 @@ const RunOptions = struct {
 const DetectOptions = struct {
     output_file: ?[]const u8 = null,
     target_binary: ?[]const u8 = null,
+    /// Write rules for whole library directories instead of the exact files
+    dirs: bool = false,
 };
 
 /// Stop command options
@@ -284,6 +287,8 @@ fn parseDetectArgs(opts: *DetectOptions, args: []const [:0]const u8) !void {
                 i += 1;
                 if (i >= args.len) return error.MissingArgument;
                 opts.output_file = args[i];
+            } else if (std.mem.eql(u8, arg, "--dirs")) {
+                opts.dirs = true;
             } else {
                 std.debug.print("Unknown option: {s}\n", .{arg});
                 return error.UnknownOption;
@@ -338,13 +343,13 @@ fn printUsage(io: std.Io) void {
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
     stdout.print(
-        \\isolate - Infrastructureless container runner
+        \\isolate - run a program in a jail that contains only what you list
         \\
         \\Usage: isolate <command> [options] [arguments]
         \\
         \\Commands:
         \\  run      Run a binary in isolation (default)
-        \\  detect   Detect and generate capability file
+        \\  detect   List the libraries a program needs, as a capability file
         \\  list     List running isolated instances
         \\  stop     Stop a running instance
         \\  clean    Clean up orphaned instances and data
@@ -413,8 +418,12 @@ fn printDetectUsage(io: std.Io) void {
         \\
         \\Analyze a binary and generate a capability file.
         \\
+        \\The shared libraries the binary is linked against are listed file by
+        \\file, so the jail holds exactly those and nothing else.
+        \\
         \\Options:
         \\  -o, --output <file>    Output capability file (default: <binary>.caps)
+        \\  --dirs                 Mount whole library directories instead
         \\
         \\Examples:
         \\  isolate detect ./myapp
@@ -452,7 +461,7 @@ fn cmdDetect(io: std.Io, allocator: std.mem.Allocator, opts: DetectOptions) !u8 
     try stdout.print("============================\n\n", .{});
 
     // Use native Zig ELF detection
-    detect.detectCapabilities(io, allocator, opts.target_binary.?, opts.output_file) catch |err| {
+    detect.detectCapabilities(io, allocator, opts.target_binary.?, opts.output_file, opts.dirs) catch |err| {
         std.debug.print("Detection failed: {}\n", .{err});
         return 1;
     };
@@ -562,13 +571,6 @@ fn cmdRun(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions) !u8 {
         return 1;
     }
 
-    // Network rules are parsed and listed but not enforced: there is no
-    // firewall integration. Say so rather than let `network: tcp:443:outbound`
-    // look like it restricts anything.
-    if (parse_result.caps.network_rules.items.len > 0) {
-        try stderr.print("Warning: {d} network rule(s) in {s} are not enforced; only network_mode (inherit, none, vnet) controls network access\n", .{ parse_result.caps.network_rules.items.len, caps_file });
-    }
-
     // Set workspace path if specified
     if (opts.workspace_dir) |ws| {
         if (parse_result.caps.workspace_path) |old_wp| {
@@ -584,6 +586,14 @@ fn cmdRun(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions) !u8 {
             allocator.free(old_iface);
         }
         parse_result.caps.network_config.interface = try allocator.dupe(u8, iface);
+    }
+
+    // Network rules are enforced or the run is refused; they are never
+    // quietly ignored. This is checked after the command-line overrides,
+    // since --vnet can supply the interface.
+    if (netrules.unenforceable(&parse_result.caps)) |reason| {
+        try stderr.print("Error: {s}: {s}\n", .{ caps_file, reason });
+        return 1;
     }
 
     if (opts.verbose) {
@@ -866,6 +876,11 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
             try stdout.print("Removed resource limits of {d} jail(s) that no longer exist.\n", .{purged});
         }
 
+        const purged_anchors = freebsd.purgeStaleNetworkRules();
+        if (purged_anchors > 0) {
+            try stdout.print("Removed network rules of {d} jail(s) that no longer exist.\n", .{purged_anchors});
+        }
+
         try stdout.print("Checking for orphaned instance directories...\n", .{});
 
         var cleaned_dirs: u32 = 0;
@@ -914,6 +929,17 @@ fn cmdCheck(io: std.Io) !u8 {
 
     const sys_caps = syscheck.detect();
     try syscheck.printCheck(sys_caps, stdout);
+
+    if (builtin.os.tag == .freebsd) {
+        try stdout.print("Network rules (pf):\n", .{});
+        switch (freebsd.pfState()) {
+            .ready => try stdout.print("  [OK] pf                   Enabled, with isolate's anchor - network rules can be enforced\n", .{}),
+            .unavailable => try stdout.print("  [!!] pf                   Not available, or not running as root - files with network rules will be refused\n", .{}),
+            .disabled => try stdout.print("  [!!] pf                   Not enabled - files with network rules will be refused\n", .{}),
+            .no_anchor => try stdout.print("  [!!] pf                   Enabled, but pf.conf lacks:  {s}\n", .{netrules.anchor_line}),
+        }
+        try stdout.print("\n", .{});
+    }
 
     // Return non-zero if critical features are missing
     if (!sys_caps.jails_available) {
@@ -1033,6 +1059,14 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             break :blk formatted;
         };
 
+        // The program runs from the absolute path it has on the host
+        var program_buf: [c_api.PATH_MAX]u8 = undefined;
+        if (c.realpath(@ptrCast(target_binary.ptr), &program_buf) == null) {
+            stderr.print("Error: {s} not found\n", .{target_binary}) catch {};
+            return 1;
+        }
+        const program_path: [:0]const u8 = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&program_buf)), 0);
+
         // Instance names are unique. Refuse before anything is created.
         {
             var reg = registry.Registry.init(io, allocator);
@@ -1063,7 +1097,7 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             _ = c.close(pipefd[0]);
 
             // Create isolation context using native Zig implementation
-            freebsd.createIsolation(io, capability, target_binary) catch |err| {
+            freebsd.createIsolation(io, capability, program_path) catch |err| {
                 stderr.print("Failed to create isolation context: {}\n", .{err}) catch {};
                 _ = c.close(pipefd[1]);
                 c._exit(1);
@@ -1089,26 +1123,14 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
                 stdout.print("Executing target binary...\n\n", .{}) catch {};
             }
 
-            // Execute target binary
-            const binary_name = if (std.mem.findLast(u8, target_binary, "/")) |idx|
-                target_binary[idx + 1 ..]
-            else
-                target_binary;
-
-            // Build the path inside the jail - binary is copied to jail root
-            const exec_path = std.fmt.allocPrintSentinel(allocator, "/{s}", .{binary_name}, 0) catch {
-                stderr.print("Out of memory\n", .{}) catch {};
-                c._exit(1);
-            };
-
-            // Build argv for execv: the binary's name, then every argument
+            // Build argv for execv: the program's path, then every argument
             // given on the command line, however many there are. Each is a
             // slice of a NUL-terminated command-line string.
             const argv = allocator.alloc(?[*:0]const u8, args.len + 2) catch {
                 stderr.print("Out of memory\n", .{}) catch {};
                 c._exit(1);
             };
-            argv[0] = @ptrCast(binary_name.ptr);
+            argv[0] = program_path.ptr;
             for (args, 1..) |arg, i| argv[i] = @ptrCast(arg.ptr);
             argv[args.len + 1] = null;
 
@@ -1116,10 +1138,12 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             // that happened to be open in this process
             c.closefrom(3);
 
-            _ = c.execv(exec_path.ptr, @ptrCast(argv.ptr));
+            // The program is in the jail at the path it has on the host
+            _ = c.execv(program_path.ptr, @ptrCast(argv.ptr));
 
             // If we get here, execv failed
-            stderr.print("Failed to execute {s}\n", .{target_binary}) catch {};
+            const reason = std.mem.span(c.strerror(std.c._errno().*));
+            stderr.print("Failed to execute {s}: {s}\n", .{ program_path, reason }) catch {};
             c._exit(1);
         } else {
             // Parent process
@@ -1206,6 +1230,7 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             // Cleanup using native Zig implementation
             freebsd.cleanupIsolation(io);
             freebsd.removeResourceLimitsForPid(pid);
+            freebsd.removeNetworkRulesForPid(pid);
 
             // Unregister instance (never someone else's entry of the same name)
             if (registered) {
@@ -1273,6 +1298,8 @@ test {
     _ = c_api;
     _ = caps;
     _ = detect;
+    _ = @import("libs.zig");
+    _ = netrules;
     _ = registry;
     if (builtin.os.tag == .freebsd) {
         _ = syscheck;
