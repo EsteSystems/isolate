@@ -467,11 +467,14 @@ fn cmdRun(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions) !u8 {
     if (caps.load(io, allocator, caps_file)) |result| {
         parse_result = result;
     } else |err| {
-        if (opts.verbose or err != caps.ParseError.FileNotFound) {
+        if (err == caps.ParseError.FileNotFound) {
+            try stderr.print("Warning: No capability file at {s}\n", .{caps_file});
+        } else {
             try stderr.print("Warning: Could not load capabilities from {s}: {}\n", .{ caps_file, err });
-            try stderr.print("Suggestion: Run 'isolate detect {s}' to generate capability file\n", .{target_binary});
-            try stderr.print("Running without isolation.\n\n", .{});
         }
+        try stderr.print("Running with default capabilities: ephemeral user, inherited network, no filesystem rules.\n", .{});
+        try stderr.print("Nothing (not even /lib or /libexec) is mounted in the jail, so dynamically linked binaries will not start.\n", .{});
+        try stderr.print("Run 'isolate detect {s}' to generate a capability file.\n\n", .{target_binary});
         // Use default capabilities
         parse_result = .{
             .caps = caps.Capabilities.init(allocator),
