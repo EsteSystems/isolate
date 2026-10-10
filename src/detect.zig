@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const elf = std.elf;
+const caps = @import("caps.zig");
 
 /// Maximum capability hints
 pub const MAX_CAPABILITY_HINTS = 64;
@@ -122,7 +123,7 @@ const app_patterns = [_]AppPattern{
     .{ .pattern = "mongod", .description = "MongoDB server", .capability = "network: tcp:27017:inbound\nfilesystem: /var/lib/mongodb:rw\nmemory: 256M", .confidence = 90 },
     .{ .pattern = "server", .description = "Generic server application", .capability = "network: tcp:8080:inbound\nmemory: 128M", .confidence = 60 },
     .{ .pattern = "client", .description = "Generic client application", .capability = "network: tcp:80:outbound\nnetwork: tcp:443:outbound", .confidence = 60 },
-    .{ .pattern = "daemon", .description = "System daemon", .capability = "processes: 5\nfilesystem: /var/run:rw\nfilesystem: /var/log:w", .confidence = 70 },
+    .{ .pattern = "daemon", .description = "System daemon", .capability = "processes: 5\nfilesystem: /var/run:rw\nfilesystem: /var/log:rw", .confidence = 70 },
     .{ .pattern = "bot", .description = "Bot application", .capability = "network: tcp:443:outbound\nfilesystem: /tmp:rw\nmemory: 64M", .confidence = 65 },
 };
 
@@ -479,7 +480,29 @@ pub fn analyzePatterns(result: *DetectionResult) !void {
     }
 }
 
-/// Generate capability file from detection results
+/// The key of a "key: value" capability line, and its value
+fn splitLine(line: []const u8) ?struct { key: []const u8, value: []const u8 } {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return null;
+    return .{
+        .key = std.mem.trim(u8, line[0..colon], " \t"),
+        .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+    };
+}
+
+/// Whether a path exists on this host as something a filesystem rule can
+/// mount: a directory or a regular file
+fn isMountable(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .directory or st.kind == .file;
+}
+
+/// Generate capability file from detection results.
+///
+/// Every line written without a leading '#' is one `isolate run` applies as
+/// written, so the file loads with no problems (design: DET-2). What
+/// detection inferred but isolate cannot apply is written as a comment that
+/// says why: network rules (not enforced), filesystem rules for paths that
+/// do not exist here, and anything that is not a valid rule.
 pub fn generateCapabilityFile(
     io: std.Io,
     allocator: Allocator,
@@ -501,6 +524,27 @@ pub fn generateCapabilityFile(
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
 
+    // Sort hints by confidence
+    result.sortByConfidence();
+
+    // The limits appear once. A hint can only raise them above the defaults.
+    var memory_bytes: usize = 128 * 1024 * 1024;
+    var processes: u32 = 5;
+    const files: u32 = 512;
+    for (result.hints.items) |hint| {
+        var lines = std.mem.splitScalar(u8, hint.capability, '\n');
+        while (lines.next()) |line| {
+            const kv = splitLine(line) orelse continue;
+            if (std.mem.eql(u8, kv.key, "memory")) {
+                const bytes = caps.parseMemorySize(kv.value) catch continue;
+                memory_bytes = @max(memory_bytes, bytes);
+            } else if (std.mem.eql(u8, kv.key, "processes")) {
+                const n = std.fmt.parseInt(u32, kv.value, 10) catch continue;
+                processes = @max(processes, n);
+            }
+        }
+    }
+
     // Write header
     try writer.print("# Auto-generated capability file for {s}\n", .{binary_path});
     try writer.print("# Generated on: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\n", .{
@@ -511,32 +555,40 @@ pub fn generateCapabilityFile(
         day_seconds.getMinutesIntoHour(),
         day_seconds.getSecondsIntoMinute(),
     });
-    try writer.writeAll("# Review and modify capabilities as needed\n");
-    try writer.writeAll("# Remove or comment out unnecessary capabilities\n\n");
+    try writer.writeAll("# This is a starting point from static analysis, not a verified policy.\n");
+    try writer.writeAll("# Review every line. Check the result with: isolate run -n -v <binary>\n\n");
 
     try writer.writeAll("# User context - creates ephemeral user automatically\n");
     try writer.writeAll("user: auto\n\n");
 
-    try writer.writeAll("# Default resource limits (adjust based on application needs)\n");
-    try writer.writeAll("memory: 128M    # Adjust based on application requirements\n");
-    try writer.writeAll("processes: 5    # Adjust if application spawns child processes\n");
-    try writer.writeAll("files: 512      # File descriptor limit (512 is the minimum for fork)\n\n");
+    try writer.writeAll("# Resource limits (adjust based on application needs)\n");
+    try writer.print("memory: {d}M\n", .{memory_bytes / (1024 * 1024)});
+    try writer.print("processes: {d}\n", .{processes});
+    try writer.print("files: {d}\n\n", .{files});
 
-    // Sort hints by confidence
-    result.sortByConfidence();
-
-    // Track added capabilities to avoid duplicates
-    var added_caps = std.StringHashMap(void).init(allocator);
-    defer added_caps.deinit();
+    // Track what has been written, to avoid duplicates
+    var added_hints = std.StringHashMap(void).init(allocator);
+    defer added_hints.deinit();
+    var added_lines = std.StringHashMap(void).init(allocator);
+    defer added_lines.deinit();
+    var added_paths = std.StringHashMap(void).init(allocator);
+    defer {
+        var keys = added_paths.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        added_paths.deinit();
+    }
+    var file_rule_count: usize = 0;
+    var env_count: usize = 0;
 
     try writer.writeAll("# Detected capabilities (sorted by confidence)\n");
-    try writer.writeAll("# Higher confidence suggestions are listed first\n\n");
+    try writer.writeAll("# Lines starting with '#' are not applied; each says why.\n\n");
 
     var current_conf_range: ?u8 = null;
 
     for (result.hints.items) |hint| {
         // Skip if already added
-        if (added_caps.contains(hint.capability)) continue;
+        if (added_hints.contains(hint.capability)) continue;
+        try added_hints.put(hint.capability, {});
 
         // Write confidence section header
         const conf_range = (hint.confidence / 10) * 10;
@@ -549,25 +601,63 @@ pub fn generateCapabilityFile(
         // Write hint
         try writer.print("# {s}\n", .{hint.description});
 
-        // Split multi-line capabilities
         var iter = std.mem.splitScalar(u8, hint.capability, '\n');
         while (iter.next()) |cap_line| {
-            if (cap_line.len > 0) {
-                try writer.print("{s}\n", .{cap_line});
+            if (cap_line.len == 0) continue;
+            const kv = splitLine(cap_line) orelse {
+                try writer.print("#   {s}    (not a capability line)\n", .{cap_line});
+                continue;
+            };
+
+            if (std.mem.eql(u8, kv.key, "memory") or std.mem.eql(u8, kv.key, "processes") or std.mem.eql(u8, kv.key, "files")) {
+                // Folded into the limits at the top of the file
+                try writer.print("#   {s}    (see the limits above)\n", .{cap_line});
+            } else if (std.mem.eql(u8, kv.key, "network")) {
+                try writer.print("#   {s}    (network rules are not enforced; use network_mode)\n", .{cap_line});
+            } else if (std.mem.eql(u8, kv.key, "filesystem")) {
+                const rule = caps.parseFileRule(allocator, kv.value) catch {
+                    try writer.print("#   {s}    (not a usable rule)\n", .{cap_line});
+                    continue;
+                };
+                // The rule's path is kept as the key of added_paths
+                if (added_paths.contains(rule.path)) {
+                    allocator.free(rule.path);
+                    continue;
+                }
+                try added_paths.put(rule.path, {});
+
+                const is_tmp = std.mem.eql(u8, rule.path, "/tmp");
+                if (!is_tmp and !isMountable(io, rule.path)) {
+                    try writer.print("#   {s}    (not present on this host)\n", .{cap_line});
+                } else if (file_rule_count >= caps.MAX_FILE_RULES) {
+                    try writer.print("#   {s}    (over the limit of {d} filesystem rules)\n", .{ cap_line, caps.MAX_FILE_RULES });
+                } else {
+                    try writer.print("{s}\n", .{cap_line});
+                    file_rule_count += 1;
+                }
+            } else if (std.mem.eql(u8, kv.key, "env")) {
+                if (added_lines.contains(cap_line)) continue;
+                try added_lines.put(cap_line, {});
+                if (env_count >= caps.MAX_ENV_VARS) {
+                    try writer.print("#   {s}    (over the limit of {d} env entries)\n", .{ cap_line, caps.MAX_ENV_VARS });
+                } else {
+                    try writer.print("{s}\n", .{cap_line});
+                    env_count += 1;
+                }
+            } else {
+                try writer.print("#   {s}    (not applied)\n", .{cap_line});
             }
         }
-
-        try added_caps.put(hint.capability, {});
     }
 
     try writer.writeAll("\n");
 
     // Add commented examples
-    try writer.writeAll("# Additional capability examples (commented out):\n");
-    try writer.writeAll("# network: udp:53:outbound     # DNS queries\n");
-    try writer.writeAll("# filesystem: /home/user:rw    # User home directory\n");
-    try writer.writeAll("# env: PATH=/usr/bin:/bin      # Custom environment\n");
-    try writer.writeAll("# cpu: 50                      # CPU limit (percentage)\n");
+    try writer.writeAll("# Other settings (commented out):\n");
+    try writer.writeAll("# network_mode: none             # no network at all (default: inherit, the host's network)\n");
+    try writer.writeAll("# filesystem: /home/user:rw      # a directory or file, read-only (r) or read-write (rw)\n");
+    try writer.writeAll("# env: PATH=/usr/bin:/bin        # custom environment\n");
+    try writer.writeAll("# env_clear: true                # start from an empty environment\n");
 
     try writer.flush();
 }
@@ -672,6 +762,48 @@ test "DetectionResult addHint" {
     try std.testing.expectEqual(@as(usize, 1), result.hints.items.len);
     try std.testing.expectEqualStrings("Test hint", result.hints.items[0].description);
     try std.testing.expectEqual(@as(u8, 80), result.hints.items[0].confidence);
+}
+
+test "generated capability files load without problems" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    var out_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out_path = try std.fmt.bufPrint(&out_buf, "{s}/out.caps", .{dir_buf[0..dir_len]});
+
+    var result = DetectionResult.init(allocator, "/usr/local/sbin/nginx");
+    defer result.deinit();
+
+    // Everything detection can produce, including what isolate cannot apply
+    try result.addHint("libraries", "filesystem: /tmp:rw\nfilesystem: /nonexistent/isolate-test:r", 95);
+    try result.addHint("server", "network: tcp:80:inbound\nnetwork: tcp:443:inbound\nmemory: 256M", 90);
+    try result.addHint("threads", "processes: 10", 80);
+    try result.addHint("fork", "processes: 20", 75);
+    try result.addHint("x11", "filesystem: /tmp:rw\nenv: DISPLAY=:0", 70);
+    try result.addHint("string", "filesystem: /var/run/%s.pid # x:rw", 65);
+    try result.addHint("string", "filesystem: relative/path:rw", 60);
+    try result.addHint("daemon", "filesystem: /var/log:w", 55);
+
+    try generateCapabilityFile(io, allocator, "/usr/local/sbin/nginx", out_path, &result);
+
+    var parsed = try caps.load(io, allocator, out_path);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.problems.items.len);
+    // Limits are written once, raised to the largest hint
+    try std.testing.expectEqual(@as(?usize, 256 * 1024 * 1024), parsed.caps.limits.memory_bytes);
+    try std.testing.expectEqual(@as(?u32, 20), parsed.caps.limits.max_processes);
+    try std.testing.expectEqual(@as(?u32, 512), parsed.caps.limits.max_files);
+    // Network rules are comments, not rules
+    try std.testing.expectEqual(@as(usize, 0), parsed.caps.network_rules.items.len);
+    // /tmp once; the nonexistent, malformed and write-only rules not at all
+    try std.testing.expectEqual(@as(usize, 1), parsed.caps.file_rules.items.len);
+    try std.testing.expectEqualStrings("/tmp", parsed.caps.file_rules.items[0].path);
+    try std.testing.expectEqual(@as(usize, 1), parsed.caps.env_vars.items.len);
 }
 
 test "DetectionResult sortByConfidence" {
