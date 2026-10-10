@@ -16,6 +16,7 @@ Traditional containerization requires learning Docker, Kubernetes, registries, o
 - **Capability Detection**: Analyzes a binary to draft a capability file for you to review
 - **Ephemeral Users**: Creates temporary users per instance for privilege separation
 - **Resource Limits**: Memory, process, and file descriptor limits via rctl
+- **System V IPC on request**: A private shared-memory and semaphore namespace per jail, for programs like PostgreSQL
 - **Network Modes**: Host network, no network, or a VNET stack of its own
 - **Workspace Mounting**: Mount host directories for persistent application data
 - **Instance Management**: Track, list, stop, and clean up running instances
@@ -237,6 +238,9 @@ network: tcp:8080:inbound     # Listen on TCP port 8080
 network: tcp:443:outbound     # Connect to TCP port 443
 network: udp:53:outbound      # DNS queries
 
+# System V shared memory, semaphores and message queues, private to the jail
+# sysv_ipc: true              # off by default; PostgreSQL needs it
+
 # Environment variables
 env: PATH=/usr/bin:/bin
 env: HOME=/workspace
@@ -364,7 +368,7 @@ doas isolate stop app-tenant-b
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes how the code is built.
 - [docs/design/](docs/design/README.md) specifies what isolate guarantees: scope, invariants, success and failure criteria, and known gaps.
-- [docs/nginx-guide.md](docs/nginx-guide.md) is a worked example.
+- [docs/nginx-guide.md](docs/nginx-guide.md) and [docs/postgresql-guide.md](docs/postgresql-guide.md) are worked examples, both run as written on FreeBSD 15.1.
 
 ### Module Overview
 
@@ -399,7 +403,7 @@ The unit tests cover parsing and validation and create no jails. The end-to-end 
 zig build && doas sh tests/scenarios.sh
 ```
 
-They create real jails, users, mounts, limits and a network interface, check about 70 behaviours against the [design documents](docs/design/README.md), and verify at the end that nothing was left behind.
+They create real jails, users, mounts, limits and a network interface, check about 80 behaviours against the [design documents](docs/design/README.md), and verify at the end that nothing was left behind.
 
 ## Troubleshooting
 

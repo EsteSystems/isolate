@@ -42,6 +42,7 @@ key: value            # trailing comment
 | `workspace` | host directory mounted read-write at `/workspace` | none |
 | `env` | `NAME=value`; name up to 255 bytes, value up to 1023 | none |
 | `env_clear` | `true`, `1`, `yes`, `false`, `0`, `no` | `false` |
+| `sysv_ipc` | `true`, `1`, `yes`, `false`, `0`, `no` | `false` |
 | `network_mode` | `inherit`, `none`, `vnet`, `vnet:<interface>` | `inherit` |
 | `network_ip` | address for the VNET interface, e.g. `10.0.99.2/24` | none |
 | `memory` | number with optional `K`, `M`, `G`, `B` suffix (powers of 1024) | unlimited |
@@ -74,6 +75,10 @@ The host path is mounted with nullfs at the same path inside the jail.
 - The path must exist on the host when the run starts, as a directory or a regular file. A single file is mounted as a single file.
 - `:r` or no suffix means read-only. `:rw` means read-write.
 - **`/tmp` is special.** A rule for `/tmp` mounts a directory private to the instance, not the host's `/tmp`.
+
+### `sysv_ipc`
+
+With `true`, the jail gets System V shared memory, semaphores and message queues of its own. They are not the host's: nothing created in the jail is visible to another jail, and everything is destroyed when the jail is removed. Without it, the System V calls fail. PostgreSQL needs this; see the [PostgreSQL guide](../postgresql-guide.md).
 
 ### `env`
 

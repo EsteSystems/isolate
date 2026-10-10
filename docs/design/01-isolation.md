@@ -27,7 +27,7 @@ Contain an untrusted program: it runs in a jail whose filesystem isolate built f
 └── inst-XXXXXX/                     per run, from mkdtemp(3), 0755
     ├── root/                        the jail's root filesystem
     │   ├── <binary>                 copy of the program, 0755
-    │   ├── etc/passwd, etc/group    root and the program's user only
+    │   ├── etc/                     user database: root and the program's user only
     │   ├── dev/                     devfs, reduced to a few nodes
     │   ├── tmp/                     1777; the instance tmp if a /tmp rule exists
     │   ├── workspace/               nullfs mount of the -w directory, read-write
@@ -46,10 +46,13 @@ The jail is created with these parameters. Everything else is the FreeBSD defaul
 | `persist` | set |
 | `allow.raw_sockets` | false |
 | `allow.sysvipc` | false |
+| `sysvshm`, `sysvsem`, `sysvmsg` | `new`, only with `sysv_ipc: true` |
 | `allow.socket_af` | true |
 | `ip4`, `ip6` / `vnet` | by network mode; see [05-network.md](05-network.md) |
 
 The jail's `/dev` is a devfs mount on which isolate hides every node and then unhides `null`, `zero`, `full`, `random`, `urandom`, `stdin`, `stdout`, `stderr`, `fd` and `pts`.
+
+The jail's `/etc` holds `master.passwd`, `passwd`, `pwd.db`, `spwd.db` and `group`, built with `pwd_mkdb(8)`. They contain two users, `root` and the one the program runs as, with no password hashes. FreeBSD's libc reads the `.db` files, not `passwd`, so without them a program cannot look up its own user.
 
 ## Invariants
 
@@ -68,8 +71,9 @@ The jail's `/dev` is a devfs mount on which isolate hides every node and then un
 | ISO-9 | The jail's `/dev` exposes only the device nodes listed above. | Holds (tested): `mem`, `kmem`, `io`, `pci`, `bpf` and `geom.ctl` are absent. |
 | ISO-10 | The program inherits no open file descriptors other than 0, 1 and 2. | Holds (tested): descriptors opened by the invoking shell are closed before `execv`. |
 | ISO-11 | If something the capability file asks for cannot be set up, the run does not start, and nothing is left behind. | Holds (tested) for a rule whose path does not exist. A failed devfs mount, devfs restriction or any other mount takes the same path (by inspection). Related: LIM-5, NET-5. |
-| ISO-12 | Inside the jail the program cannot create raw sockets, use System V IPC, create jails or mount filesystems. | Holds (by inspection) |
+| ISO-12 | Inside the jail the program cannot create raw sockets, create jails or mount filesystems. It cannot use System V IPC unless the capability file sets `sysv_ipc: true`; then the jail has a System V namespace of its own, never the host's, and the kernel destroys it with the jail. | System V IPC: holds (tested): `shmget` fails by default, works when granted, and a segment the program leaves behind is gone after the run. The rest by inspection. |
 | ISO-13 | The program receives exactly the arguments given after the binary on the command line. | Holds (tested) with 200 arguments, and with arguments that look like isolate's own options. |
+| ISO-14 | The program can look up its own user and group by id and by name. The jail's user database names no other user of the host and holds no password hash, and the program cannot read `master.passwd` or `spwd.db`. | Holds (tested), for `user: auto` and for an existing user. |
 
 ## Default behaviour that is not an invariant
 
@@ -88,8 +92,10 @@ All of these, observed from inside the jail on a run with only library and `/bin
 5. With `env_clear: true`, a variable exported in the invoking shell is absent.
 6. `ls /dev` lists only the nodes named above.
 7. No descriptor above 2 is open.
+8. `getpwuid(getuid())` returns the program's user.
+9. `shmget` fails unless the capability file sets `sysv_ipc: true`.
 
-All seven pass.
+All nine pass.
 
 ## Failure criteria
 

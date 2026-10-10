@@ -450,7 +450,9 @@ Directory structure:
 
 ### 3. Create the Capability File
 
-The capability file (`nginx.caps`) defines what the isolated process can access:
+The capability file (`nginx.caps`) defines what the isolated process can access.
+
+> **Note:** This guide keeps the capability file in the workspace for convenience. The workspace is mounted read-write in the jail, so the program could rewrite a capability file stored there and change its own policy for the next run. For anything you depend on, keep it somewhere the jail cannot see, such as `/usr/local/etc/isolate/`, owned by root.
 
 ```ini
 # /var/isolate/nginx/nginx.caps

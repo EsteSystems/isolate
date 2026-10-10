@@ -60,6 +60,7 @@ isolate is a dynamically linked executable. At run time it uses:
 |---|---|
 | `libc`, `libjail` (FreeBSD base) | System calls; `jailparam_*`, `jail_getid`, `jail_getname`. |
 | `/usr/sbin/pw` | Creating and deleting the ephemeral user. |
+| `/usr/sbin/pwd_mkdb` | Building the user database in the jail's `/etc`. |
 | `/sbin/ifconfig` | Moving an interface into a VNET jail, configuring it, and taking it back. |
 | `/sbin/devfs` | Hiding device nodes in the jail's `/dev`. |
 | A kernel with jails, nullfs and devfs | Always. |
@@ -89,6 +90,7 @@ pub const Capabilities = struct {
 
     env_vars: std.ArrayList(EnvVar),
     env_clear: bool,
+    sysv_ipc: bool,                    // private System V IPC namespace
 
     limits: ResourceLimits,            // memory_bytes, max_processes, max_files
 };
@@ -146,7 +148,7 @@ pub const CapabilityHint = struct {
 
 Nothing is written anywhere else. In particular nothing is created under `/tmp`.
 
-The jail root contains a copy of the program at `/<basename>`, a two-line `etc/passwd` and `etc/group`, devfs at `dev`, and empty directories that the rules mount over. The full list is in [design/01-isolation.md](design/01-isolation.md).
+The jail root contains a copy of the program at `/<basename>`, a user database in `etc` holding root and the program's user, devfs at `dev`, and empty directories that the rules mount over. The full list is in [design/01-isolation.md](design/01-isolation.md).
 
 ## Execution flow
 
@@ -168,7 +170,7 @@ main: parse arguments (options only before the binary)
       directories                            the child failed: report, exit
       nullfs  workspace → /workspace       c write the registry entry
       copy the binary to /<basename>         (exclusive; on failure stop the child)
-      write etc/passwd, etc/group          d waitpid(child)
+      build the user database in etc/      d waitpid(child)
       mount devfs; hide all but a          e VNET: ifconfig <if> -vnet <jid>
         few nodes (devfs rule apply)         jail_remove
       nullfs  one mount per rule             unmount everything under the
@@ -232,6 +234,7 @@ Reads `kern.racct.enable`, `kern.features.vimage`, `security.jail.jailed`, `kern
 | Remove a directory tree | `fts(3)` with `FTS_PHYSICAL | FTS_XDEV` |
 | Resource limits | `rctl_add_rule(2)`, `rctl_remove_rule(2)`, `rctl_get_rules(2)` |
 | Create and delete the user | `fork` + `execv("/usr/sbin/pw")` |
+| The jail's user database | `fork` + `execv("/usr/sbin/pwd_mkdb")` |
 | VNET interface | `fork` + `execv("/sbin/ifconfig")`: `vnet`, `-j <jid> … up`, `-vnet` |
 | Drop privileges | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | Start the program | `closefrom(2)`, `execv(2)` |
@@ -246,6 +249,7 @@ Reads `kern.racct.enable`, `kern.features.vimage`, `security.jail.jailed`, `kern
 | `allow.raw_sockets` | false |
 | `allow.socket_af` | true |
 | `allow.sysvipc` | false |
+| `sysvshm`, `sysvsem`, `sysvmsg` | `new`, with `sysv_ipc: true` |
 | `ip4`, `ip6` | `inherit` or `disable`, by network mode |
 | `vnet` | `new`, in VNET mode (instead of `ip4`/`ip6`) |
 
@@ -277,9 +281,9 @@ Output goes to stdout and stderr through unbuffered, streaming writers, so that 
 
 ## Tests
 
-`zig build test` runs the unit tests of every module: 45 on FreeBSD, 35 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry, generated capability files, and small helpers. None of them creates a jail.
+`zig build test` runs the unit tests of every module: 46 on FreeBSD, 36 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry, generated capability files, and small helpers. None of them creates a jail.
 
-`tests/scenarios.sh` does. It needs FreeBSD and root, creates real jails, users, mounts, limits and an epair interface, and makes about 70 checks, each labelled with the invariant it demonstrates. It refuses to start on a host that already has isolate leftovers, and its last check is that it left none. Run it with `doas sh tests/scenarios.sh` after `zig build`.
+`tests/scenarios.sh` does. It needs FreeBSD and root, creates real jails, users, mounts, limits and an epair interface, and makes about 80 checks, each labelled with the invariant it demonstrates. It refuses to start on a host that already has isolate leftovers, and its last check is that it left none. Run it with `doas sh tests/scenarios.sh` after `zig build`.
 
 ## Measurements
 
