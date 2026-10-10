@@ -118,6 +118,16 @@ check ISO-13 "200 arguments arrive" has '^args: 200$'
 run "$BASECAPS" "$W/probe" args -v -c x --name y
 check ISO-13 "isolate's own option names pass through after the binary" has '^args: 5$'
 
+run "$BASECAPS" "$W/probe" self
+check ISO-15 "the program runs from the path it has on the host" has "^self: $W/probe\$"
+(cd "$W" && OUT=$("$I" run -c "$BASECAPS" ./probe self 2>&1); printf '%s\n' "$OUT" > "$W/self.out")
+OUT=$(cat "$W/self.out")
+check ISO-15 "  also when it was named by a relative path" has "^self: $W/probe\$"
+printf '#!/bin/sh\necho overwritten > "$0"\n' > "$W/selfwrite.sh"; chmod 777 "$W/selfwrite.sh"
+run "$BASECAPS" "$W/selfwrite.sh"
+check ISO-15 "  and cannot overwrite itself, even when its file is world-writable" has 'Read-only file system'
+check ISO-15 "  (the file on the host is unchanged)" grep -q 'echo overwritten' "$W/selfwrite.sh"
+
 echo "== Capability file =="
 
 run "$(mkcaps typo 'memroy: 64M')" /bin/ls /
@@ -127,6 +137,15 @@ for bad in 'cpu: 50' 'network_default: deny' 'filesystem_default: deny' 'filesys
     run "$(mkcaps bad "$bad")" /bin/ls /
     check CAP-1 "refused: $bad" rc_not0
 done
+
+run "$(mkcaps overlap 'filesystem: /etc/ssh/ssh_config:r' 'filesystem: /etc/ssh:r')" /bin/ls /etc/ssh
+check CAP-7 "a rule inside another rule's directory is accepted, in either order" has '^ssh_config$'
+run "$(mkcaps conflict 'filesystem: /etc/ssh:r' 'filesystem: /etc/ssh/ssh_config:rw')" /bin/ls /etc/ssh
+check CAP-7 "a read-write rule inside a read-only one is refused" rc_not0
+check CAP-7 "  with a reason" has 'inside the read-only rule'
+mkdir -p "$W/nest"; echo nested > "$W/nest/file"; chmod -R 755 "$W/nest"
+run "$(mkcaps tmpnest 'filesystem: /tmp:rw' "filesystem: $W/nest:r")" /bin/cat "$W/nest/file"
+check CAP-7 "rules for unrelated paths are both mounted" has '^nested$'
 
 run "$(mkcaps file 'filesystem: /etc/hosts:r')" /bin/cat /etc/hosts
 check CAP-1 "a rule for a single file mounts that file" has 'localhost'
@@ -246,6 +265,48 @@ if [ "$(sysctl -n kern.features.vimage 2>/dev/null)" = 1 ] && [ -n "$LANIP" ]; t
     check NET-4 "the interface is back on the host within five seconds" wait_iface "$EPB"
     check LIF-1 "nothing is left after a VNET run" clean_host
 
+    nc -k -l 18998 >/dev/null 2>&1 &
+    NC2=$!
+    anchors() { pfctl -a isolate -s Anchors 2>/dev/null | grep -c 'isolate/isolate-'; }
+    VN="network_mode: vnet:$EPB"
+    IP="network_ip: 10.99.99.2/24"
+    if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' && pfctl -s rules 2>/dev/null | grep -q 'anchor "isolate/\*"'; then
+        run "$(mkcaps nr1 "$VN" "$IP" 'network: tcp:18999:outbound')" "$W/probe" conn 10.99.99.1 18999 10.99.99.1 18998
+        check NET-6 "outbound: the allowed port connects" has '10\.99\.99\.1:18999 connected'
+        check NET-6 "outbound: another port on the same host does not" has '10\.99\.99\.1:18998 failed'
+        check NET-6 "no pf anchor is left after the run" test "$(anchors)" = 0
+
+        run "$(mkcaps nr2 "$VN" "$IP" 'network: tcp:10.99.99.1:18998:outbound')" "$W/probe" conn 10.99.99.1 18998 10.99.99.1 18999
+        check NET-6 "outbound: a rule with an address allows that address and port" has '10\.99\.99\.1:18998 connected'
+        check NET-6 "  and nothing else" has '10\.99\.99\.1:18999 failed'
+
+        run "$(mkcaps nr3 "$VN" "$IP" 'network: none')" "$W/probe" conn 10.99.99.1 18999
+        check NET-6 "network: none blocks everything" has '18999 failed'
+
+        "$I" run -c "$(mkcaps nr4 "$VN" "$IP" 'network: tcp:18001:inbound')" -N scenario-net "$W/probe" listen 30 18001 18002 >"$W/net.log" 2>&1 &
+        M=$!; sleep 3
+        check NET-6 "inbound: the allowed port is reachable from the host" nc -z -w 2 10.99.99.2 18001
+        check NET-6 "inbound: another listening port is not" sh -c '! nc -z -w 2 10.99.99.2 18002'
+        check NET-6 "the rules are in an anchor named after the jail" test "$(anchors)" = 1
+        kill -9 $M; sleep 1
+        OUT=$("$I" clean 2>&1); RC=$?
+        check NET-6 "clean removes the rules of an orphaned instance" test "$(anchors)" = 0
+        wait_iface "$EPB"
+    else
+        run "$(mkcaps nr1 "$VN" "$IP" 'network: tcp:18999:outbound')" "$W/probe" conn 10.99.99.1 18999
+        check NET-6 "without pf and isolate's anchor, a file with network rules is refused" rc_not0
+        check NET-6 "  and the program never ran" lacks '^conn:'
+        skip NET-6 "pf is not enabled with isolate's anchor; enforcement not exercised"
+    fi
+    kill $NC2 2>/dev/null
+
+    run "$(mkcaps nrinherit 'network: tcp:443:outbound')" "$W/probe" conn 10.99.99.1 18999
+    check NET-6 "network rules without a VNET jail are refused" rc_not0
+    check NET-6 "  with a reason" has 'network rules need network_mode: vnet'
+    check NET-6 "  and the program never ran" lacks '^conn:'
+    run "$(mkcaps nrbad "$VN" 'network: tcp:example.com:443:outbound')" "$W/probe" conn 10.99.99.1 18999
+    check NET-6 "a rule with a host name is refused" rc_not0
+
     run "$(mkcaps vnetbad 'network_mode: vnet:nosuchif9')" "$W/probe" conn 10.99.99.1 18999
     check NET-5 "an interface that does not exist stops the run" rc_not0
     check NET-5 "  and the program never ran" lacks '^conn:'
@@ -265,6 +326,23 @@ check DET-1 "detect runs unprivileged" rc_is 0
 "$I" detect "$W/hello" >/dev/null 2>&1
 run "$W/hello.caps" "$W/hello"
 check DET-2 "a generated file runs the program unedited" has 'Hello from isolated world'
+for bin in /bin/ls /usr/bin/ssh /usr/sbin/sshd /usr/local/sbin/nginx /usr/local/bin/postgres; do
+    [ -x "$bin" ] || continue
+    "$I" detect -o "$W/closure.caps" "$bin" >/dev/null 2>&1
+    grep '^filesystem: .*:r$' "$W/closure.caps" | sed 's/^filesystem: //; s/:r$//' | grep -v '/ld-elf' | sort > "$W/closure.ours"
+    ldd "$bin" 2>/dev/null | awk '/=>/ {print $3}' | sort > "$W/closure.ldd"
+    check DET-6 "the libraries listed for $bin are the ones ldd reports" cmp -s "$W/closure.ours" "$W/closure.ldd"
+done
+"$I" detect -o "$W/find.caps" /usr/bin/find >/dev/null 2>&1
+run "$W/find.caps" /usr/bin/find / -type f
+check DET-6 "a jail built from a generated file holds the program's libraries" has '^/lib/libc\.so\.7$'
+check DET-6 "  and no other library" lacks '^/lib/libm\.so|^/usr/lib/|^/lib/libz'
+"$I" detect -o "$W/ssh.caps" /usr/bin/ssh >/dev/null 2>&1
+check DET-7 "nothing guessed from strings is live (no rule under /etc)" sh -c "! grep -q '^filesystem: /etc' '$W/ssh.caps'"
+check DET-7 "  but the guesses are there as comments" grep -q '^#.*filesystem: /etc/ssh' "$W/ssh.caps"
+run "$W/ssh.caps" /usr/bin/ssh -V
+check DET-2 "the file generated for ssh runs it unedited" has 'OpenSSH'
+
 for bin in /usr/local/sbin/nginx /usr/sbin/sshd /bin/sh; do
     [ -x "$bin" ] || continue
     "$I" detect -o "$W/gen.caps" "$bin" >/dev/null 2>&1
