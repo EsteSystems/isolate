@@ -269,6 +269,10 @@ fn checkProcessState(pid: i64, jail_id: i64) InstanceState {
     if (builtin.os.tag == .freebsd) {
         // Check if jail exists
         const c = @cImport({
+            // Release builds define _FORTIFY_SOURCE, and the fortified libc wrappers do
+            // not survive translate-c; they add nothing for calls made from Zig.
+            @cUndef("_FORTIFY_SOURCE");
+            @cDefine("_FORTIFY_SOURCE", "0");
             @cInclude("sys/param.h");
             @cInclude("sys/uio.h");
             @cInclude("sys/jail.h");

@@ -14,6 +14,10 @@ comptime {
 }
 
 const c = @cImport({
+    // Release builds define _FORTIFY_SOURCE, and the fortified libc wrappers do
+    // not survive translate-c; they add nothing for calls made from Zig.
+    @cUndef("_FORTIFY_SOURCE");
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("sys/types.h");
     @cInclude("sys/sysctl.h");
 });
@@ -80,6 +84,10 @@ pub fn detect() SystemCapabilities {
         .is_root = blk: {
             // Use C geteuid since we're on FreeBSD
             const c_unistd = @cImport({
+                // Release builds define _FORTIFY_SOURCE, and the fortified libc wrappers do
+                // not survive translate-c; they add nothing for calls made from Zig.
+                @cUndef("_FORTIFY_SOURCE");
+                @cDefine("_FORTIFY_SOURCE", "0");
                 @cInclude("unistd.h");
             });
             break :blk c_unistd.geteuid() == 0;
