@@ -118,6 +118,8 @@ Options:
 - `-v, --verbose`: Verbose output
 - `-n, --dry-run`: Show configuration without executing
 
+Options must come before the binary. Everything after it is passed to the binary unchanged, so `isolate run -v ./myapp -v --port 80` gives `-v --port 80` to `myapp`. Use `--` if the binary's own name starts with a dash.
+
 #### `isolate detect [options] <binary> [output.caps]`
 
 Analyze a binary and generate a capability file.
@@ -196,7 +198,9 @@ user: auto                    # Create ephemeral user (recommended)
 # user: nobody                # Use existing user
 
 # Resource limits
-memory: 256M                  # Memory limit (K, M, G suffixes)
+memory: 256M                  # Resident memory limit (K, M, G suffixes); the
+                              # process is killed when it exceeds it. Usage is
+                              # sampled about once a second.
 processes: 10                 # Maximum processes
 files: 512                    # File descriptor limit (minimum 512 for fork)
 
@@ -264,6 +268,8 @@ filesystem: /lib:r
 filesystem: /usr/lib:r
 filesystem: /libexec:r
 ```
+
+isolate configures the address with the host's `ifconfig -j`, so the jail does not need `/sbin` mounted. The loopback interface is brought up automatically.
 
 **Run with VNET:**
 ```sh

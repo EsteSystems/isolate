@@ -61,10 +61,9 @@ extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
 extern var environ: [*c][*c]u8;
 var empty_environ = [_:null]?[*:0]u8{};
 
-/// Unbuffered stdout writer. Unbuffered so that nothing is left behind in a
-/// buffer across fork()/execv()/_exit() in the isolation path.
+/// Unbuffered, streaming stdout writer (see stdoutWriter in main.zig)
 fn stdoutWriter(io: std.Io) std.Io.File.Writer {
-    return std.Io.File.stdout().writer(io, &.{});
+    return std.Io.File.stdout().writerStreaming(io, &.{});
 }
 
 // ============================================================================
@@ -530,8 +529,64 @@ pub fn lookupUser(username: []const u8) !struct { uid: u32, gid: u32 } {
 // Resource Limits (rctl)
 // ============================================================================
 
-// rctl syscall wrapper - not available in standard headers
+// rctl syscall wrappers - not available in standard headers
 extern fn rctl_add_rule(inbufp: [*]const u8, inbuflen: usize, outbufp: [*]u8, outbuflen: usize) c_int;
+extern fn rctl_remove_rule(inbufp: [*]const u8, inbuflen: usize, outbufp: [*]u8, outbuflen: usize) c_int;
+extern fn rctl_get_rules(inbufp: [*]const u8, inbuflen: usize, outbufp: [*]u8, outbuflen: usize) c_int;
+
+/// Prefix of every jail name isolate creates (isolate-<pid of the jailed process>)
+const jail_name_prefix = "isolate-";
+
+/// Remove every rctl rule attached to the named jail. Rules are keyed by
+/// jail name and outlive the jail, so without this they pile up and - since
+/// the name is derived from a PID - would apply to a later jail that
+/// happens to get the same name.
+pub fn removeResourceLimits(jail_name: []const u8) void {
+    var filter_buf: [128]u8 = undefined;
+    var out_buf: [16]u8 = undefined;
+    const filter = std.fmt.bufPrintZ(&filter_buf, "jail:{s}", .{jail_name}) catch return;
+    _ = rctl_remove_rule(filter.ptr, filter.len + 1, &out_buf, out_buf.len);
+}
+
+/// Same, for the jail of the instance whose jailed process had this PID
+pub fn removeResourceLimitsForPid(pid: i32) void {
+    var name_buf: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, jail_name_prefix ++ "{d}", .{pid}) catch return;
+    removeResourceLimits(name);
+}
+
+var rules_buf: [256 * 1024]u8 = undefined;
+
+/// Remove the rctl rules of isolate jails that no longer exist. Returns
+/// the number of jails whose rules were removed.
+pub fn purgeStaleLimits() u32 {
+    if (rctl_get_rules("::", 3, &rules_buf, rules_buf.len) != 0) return 0;
+    const rules = std.mem.sliceTo(&rules_buf, 0);
+
+    var purged: u32 = 0;
+    var last_buf: [64]u8 = undefined;
+    var last: []const u8 = "";
+
+    var it = std.mem.splitScalar(u8, rules, ',');
+    while (it.next()) |rule| {
+        const prefix = "jail:" ++ jail_name_prefix;
+        if (!std.mem.startsWith(u8, rule, prefix)) continue;
+        const rest = rule["jail:".len..];
+        const name = rest[0 .. std.mem.findScalar(u8, rest, ':') orelse continue];
+        if (name.len >= last_buf.len or std.mem.eql(u8, name, last)) continue;
+
+        var name_z: [64]u8 = undefined;
+        @memcpy(name_z[0..name.len], name);
+        name_z[name.len] = 0;
+        if (c.jail_getid(&name_z) >= 0) continue; // jail still exists
+
+        removeResourceLimits(name);
+        @memcpy(last_buf[0..name.len], name);
+        last = last_buf[0..name.len];
+        purged += 1;
+    }
+    return purged;
+}
 
 // Cached system capabilities (detected once)
 var cached_sys_caps: ?syscheck.SystemCapabilities = null;
@@ -567,8 +622,13 @@ pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.Resourc
     }
 
     if (limits.memory_bytes) |mem| {
-        if (std.fmt.bufPrint(&rule_buf, "jail:{s}:memoryuse:deny={d}\x00", .{ jail_name, mem })) |formatted| {
-            stdout.print("Setting memory limit: {d} bytes\n", .{mem}) catch {};
+        // The limit is on resident memory, and the action is sigkill:
+        // memoryuse:deny denies nothing (the kernel only tries to page the
+        // excess out, and the process keeps allocating). The kernel samples
+        // usage about once a second, so a process can overshoot briefly
+        // before it is killed.
+        if (std.fmt.bufPrint(&rule_buf, "jail:{s}:memoryuse:sigkill={d}\x00", .{ jail_name, mem })) |formatted| {
+            stdout.print("Setting memory limit: {d} bytes (process is killed above it)\n", .{mem}) catch {};
             const ret = rctl_add_rule(&rule_buf, formatted.len, &out_buf, out_buf.len);
             if (ret != 0) {
                 stdout.print("Warning: Failed to set memory limit (rctl error)\n", .{}) catch {};
@@ -711,12 +771,17 @@ pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, netw
                 configureJailInterface(jid, iface, ip) catch |err| {
                     stdout.print("Warning: Failed to configure IP {s}: {}\n", .{ ip, err }) catch {};
                 };
-                // Also configure loopback
-                configureJailInterface(jid, "lo0", "127.0.0.1/8") catch {};
+            } else {
+                stdout.print("Note: No network_ip set; {s} is in the jail but has no address\n", .{iface}) catch {};
             }
         } else {
             stdout.print("Note: VNET jail created but no interface specified (use --vnet <interface>)\n", .{}) catch {};
         }
+
+        // A new network stack starts with an unconfigured loopback
+        configureJailInterface(jid, "lo0", "127.0.0.1/8") catch {
+            stdout.print("Warning: Failed to configure loopback in jail\n", .{}) catch {};
+        };
     }
 
     return jid;
@@ -746,7 +811,9 @@ fn moveInterfaceToJail(jid: i32, ifname: []const u8) !void {
     safeExec("/sbin/ifconfig", &argv) catch return error.JailParamFailed;
 }
 
-/// Configure an interface inside a jail using jexec
+/// Configure an interface that lives in a jail's network stack. Runs the
+/// host's ifconfig with -j rather than executing anything inside the jail,
+/// whose filesystem has no /sbin/ifconfig unless a rule happens to mount it.
 fn configureJailInterface(jid: i32, ifname: []const u8, ip: []const u8) !void {
     var jid_buf: [16]u8 = undefined;
     var ifname_buf: [64]u8 = undefined;
@@ -763,12 +830,11 @@ fn configureJailInterface(jid: i32, ifname: []const u8, ip: []const u8) !void {
     @memcpy(ip_buf[0..ip.len], ip);
     ip_buf[ip.len] = 0;
 
-    // Use jexec to run ifconfig inside the jail
-    // jexec <jid> /sbin/ifconfig <ifname> inet <ip> up
+    // ifconfig -j <jid> <ifname> inet <ip> up
     const argv: [8]?[*:0]const u8 = .{
-        "/usr/sbin/jexec",
-        @ptrCast(&jid_buf),
         "/sbin/ifconfig",
+        "-j",
+        @ptrCast(&jid_buf),
         @ptrCast(&ifname_buf),
         "inet",
         @ptrCast(&ip_buf),
@@ -776,7 +842,7 @@ fn configureJailInterface(jid: i32, ifname: []const u8, ip: []const u8) !void {
         null,
     };
 
-    safeExec("/usr/sbin/jexec", &argv) catch return error.JailParamFailed;
+    safeExec("/sbin/ifconfig", &argv) catch return error.JailParamFailed;
 }
 
 /// Attach to a jail
@@ -809,8 +875,8 @@ pub fn jailExists(jid: i32) bool {
 
 /// Tear down what an instance left behind when the isolate process that
 /// managed it is gone: the jail (which kills anything still running in
-/// it), the instance directory, and the ephemeral user.
-pub fn teardownInstance(io: std.Io, jail_id: i32, jail_path: []const u8, username: []const u8) void {
+/// it), its resource limits, the instance directory, and the ephemeral user.
+pub fn teardownInstance(io: std.Io, pid: i32, jail_id: i32, jail_path: []const u8, username: []const u8) void {
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
 
@@ -818,6 +884,7 @@ pub fn teardownInstance(io: std.Io, jail_id: i32, jail_path: []const u8, usernam
         stdout.print("Removing jail JID {d}\n", .{jail_id}) catch {};
         removeJail(jail_id);
     }
+    removeResourceLimitsForPid(pid);
 
     if (jail_path.len > 0) {
         const inst_dir = instanceDir(jail_path);
@@ -1147,7 +1214,11 @@ pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_
 
     // Generate unique jail name
     const pid = c.getpid();
-    const jail_name = std.fmt.bufPrint(&jail_name_buf, "isolate-{d}", .{pid}) catch return error.InvalidPath;
+    const jail_name = std.fmt.bufPrint(&jail_name_buf, jail_name_prefix ++ "{d}", .{pid}) catch return error.InvalidPath;
+
+    // Rules left over from an earlier jail that had the same name (a reused
+    // PID after a crash) must not apply to this one
+    removeResourceLimits(jail_name);
 
     // Determine username and create user
     var target_uid: u32 = 0;

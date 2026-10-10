@@ -44,14 +44,17 @@ const c = c_api.c;
 pub const version = "0.3.0-zig";
 
 /// Unbuffered stdout writer. Unbuffered so that nothing is left behind in a
-/// buffer across fork()/execv()/_exit() in the isolation path.
+/// buffer across fork()/execv()/_exit() in the isolation path. Streaming
+/// (write(2), not pwrite(2)): a positional writer keeps its own offset, so
+/// with output redirected to a file every writer - and the jailed program
+/// sharing the descriptor - would overwrite the others from offset 0.
 fn stdoutWriter(io: std.Io) std.Io.File.Writer {
-    return std.Io.File.stdout().writer(io, &.{});
+    return std.Io.File.stdout().writerStreaming(io, &.{});
 }
 
 /// Unbuffered stderr writer.
 fn stderrWriter(io: std.Io) std.Io.File.Writer {
-    return std.Io.File.stderr().writer(io, &.{});
+    return std.Io.File.stderr().writerStreaming(io, &.{});
 }
 
 /// Subcommands
@@ -182,50 +185,56 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !ParsedAr
     return result;
 }
 
-/// Parse run command arguments
+/// Parse run command arguments. Options are only recognized before the
+/// target binary; everything after it belongs to the binary, so
+/// `isolate run -v ./app -v --port 80` passes `-v --port 80` to the app.
+/// A `--` ends option parsing explicitly.
 fn parseRunArgs(opts: *RunOptions, args: []const [:0]const u8, allocator: std.mem.Allocator) !void {
-    var positional: std.ArrayList([]const u8) = .empty;
-    defer positional.deinit(allocator);
-
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
-        if (std.mem.startsWith(u8, arg, "-")) {
-            if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--caps")) {
-                i += 1;
-                if (i >= args.len) return error.MissingArgument;
-                opts.caps_file = args[i];
-            } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--workspace")) {
-                i += 1;
-                if (i >= args.len) return error.MissingArgument;
-                opts.workspace_dir = args[i];
-            } else if (std.mem.eql(u8, arg, "-N") or std.mem.eql(u8, arg, "--name")) {
-                i += 1;
-                if (i >= args.len) return error.MissingArgument;
-                opts.name = args[i];
-            } else if (std.mem.eql(u8, arg, "--vnet")) {
-                i += 1;
-                if (i >= args.len) return error.MissingArgument;
-                opts.vnet_interface = args[i];
-            } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
-                opts.verbose = true;
-            } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--dry-run")) {
-                opts.dry_run = true;
-            } else {
-                std.debug.print("Unknown option: {s}\n", .{arg});
-                return error.UnknownOption;
-            }
+        if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            break;
+        }
+        if (!std.mem.startsWith(u8, arg, "-")) break;
+
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--caps")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            opts.caps_file = args[i];
+        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--workspace")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            opts.workspace_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "-N") or std.mem.eql(u8, arg, "--name")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            opts.name = args[i];
+        } else if (std.mem.eql(u8, arg, "--vnet")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            opts.vnet_interface = args[i];
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            opts.verbose = true;
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--dry-run")) {
+            opts.dry_run = true;
         } else {
-            try positional.append(allocator, arg);
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
         }
     }
 
-    // First positional is target binary
-    if (positional.items.len > 0) {
-        opts.target_binary = positional.items[0];
-        if (positional.items.len > 1) {
-            opts.binary_args = try allocator.dupe([]const u8, positional.items[1..]);
+    // The first remaining argument is the target binary, the rest are its
+    // arguments, whatever they look like
+    if (i < args.len) {
+        opts.target_binary = args[i];
+        const rest = args[i + 1 ..];
+        if (rest.len > 0) {
+            const binary_args = try allocator.alloc([]const u8, rest.len);
+            for (rest, binary_args) |src, *dst| dst.* = src;
+            opts.binary_args = binary_args;
         }
     }
 }
@@ -696,7 +705,7 @@ fn stopInstance(io: std.Io, allocator: std.mem.Allocator, name: []const u8, forc
         return 0;
     }
 
-    freebsd.teardownInstance(io, inst.jail_id, inst.jail_path, inst.username);
+    freebsd.teardownInstance(io, inst.pid, inst.jail_id, inst.jail_path, inst.username);
     reg.unregister(name);
     try stdout.print("Instance '{s}' stopped and unregistered.\n", .{name});
 
@@ -728,7 +737,7 @@ fn cleanOrphans(io: std.Io, allocator: std.mem.Allocator, reg: *registry.Registr
             if (inst.manager_pid > 0 and c.kill(inst.manager_pid, 0) == 0) continue;
 
             try stdout.print("Instance '{s}' is orphaned (state: {s}, isolate process gone)\n", .{ inst.name, @tagName(inst.state) });
-            freebsd.teardownInstance(io, inst.jail_id, inst.jail_path, inst.username);
+            freebsd.teardownInstance(io, inst.pid, inst.jail_id, inst.jail_path, inst.username);
             reg.unregister(inst.name);
             cleaned += 1;
         }
@@ -765,6 +774,11 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
 
     // Also clean any orphaned instance directories
     if (builtin.os.tag == .freebsd and c.geteuid() == 0) {
+        const purged = freebsd.purgeStaleLimits();
+        if (purged > 0) {
+            try stdout.print("Removed resource limits of {d} jail(s) that no longer exist.\n", .{purged});
+        }
+
         try stdout.print("Checking for orphaned instance directories...\n", .{});
 
         // Instances that are still running keep their directories
@@ -1109,6 +1123,7 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
 
             // Cleanup using native Zig implementation
             freebsd.cleanupIsolation(io);
+            freebsd.removeResourceLimitsForPid(pid);
 
             // Unregister instance
             reg.unregister(instance.name);
@@ -1180,9 +1195,72 @@ test {
     }
 }
 
-test "parse args - help" {
-    // Basic test that parsing infrastructure works
-    // Full argument parsing tests would go here
+test "parseArgs: no arguments and help" {
+    const allocator = std.testing.allocator;
+    var none = try parseArgs(allocator, &.{"isolate"});
+    defer none.deinit();
+    try std.testing.expectEqual(Command.help, none.command);
+
+    var help = try parseArgs(allocator, &.{ "isolate", "--help" });
+    defer help.deinit();
+    try std.testing.expectEqual(Command.help, help.command);
+}
+
+test "parseRunArgs: options before the binary" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseArgs(allocator, &.{ "isolate", "run", "-v", "-c", "x.caps", "-N", "name", "./app", "a", "b" });
+    defer parsed.deinit();
+    const opts = parsed.run_opts;
+    try std.testing.expectEqual(Command.run, parsed.command);
+    try std.testing.expect(opts.verbose);
+    try std.testing.expectEqualStrings("x.caps", opts.caps_file.?);
+    try std.testing.expectEqualStrings("name", opts.name.?);
+    try std.testing.expectEqualStrings("./app", opts.target_binary.?);
+    try std.testing.expectEqual(@as(usize, 2), opts.binary_args.len);
+    try std.testing.expectEqualStrings("b", opts.binary_args[1]);
+}
+
+test "parseRunArgs: options after the binary belong to the binary" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseArgs(allocator, &.{ "isolate", "run", "./app", "-v", "--port", "80", "-n", "-c", "other" });
+    defer parsed.deinit();
+    const opts = parsed.run_opts;
+    try std.testing.expect(!opts.verbose);
+    try std.testing.expect(!opts.dry_run);
+    try std.testing.expect(opts.caps_file == null);
+    try std.testing.expectEqualStrings("./app", opts.target_binary.?);
+    try std.testing.expectEqual(@as(usize, 6), opts.binary_args.len);
+    try std.testing.expectEqualStrings("-v", opts.binary_args[0]);
+    try std.testing.expectEqualStrings("other", opts.binary_args[5]);
+}
+
+test "parseRunArgs: -- ends options" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseArgs(allocator, &.{ "isolate", "run", "-n", "--", "-odd-name", "-x" });
+    defer parsed.deinit();
+    const opts = parsed.run_opts;
+    try std.testing.expect(opts.dry_run);
+    try std.testing.expectEqualStrings("-odd-name", opts.target_binary.?);
+    try std.testing.expectEqual(@as(usize, 1), opts.binary_args.len);
+    try std.testing.expectEqualStrings("-x", opts.binary_args[0]);
+}
+
+test "parseRunArgs: errors" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.MissingArgument, parseArgs(allocator, &.{ "isolate", "run", "-c" }));
+
+    var no_binary = try parseArgs(allocator, &.{ "isolate", "run", "-v" });
+    defer no_binary.deinit();
+    try std.testing.expect(no_binary.run_opts.target_binary == null);
+}
+
+test "parseArgs: legacy form without a subcommand" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseArgs(allocator, &.{ "isolate", "./app", "-x" });
+    defer parsed.deinit();
+    try std.testing.expectEqual(Command.run, parsed.command);
+    try std.testing.expectEqualStrings("./app", parsed.run_opts.target_binary.?);
+    try std.testing.expectEqualStrings("-x", parsed.run_opts.binary_args[0]);
 }
 
 test "version string" {
