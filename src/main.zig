@@ -767,6 +767,27 @@ fn cmdCheck(io: std.Io) !u8 {
 // Isolation Implementation
 // ============================================================================
 
+/// Read exactly buf.len bytes from fd. False on EOF or error.
+fn readFull(fd: c_int, buf: []u8) bool {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = c.read(fd, buf[off..].ptr, buf.len - off);
+        if (n <= 0) return false;
+        off += @intCast(n);
+    }
+    return true;
+}
+
+/// Exit code to propagate for a waited-for child
+fn childExitCode(status: c_int) u8 {
+    if (c.WIFEXITED(status)) {
+        return @intCast(c.WEXITSTATUS(status));
+    } else if (c.WIFSIGNALED(status)) {
+        return @intCast(128 + c.WTERMSIG(status));
+    }
+    return 1;
+}
+
 /// Run isolation using native Zig implementation
 fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const caps.Capabilities, target_binary: []const u8, args: []const []const u8, instance_name: ?[]const u8, verbose: bool) u8 {
     var stdout_file = stdoutWriter(io);
@@ -908,14 +929,28 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             var username: [64]u8 = undefined;
             var jailpath: [freebsd.PATH_MAX]u8 = undefined;
 
-            _ = c.read(pipefd[0], &jid, @sizeOf(c_int));
-            _ = c.read(pipefd[0], &username, 64);
-            _ = c.read(pipefd[0], &jailpath, freebsd.PATH_MAX);
+            const complete = readFull(pipefd[0], std.mem.asBytes(&jid)) and
+                readFull(pipefd[0], &username) and
+                readFull(pipefd[0], &jailpath);
+            _ = c.close(pipefd[0]);
+
+            if (!complete) {
+                // The child failed before it finished setting up and has
+                // already torn down whatever it created; the variables
+                // above hold nothing usable. Just report its exit status.
+                var status: c_int = undefined;
+                _ = c.waitpid(pid, &status, 0);
+                stderr.print("Isolation setup failed; nothing was started\n", .{}) catch {};
+                return childExitCode(status);
+            }
+
+            // The child NUL-terminates both; make sure of it before span()
+            username[username.len - 1] = 0;
+            jailpath[jailpath.len - 1] = 0;
 
             freebsd.freebsd_set_jail_id(jid);
             freebsd.freebsd_set_username(@ptrCast(&username));
             freebsd.freebsd_set_jail_path(@ptrCast(&jailpath));
-            _ = c.close(pipefd[0]);
 
             // Register instance
             var reg = registry.Registry.init(io, allocator);
@@ -964,12 +999,7 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             }
 
             // Return appropriate exit code
-            if (c.WIFEXITED(status)) {
-                return @intCast(c.WEXITSTATUS(status));
-            } else if (c.WIFSIGNALED(status)) {
-                return @intCast(128 + c.WTERMSIG(status));
-            }
-            return 1;
+            return childExitCode(status);
         }
 
         return 0;
