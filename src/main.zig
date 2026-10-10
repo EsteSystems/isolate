@@ -676,7 +676,7 @@ fn stopInstance(io: std.Io, allocator: std.mem.Allocator, name: []const u8, forc
 
     // Signal the jailed process only while its jail still exists: once
     // the jail is gone, the PID may already belong to another process
-    if (inst.state == .running and freebsd.jailExists(inst.jail_id)) {
+    if (inst.state == .running and freebsd.jailBelongsTo(inst.jail_id, inst.pid)) {
         if (c.kill(inst.pid, c.SIGTERM) < 0) {
             try stderr.print("Warning: Failed to send SIGTERM to PID {d}\n", .{inst.pid});
         } else {

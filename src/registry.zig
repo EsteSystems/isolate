@@ -11,9 +11,12 @@ const Io = std.Io;
 // kill(2) with signal 0 is used to probe whether a PID exists
 extern "c" fn kill(pid: std.c.pid_t, sig: c_int) c_int;
 
-/// Registry directory path
+/// Registry directory path. Only root can create entries in /var/run, and
+/// that is the whole trust model of the registry: `stop` and `clean` act as
+/// root on what the entries say (which jail to remove, which directory to
+/// delete). There is deliberately no fallback to a directory other users can
+/// write to.
 pub const REGISTRY_DIR = "/var/run/isolate";
-pub const REGISTRY_DIR_FALLBACK = "/tmp/isolate-registry";
 
 /// Instance names become registry file names (<name>.json) and appear in
 /// paths: letters, digits, '.', '_' and '-' only, not starting with '.',
@@ -86,29 +89,18 @@ pub const Registry = struct {
     const Self = @This();
 
     pub fn init(io: Io, allocator: Allocator) Self {
-        // Try primary directory first, fall back to /tmp
-        const dir = if (Io.Dir.accessAbsolute(io, REGISTRY_DIR, .{})) |_|
-            REGISTRY_DIR
-        else |_|
-            REGISTRY_DIR_FALLBACK;
-
         return .{
             .io = io,
             .allocator = allocator,
-            .registry_dir = dir,
+            .registry_dir = REGISTRY_DIR,
         };
     }
 
-    /// Ensure registry directory exists
+    /// Ensure registry directory exists (root only; 0755 so that
+    /// `isolate list` works unprivileged)
     pub fn ensureDir(self: *Self) !void {
-        Io.Dir.createDirAbsolute(self.io, self.registry_dir, .default_dir) catch |err| {
-            if (err != error.PathAlreadyExists) {
-                // Try fallback
-                self.registry_dir = REGISTRY_DIR_FALLBACK;
-                Io.Dir.createDirAbsolute(self.io, self.registry_dir, .default_dir) catch |err2| {
-                    if (err2 != error.PathAlreadyExists) return err2;
-                };
-            }
+        Io.Dir.createDirAbsolute(self.io, self.registry_dir, @enumFromInt(0o755)) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
         };
     }
 
