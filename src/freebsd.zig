@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const caps = @import("caps.zig");
 const syscheck = @import("syscheck.zig");
+const registry = @import("registry.zig");
 
 // Only compile on FreeBSD
 comptime {
@@ -40,6 +41,16 @@ const c = @cImport({
 });
 
 pub const PATH_MAX = c.PATH_MAX;
+
+/// Root-owned directory that holds the per-instance directories. Only root
+/// can create entries in /var/run, so nobody else can plant a path or a
+/// symlink here for root to follow.
+const runtime_dir = registry.REGISTRY_DIR;
+
+/// The per-instance directory that contains the jail root (`<dir>/root`)
+fn instanceDir(jail_path: []const u8) []const u8 {
+    return std.fs.path.dirname(jail_path) orelse jail_path;
+}
 
 // stat(2) against std.c.Stat; std.c.stat is missing its extern in Zig 0.16
 extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
@@ -920,9 +931,10 @@ pub fn setupFilesystemIsolation(
             // Security: Intercept /tmp mounts to use instance-specific directory
             // This prevents cross-instance information leakage
             if (std.mem.eql(u8, rule.path, "/tmp")) {
-                // Create instance-specific tmp directory on host
+                // Create the instance-specific tmp directory inside the
+                // per-instance directory, next to the jail root
                 var instance_tmp_buf: [PATH_MAX]u8 = undefined;
-                const instance_tmp = std.fmt.bufPrint(&instance_tmp_buf, "/tmp{s}", .{jail_path}) catch continue;
+                const instance_tmp = std.fmt.bufPrint(&instance_tmp_buf, "{s}/tmp", .{instanceDir(jail_path)}) catch continue;
 
                 stdout.print("Creating isolated tmp: {s}\n", .{instance_tmp}) catch {};
                 mkdirp(instance_tmp) catch {
@@ -1082,13 +1094,27 @@ pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_
         stdout.print("Using existing user {s} (UID {d}, GID {d})\n", .{ username, target_uid, target_gid }) catch {};
     }
 
+    // Create the per-instance directory under the root-owned runtime
+    // directory with an unpredictable name. It must never live under /tmp:
+    // any local user can pre-create /tmp paths and plant symlinks there for
+    // the chmod/mount/copy below to follow as root.
+    mkdirp(runtime_dir) catch return error.FilesystemSetupFailed;
+
+    var inst_buf: [PATH_MAX]u8 = undefined;
+    const inst_template = std.fmt.bufPrintZ(&inst_buf, "{s}/inst-XXXXXX", .{runtime_dir}) catch return error.InvalidPath;
+    if (c.mkdtemp(inst_template.ptr) == null) return error.FilesystemSetupFailed;
+    // mkdtemp creates the directory 0700; the jail root must be traversable
+    // by the application user
+    _ = std.c.chmod(inst_template.ptr, 0o755);
+
     // Create jail filesystem
-    const jail_path = std.fmt.bufPrint(&jail_state.jail_root_path, "/tmp/isolate-{s}", .{jail_name}) catch return error.InvalidPath;
+    var jail_path_buf: [PATH_MAX]u8 = undefined;
+    const jail_path_tmp = std.fmt.bufPrint(&jail_path_buf, "{s}/root", .{inst_template}) catch return error.InvalidPath;
+    jail_state.setJailPath(jail_path_tmp);
+    const jail_path = jail_state.getJailPath();
 
     stdout.print("Creating jail filesystem: {s}\n", .{jail_path}) catch {};
 
-    // Clean up any previous jail
-    rmrf(jail_path) catch {};
     mkdirp(jail_path) catch return error.FilesystemSetupFailed;
 
     // Set up filesystem isolation

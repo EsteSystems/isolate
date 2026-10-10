@@ -233,9 +233,10 @@ pub const CapabilityType = enum {
 Creation:
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Generate unique jail name (isolate-<pid>)                │
-│ 2. Create jail root: /tmp/isolate-<name>/                   │
-│ 3. Create directory structure:                              │
-│    /tmp/isolate-<name>/                                     │
+│ 2. Create instance dir: /var/run/isolate/inst-XXXXXX/      │
+│    (mkdtemp; root-owned parent, unpredictable name)         │
+│ 3. Create jail root inside it:                              │
+│    /var/run/isolate/inst-XXXXXX/root/                       │
 │    ├── bin/           (empty or minimal)                    │
 │    ├── lib/           (nullfs mount)                        │
 │    ├── libexec/       (nullfs mount)                        │
@@ -323,7 +324,7 @@ Each file contains:
   "name": "myapp-abc123",
   "pid": 12345,
   "jail_id": 5,
-  "jail_path": "/tmp/isolate-isolate-12345",
+  "jail_path": "/var/run/isolate/inst-a1B2c3/root",
   "username": "app-12345",
   "binary_path": "/usr/local/bin/myapp",
   "start_time": 1699900000,

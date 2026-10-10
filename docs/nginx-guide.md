@@ -603,7 +603,7 @@ Host Filesystem                              Jail Filesystem
 /usr/local/sbin               ──nullfs──▶    /usr/local/sbin (read-only)
 /usr/local/etc/nginx          ──nullfs──▶    /usr/local/etc/nginx (read-only)
 /bin                          ──nullfs──▶    /bin (read-only)
-/tmp/isolate-<jail>           ──nullfs──▶    /tmp (read-write, isolated)
+<instance dir>/tmp            ──nullfs──▶    /tmp (read-write, isolated)
 /var/isolate/nginx            ──nullfs──▶    /workspace (read-write)
 
                                              /etc/passwd (generated, minimal)
@@ -611,7 +611,7 @@ Host Filesystem                              Jail Filesystem
                                              /start.sh (copied binary)
 ```
 
-> **Security Note:** Each instance gets its own isolated `/tmp` directory (`/tmp/isolate-<jail-name>`), preventing cross-instance information leakage through temporary files.
+> **Security Note:** Each instance gets its own isolated `/tmp` directory (`/var/run/isolate/inst-XXXXXX/tmp`, next to the jail root), preventing cross-instance information leakage through temporary files.
 
 ### Phase 3: Jail Creation
 
@@ -619,7 +619,7 @@ Host Filesystem                              Jail Filesystem
 # Equivalent jail(8) parameters
 jail -c \
     name=isolate-1316 \
-    path=/tmp/isolate-isolate-1316 \
+    path=/var/run/isolate/inst-a1B2c3/root \
     persist \
     allow.raw_sockets=false \
     allow.socket_af=true \
