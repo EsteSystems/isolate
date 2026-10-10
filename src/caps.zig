@@ -186,6 +186,9 @@ pub const Capabilities = struct {
     env_vars: std.ArrayList(EnvVar),
     env_clear: bool,
 
+    // System V IPC (shared memory, semaphores, message queues), private to the jail
+    sysv_ipc: bool = false,
+
     // Resource limits
     limits: ResourceLimits,
 
@@ -274,6 +277,10 @@ pub const Capabilities = struct {
         try writer.print("  Network rules: {}\n", .{self.network_rules.items.len});
         for (self.network_rules.items) |rule| {
             try writer.print("    {f}\n", .{rule});
+        }
+
+        if (self.sysv_ipc) {
+            try writer.print("  System V IPC: private to the jail\n", .{});
         }
 
         try writer.print("  File rules: {}\n", .{self.file_rules.items.len});
@@ -469,6 +476,13 @@ pub fn isSafeMountPath(path: []const u8) bool {
     return true;
 }
 
+/// true/1/yes or false/0/no; anything else is null
+pub fn parseBool(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "yes")) return true;
+    if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "no")) return false;
+    return null;
+}
+
 /// Parse an environment variable (e.g., "MY_VAR=value")
 pub fn parseEnvVar(allocator: Allocator, env_str: []const u8) ParseError!EnvVar {
     const eq_idx = std.mem.findScalar(u8, env_str, '=') orelse {
@@ -619,14 +633,16 @@ pub fn loadFromReader(allocator: Allocator, reader: *std.Io.Reader) ParseError!P
                 continue;
             };
             try caps.env_vars.append(allocator, env);
-        } else if (std.mem.eql(u8, key, "env_clear")) {
-            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "yes")) {
-                caps.env_clear = true;
-            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "no")) {
-                caps.env_clear = false;
-            } else {
-                const msg = try std.fmt.allocPrint(allocator, "Invalid env_clear: {s} (use true or false)", .{value});
+        } else if (std.mem.eql(u8, key, "env_clear") or std.mem.eql(u8, key, "sysv_ipc")) {
+            const flag = parseBool(value) orelse {
+                const msg = try std.fmt.allocPrint(allocator, "Invalid {s}: {s} (use true or false)", .{ key, value });
                 try problems.append(allocator, .{ .line = line_num, .message = msg });
+                continue;
+            };
+            if (std.mem.eql(u8, key, "env_clear")) {
+                caps.env_clear = flag;
+            } else {
+                caps.sysv_ipc = flag;
             }
         } else if (std.mem.eql(u8, key, "network_mode")) {
             // Parse network isolation mode: inherit, none, or vnet:<interface>
@@ -833,6 +849,29 @@ test "loadFromReader reports every line it cannot apply" {
     }
     try std.testing.expectEqual(@as(?u32, 64), result.caps.limits.max_files);
     try std.testing.expect(result.caps.limits.memory_bytes == null);
+}
+
+test "sysv_ipc is off unless asked for" {
+    const allocator = std.testing.allocator;
+    {
+        var reader: std.Io.Reader = .fixed("user: auto\n");
+        var result = try loadFromReader(allocator, &reader);
+        defer result.deinit();
+        try std.testing.expect(!result.caps.sysv_ipc);
+    }
+    {
+        var reader: std.Io.Reader = .fixed("sysv_ipc: true\n");
+        var result = try loadFromReader(allocator, &reader);
+        defer result.deinit();
+        try std.testing.expect(result.caps.sysv_ipc);
+        try std.testing.expectEqual(@as(usize, 0), result.problems.items.len);
+    }
+    {
+        var reader: std.Io.Reader = .fixed("sysv_ipc: shared\n");
+        var result = try loadFromReader(allocator, &reader);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.problems.items.len);
+    }
 }
 
 test "loadFromReader: last value wins for repeated keys, without leaking" {

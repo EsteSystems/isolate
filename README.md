@@ -16,6 +16,7 @@ Traditional containerization requires learning Docker, Kubernetes, registries, o
 - **Capability Detection**: Analyzes a binary to draft a capability file for you to review
 - **Ephemeral Users**: Creates temporary users per instance for privilege separation
 - **Resource Limits**: Memory, process, and file descriptor limits via rctl
+- **System V IPC on request**: A private shared-memory and semaphore namespace per jail, for programs like PostgreSQL
 - **Network Modes**: Host network, no network, or a VNET stack of its own
 - **Workspace Mounting**: Mount host directories for persistent application data
 - **Instance Management**: Track, list, stop, and clean up running instances
@@ -162,10 +163,15 @@ doas isolate stop myapp-abc123
 
 # Force: if the process ignores SIGTERM, remove the jail (kills everything in it)
 doas isolate stop -f myapp-abc123
+
+# Another signal and a longer wait, e.g. PostgreSQL's fast shutdown
+doas isolate stop -s INT -t 30 myapp-abc123
 ```
 
 Options:
-- `-f, --force`: If the process ignores SIGTERM, remove the jail (which kills everything inside it) and clean up
+- `-f, --force`: If the process is still running after the wait, remove the jail (which kills everything inside it) and clean up
+- `-s, --signal <signal>`: Signal that asks the program to stop: `TERM` (default), `INT`, `QUIT`, `HUP`, `USR1`, `USR2`, `KILL`
+- `-t, --timeout <seconds>`: How long to wait for the program to exit (default 5)
 
 #### `isolate clean`
 
@@ -236,6 +242,9 @@ filesystem: /etc/resolv.conf:r # A single file
 network: tcp:8080:inbound     # Listen on TCP port 8080
 network: tcp:443:outbound     # Connect to TCP port 443
 network: udp:53:outbound      # DNS queries
+
+# System V shared memory, semaphores and message queues, private to the jail
+# sysv_ipc: true              # off by default; PostgreSQL needs it
 
 # Environment variables
 env: PATH=/usr/bin:/bin
@@ -309,6 +318,20 @@ doas isolate run --caps tenant2.caps -w /data/tenant2 ./myapp  # 10.0.100.2
 
 Each jail can reach only the network its own interface is attached to. Tenants on different subnets cannot reach each other unless the host routes between them.
 
+### Running as a Service
+
+isolate does not supervise programs or start them at boot. [`examples/rc.d/isolate`](examples/rc.d/isolate) is an `rc.d` script that does, by running `isolate run` under `daemon(8)`:
+
+```sh
+install -m 555 examples/rc.d/isolate /usr/local/etc/rc.d/isolate
+sysrc isolate_enable=YES isolate_instances=myapp \
+    isolate_myapp_caps=/usr/local/etc/isolate/myapp.caps \
+    isolate_myapp_command="/usr/local/bin/myapp --serve"
+service isolate start
+```
+
+The instance is started at boot, restarted when it exits, stopped at shutdown, and logged to `/var/log/isolate/myapp.log`. The [PostgreSQL guide](docs/postgresql-guide.md) uses it for a database in a VNET jail, including a reboot test.
+
 ## Examples
 
 ### Hello World
@@ -364,7 +387,7 @@ doas isolate stop app-tenant-b
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes how the code is built.
 - [docs/design/](docs/design/README.md) specifies what isolate guarantees: scope, invariants, success and failure criteria, and known gaps.
-- [docs/nginx-guide.md](docs/nginx-guide.md) is a worked example.
+- [docs/nginx-guide.md](docs/nginx-guide.md) and [docs/postgresql-guide.md](docs/postgresql-guide.md) are worked examples, both run as written on FreeBSD 15.1.
 
 ### Module Overview
 
@@ -399,7 +422,7 @@ The unit tests cover parsing and validation and create no jails. The end-to-end 
 zig build && doas sh tests/scenarios.sh
 ```
 
-They create real jails, users, mounts, limits and a network interface, check about 70 behaviours against the [design documents](docs/design/README.md), and verify at the end that nothing was left behind.
+They create real jails, users, mounts, limits and a network interface, check about 85 behaviours against the [design documents](docs/design/README.md), and verify at the end that nothing was left behind.
 
 ## Troubleshooting
 

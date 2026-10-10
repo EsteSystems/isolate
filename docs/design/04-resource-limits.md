@@ -69,8 +69,17 @@ Criteria 1–5 pass on FreeBSD 15.1. Criterion 6 has not been run: the test host
 - A program runs with no limits although its capability file sets some, and isolate does not refuse.
 - A new instance is constrained by a rule left by an old one.
 
+## What the limits count
+
+Two limits count something other than their names suggest. Both were measured running PostgreSQL 19 on FreeBSD 15.1.
+
+- **`files` counts descriptor-table slots, summed over every process in the jail, not open files.** A program that sizes its table generously uses its allowance at once: each PostgreSQL process accounts for about 1,024, and a freshly started server with eight processes for 8,192. Under `files: 2048` its first `fork` fails with `EAGAIN`.
+- **`memory` counts shared memory once for every process that maps it.** With 128 MB of shared buffers, PostgreSQL accounted for 259 MB at idle and 880 MB with 15 connections, while no single process used more than 37 MB. A limit sized for the memory the program really occupies will kill it under load.
+
 ## Known gaps
 
 - **Short memory bursts are not caught.** A program can allocate far beyond its limit if it frees the memory or exits within about a second. Closing this needs a different rule (`vmemoryuse`, or a swap limit) with its own costs; it is undecided.
 - The program is killed without warning at the memory limit. There is no soft limit and no signal it could handle.
 - Limits count the whole jail, so a memory limit of N with several worker processes is shared between them.
+- There is no limit that counts shared memory once. For a program built around a large shared segment, `memory` is hard to size and is best left generous or unset.
+- System V objects are not limited separately; rctl's `shmsize` and `nshm` are not used.

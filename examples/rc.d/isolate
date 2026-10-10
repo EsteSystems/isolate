@@ -1,0 +1,232 @@
+#!/bin/sh
+#
+# Run programs in isolate jails as supervised services, started at boot.
+#
+# isolate itself does not supervise: `isolate run` stays in the foreground
+# for as long as the program runs. This script runs it under daemon(8),
+# which keeps a pidfile, writes the output to a log file, and starts the
+# program again if it exits.
+#
+# Install as /usr/local/etc/rc.d/isolate (mode 555) and configure in
+# /etc/rc.conf. Each instance is named in isolate_instances and described
+# by variables of the form isolate_<instance>_<setting>:
+#
+#   isolate_enable="YES"
+#   isolate_instances="postgres"
+#   isolate_postgres_caps="/usr/local/etc/isolate/postgres.caps"
+#   isolate_postgres_workspace="/var/db/isolate-pg"
+#   isolate_postgres_command="/usr/local/bin/postgres -D /workspace/data"
+#
+# Settings per instance:
+#
+#   caps            capability file                              (required)
+#   command         the program and its arguments                (required)
+#   workspace       directory mounted at /workspace              (none)
+#   restart         start the program again when it exits        (YES)
+#   restart_delay   seconds to wait before starting it again     (5)
+#   stop_signal     signal that asks the program to stop         (TERM)
+#   stop_timeout    seconds to wait before removing the jail     (60)
+#
+# Instance names may contain lower-case letters, digits and underscores.
+# The command is split on whitespace; an argument cannot contain a space.
+#
+# Use:  service isolate start|stop|restart|status [instance ...]
+#
+# Logs go to ${isolate_logdir}/<instance>.log.
+
+# PROVIDE: isolate
+# REQUIRE: LOGIN FILESYSTEMS NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="isolate"
+desc="Programs run in isolate jails"
+rcvar="isolate_enable"
+
+load_rc_config $name
+
+: ${isolate_enable:="NO"}
+: ${isolate_instances:=""}
+: ${isolate_command:="/usr/local/bin/isolate"}
+: ${isolate_logdir:="/var/log/isolate"}
+
+start_cmd="isolate_start"
+stop_cmd="isolate_stop"
+status_cmd="isolate_status"
+extra_commands="status"
+
+# isolate_setting <instance> <setting> [default]
+isolate_setting()
+{
+	eval "echo \"\${isolate_${1}_${2}:-${3}}\""
+}
+
+isolate_pidfile()
+{
+	echo "/var/run/isolate-${1}.pid"
+}
+
+# The pid of an instance's supervisor, if it is running
+isolate_supervisor()
+{
+	local pidfile pid
+	pidfile=$(isolate_pidfile "$1")
+	[ -f "$pidfile" ] || return 1
+	pid=$(cat "$pidfile" 2>/dev/null)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+	echo "$pid"
+}
+
+isolate_valid_name()
+{
+	case "$1" in
+	"" | *[!a-z0-9_]*)
+		warn "invalid instance name '$1': use lower-case letters, digits and underscores"
+		return 1
+		;;
+	esac
+}
+
+isolate_start_one()
+{
+	local inst caps command workspace restart delay log flags ws_args
+	inst=$1
+	isolate_valid_name "$inst" || return 1
+
+	if isolate_supervisor "$inst" >/dev/null; then
+		echo "isolate: $inst is already running"
+		return 0
+	fi
+
+	caps=$(isolate_setting "$inst" caps)
+	command=$(isolate_setting "$inst" command)
+	workspace=$(isolate_setting "$inst" workspace)
+	restart=$(isolate_setting "$inst" restart YES)
+	delay=$(isolate_setting "$inst" restart_delay 5)
+
+	if [ -z "$caps" ] || [ -z "$command" ]; then
+		warn "$inst: set isolate_${inst}_caps and isolate_${inst}_command"
+		return 1
+	fi
+	if [ ! -r "$caps" ]; then
+		warn "$inst: capability file $caps not found"
+		return 1
+	fi
+
+	mkdir -p "$isolate_logdir"
+	log="${isolate_logdir}/${inst}.log"
+
+	flags="-R $delay"
+	case "$restart" in
+	[Nn][Oo] | [Ff][Aa][Ll][Ss][Ee] | 0) flags="" ;;
+	esac
+
+	ws_args=""
+	[ -n "$workspace" ] && ws_args="-w $workspace"
+
+	echo "Starting isolate instance: $inst"
+	# `isolate clean` first: if a previous isolate process died without
+	# cleaning up (a crash, or the machine lost power), the instance's name
+	# is still registered and its jail may still exist. clean only touches
+	# instances whose isolate process is gone.
+	/usr/sbin/daemon -f -H -P "$(isolate_pidfile "$inst")" $flags \
+	    -o "$log" -t "isolate: $inst" \
+	    /bin/sh -c '"$0" clean >/dev/null 2>&1; exec "$0" run "$@"' \
+	    "$isolate_command" -c "$caps" $ws_args -N "$inst" $command
+}
+
+isolate_stop_one()
+{
+	local inst pid signal timeout
+	inst=$1
+	isolate_valid_name "$inst" || return 1
+
+	if ! pid=$(isolate_supervisor "$inst"); then
+		echo "isolate: $inst is not running"
+		return 0
+	fi
+
+	signal=$(isolate_setting "$inst" stop_signal TERM)
+	timeout=$(isolate_setting "$inst" stop_timeout 60)
+
+	echo "Stopping isolate instance: $inst"
+	# Tell the supervisor first, so that it does not start the program
+	# again. It passes SIGTERM on to isolate, which passes it to the program.
+	kill -TERM "$pid" 2>/dev/null
+
+	# Then ask the program to stop with the signal of its choice and wait.
+	# If it is still running after the timeout, remove the jail.
+	if ! "$isolate_command" stop -s "$signal" -t "$timeout" "$inst" >/dev/null 2>&1; then
+		if "$isolate_command" list 2>/dev/null | grep -q "^${inst} "; then
+			warn "$inst did not stop within $timeout seconds; removing its jail"
+			"$isolate_command" stop -f -t 5 "$inst" >/dev/null 2>&1
+		fi
+	fi
+
+	wait_for_pids "$pid"
+}
+
+isolate_status_one()
+{
+	local inst pid
+	inst=$1
+	isolate_valid_name "$inst" || return 1
+
+	if pid=$(isolate_supervisor "$inst"); then
+		if "$isolate_command" list 2>/dev/null | grep -q "^${inst} .* running "; then
+			echo "isolate: $inst is running (supervisor pid $pid)"
+		else
+			echo "isolate: $inst is starting or restarting (supervisor pid $pid)"
+		fi
+	else
+		echo "isolate: $inst is not running"
+		return 1
+	fi
+}
+
+# The instances named on the command line, or all configured ones
+isolate_selected()
+{
+	if [ -n "$rc_extra_args" ]; then
+		echo "$rc_extra_args"
+	else
+		echo "$isolate_instances"
+	fi
+}
+
+isolate_reversed()
+{
+	local out=""
+	for i in "$@"; do out="$i $out"; done
+	echo "$out"
+}
+
+isolate_start()
+{
+	local rc=0
+	for inst in $(isolate_selected); do
+		isolate_start_one "$inst" || rc=1
+	done
+	return $rc
+}
+
+isolate_stop()
+{
+	local rc=0
+	for inst in $(isolate_reversed $(isolate_selected)); do
+		isolate_stop_one "$inst" || rc=1
+	done
+	return $rc
+}
+
+isolate_status()
+{
+	local rc=0
+	for inst in $(isolate_selected); do
+		isolate_status_one "$inst" || rc=1
+	done
+	return $rc
+}
+
+run_rc_command "$@"
