@@ -498,6 +498,13 @@ fn cmdRun(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions) !u8 {
         }
     }
 
+    // Network rules are parsed and listed but not enforced: there is no
+    // firewall integration. Say so rather than let `network: tcp:443:outbound`
+    // look like it restricts anything.
+    if (parse_result.caps.network_rules.items.len > 0) {
+        try stderr.print("Warning: {d} network rule(s) in {s} are not enforced; only network_mode (inherit, none, vnet) controls network access\n", .{ parse_result.caps.network_rules.items.len, caps_file });
+    }
+
     // Set workspace path if specified
     if (opts.workspace_dir) |ws| {
         if (parse_result.caps.workspace_path) |old_wp| {

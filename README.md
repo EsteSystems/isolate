@@ -212,7 +212,8 @@ filesystem: /usr/lib:r        # Read-only access to /usr/lib
 filesystem: /tmp:rw           # Read-write access to /tmp
 filesystem: /data:rw          # Application data directory
 
-# Network access rules (firewall-style, separate from isolation mode)
+# Network access rules - parsed and listed, but NOT enforced (there is no
+# firewall integration yet). Use network_mode to control network access.
 network: tcp:8080:inbound     # Listen on TCP port 8080
 network: tcp:443:outbound     # Connect to TCP port 443
 network: udp:53:outbound      # DNS queries
@@ -312,9 +313,6 @@ cc -o server server.c
 
 # Detect capabilities (will find network usage)
 ../zig-out/bin/isolate detect ./server
-
-# Edit server.caps to allow inbound connections
-echo "network: tcp:8080:inbound" >> ./server.caps
 
 # Run isolated server
 doas ../zig-out/bin/isolate run -v ./server

@@ -421,7 +421,7 @@ isolate protects against:
 1. **Filesystem escape**: Jail root is isolated, only explicit mounts accessible
 2. **Privilege escalation**: Ephemeral unprivileged users, no setuid binaries
 3. **Resource exhaustion**: rctl limits on memory, processes, file descriptors
-4. **Network abuse**: Explicit network rules required for access
+4. **Network abuse**: `network_mode: none` or an isolated VNET stack; `network:` rules are not enforced yet
 5. **Cross-tenant access**: Separate jails, users, and workspaces per instance
 
 ### Trust Boundaries
