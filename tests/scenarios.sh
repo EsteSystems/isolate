@@ -74,6 +74,13 @@ check ISO-3 "a rule without w is read-only" has 'Read-only file system'
 run "$(mkcaps id 'filesystem: /usr/bin:r')" /usr/bin/id
 check ISO-5 "one uid, one group, not root" has '^uid=[1-9][0-9]*(\([^)]*\))? gid=[1-9][0-9]*(\([^)]*\))? groups=[1-9][0-9]*(\([^)]*\))?$'
 
+run "$BASECAPS" "$W/probe" whoami
+check ISO-14 "the program can look its own user up" has '^whoami: uid [0-9]+ is app-[0-9]+$'
+run "$(mkcaps nobody 'user: nobody')" "$W/probe" whoami
+check ISO-14 "  also when it runs as an existing user" has '^whoami: uid 65534 is nobody$'
+run "$BASECAPS" /bin/cat /etc/master.passwd
+check ISO-14 "the jail's password file is not readable by the program" has 'Permission denied'
+
 run "$(mkcaps root 'user: root')" /bin/ls /
 check ISO-6 "user: root is refused" rc_not0
 check ISO-6 "  and says why" has 'Refusing to run as root'
@@ -97,6 +104,14 @@ check ISO-10 "no descriptors beyond stdio are inherited" has '^fds: 0 inherited$
 run "$(mkcaps missing 'filesystem: /nonexistent/isolate-scenario:r')" /bin/ls /
 check ISO-11 "a rule that cannot be mounted stops the run" rc_not0
 check ISO-11 "  and leaves nothing behind" clean_host
+
+SHM_BEFORE=$(ipcs -m | grep -c '^m')
+run "$BASECAPS" "$W/probe" shm
+check ISO-12 "System V shared memory is refused by default" has 'shmget failed'
+run "$(mkcaps sysv 'sysv_ipc: true')" "$W/probe" shm
+check ISO-12 "sysv_ipc: true allows it" has 'segment created and attached'
+OUT=$("$I" run -c "$(mkcaps sysvleak 'sysv_ipc: true' 'env: PROBE_SHM_LEAK=1')" "$W/probe" shm 2>&1); RC=$?
+check ISO-12 "a segment the program leaves behind goes away with the jail" test "$(ipcs -m | grep -c '^m')" = "$SHM_BEFORE"
 
 run "$BASECAPS" "$W/probe" args $(jot 200)
 check ISO-13 "200 arguments arrive" has '^args: 200$'

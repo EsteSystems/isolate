@@ -702,7 +702,7 @@ pub fn setResourceLimits(io: std.Io, jail_name: []const u8, limits: caps.Resourc
 // ============================================================================
 
 /// Create a FreeBSD jail
-pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, network_config: caps.NetworkConfig) !i32 {
+pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, network_config: caps.NetworkConfig, sysv_ipc: bool) !i32 {
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
 
@@ -734,7 +734,7 @@ pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, netw
     };
 
     // Set up jail parameters - need more params for VNET
-    var params: [9]c.struct_jailparam = undefined;
+    var params: [12]c.struct_jailparam = undefined;
     var param_count: usize = 0;
 
     _ = c.jailparam_init(&params[param_count], "name");
@@ -781,9 +781,22 @@ pub fn createJail(io: std.Io, jail_name: []const u8, jail_path: []const u8, netw
         param_count += 1;
     }
 
+    // The host's System V IPC objects are never shared with the jail
     _ = c.jailparam_init(&params[param_count], "allow.sysvipc");
     _ = c.jailparam_import(&params[param_count], "false");
     param_count += 1;
+
+    // On request the jail gets System V shared memory, semaphores and
+    // message queues of its own: a private namespace that the kernel
+    // destroys with the jail. Without it those system calls fail.
+    if (sysv_ipc) {
+        stdout.print("Giving the jail its own System V IPC namespace\n", .{}) catch {};
+        for ([_][:0]const u8{ "sysvshm", "sysvsem", "sysvmsg" }) |param| {
+            _ = c.jailparam_init(&params[param_count], param.ptr);
+            _ = c.jailparam_import(&params[param_count], "new");
+            param_count += 1;
+        }
+    }
 
     stdout.print("Creating jail: {s} at {s}\n", .{ jail_name, jail_path }) catch {};
 
@@ -1259,6 +1272,54 @@ pub fn setupEnvironment(io: std.Io, capability: *const caps.Capabilities, userna
 // Filesystem Isolation Setup
 // ============================================================================
 
+/// Write a file with the given contents and mode
+fn writeFile(path: [:0]const u8, contents: []const u8, mode: c_uint) !void {
+    const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, mode);
+    if (fd < 0) return error.FilesystemSetupFailed;
+    defer _ = c.close(fd);
+
+    var written: usize = 0;
+    while (written < contents.len) {
+        const n = c.write(fd, contents[written..].ptr, contents.len - written);
+        if (n <= 0) return error.FilesystemSetupFailed;
+        written += @intCast(n);
+    }
+}
+
+/// Create etc/master.passwd, etc/passwd, etc/pwd.db, etc/spwd.db and
+/// etc/group in the jail, holding root and the program's user and nothing
+/// else. The databases are built by pwd_mkdb(8) from master.passwd.
+fn writeUserDatabase(jail_path: []const u8, username: []const u8, uid: u32, gid: u32) !void {
+    var etc_buf: [PATH_MAX]u8 = undefined;
+    const etc = std.fmt.bufPrintZ(&etc_buf, "{s}/etc", .{jail_path}) catch return error.InvalidPath;
+
+    var master_buf: [PATH_MAX]u8 = undefined;
+    const master = std.fmt.bufPrintZ(&master_buf, "{s}/master.passwd", .{etc}) catch return error.InvalidPath;
+
+    // name:password:uid:gid:class:change:expire:gecos:home:shell
+    var contents_buf: [512]u8 = undefined;
+    const contents = std.fmt.bufPrint(&contents_buf,
+        \\root:*:0:0::0:0:System Administrator:/root:/usr/sbin/nologin
+        \\{s}:*:{d}:{d}::0:0:Isolated Application:/tmp:/usr/sbin/nologin
+        \\
+    , .{ username, uid, gid }) catch return error.InvalidPath;
+    try writeFile(master, contents, 0o600);
+
+    // -p also writes the plain-text passwd file; -d names the directory
+    const argv: [6]?[*:0]const u8 = .{ "/usr/sbin/pwd_mkdb", "-p", "-d", etc.ptr, master.ptr, null };
+    try safeExec("/usr/sbin/pwd_mkdb", &argv);
+
+    var group_buf: [PATH_MAX]u8 = undefined;
+    const group = std.fmt.bufPrintZ(&group_buf, "{s}/group", .{etc}) catch return error.InvalidPath;
+    var group_contents_buf: [256]u8 = undefined;
+    const group_contents = std.fmt.bufPrint(&group_contents_buf,
+        \\wheel:*:0:root
+        \\{s}:*:{d}:
+        \\
+    , .{ username, gid }) catch return error.InvalidPath;
+    try writeFile(group, group_contents, 0o644);
+}
+
 /// The device nodes left visible in a jail's /dev
 const visible_devices = [_][:0]const u8{
     "null",   "zero",   "full", "random", "urandom",
@@ -1386,45 +1447,15 @@ pub fn setupFilesystemIsolation(
         _ = std.c.chmod(@ptrCast(&buf), 0o755);
     }
 
-    // Create minimal passwd file
-    {
-        const passwd_path = std.fmt.bufPrint(&path_buf, "{s}/etc/passwd", .{jail_path}) catch return error.InvalidPath;
-        var passwd_buf: [PATH_MAX]u8 = undefined;
-        @memcpy(passwd_buf[0..passwd_path.len], passwd_path);
-        passwd_buf[passwd_path.len] = 0;
-
-        const file = c.fopen(&passwd_buf, "w");
-        if (file != null) {
-            var user_buf: [64]u8 = undefined;
-            @memcpy(user_buf[0..username.len], username);
-            user_buf[username.len] = 0;
-
-            _ = c.fprintf(file, "root:*:0:0:System Administrator:/root:/usr/sbin/nologin\n");
-            _ = c.fprintf(file, "%s:*:%u:%u:Isolated Application:/tmp:/usr/sbin/nologin\n", &user_buf, target_uid, target_gid);
-            _ = c.fclose(file);
-            stdout.print("Created minimal passwd file in jail (uid={d}, gid={d})\n", .{ target_uid, target_gid }) catch {};
-        }
-    }
-
-    // Create minimal group file
-    {
-        const group_path = std.fmt.bufPrint(&path_buf, "{s}/etc/group", .{jail_path}) catch return error.InvalidPath;
-        var group_buf: [PATH_MAX]u8 = undefined;
-        @memcpy(group_buf[0..group_path.len], group_path);
-        group_buf[group_path.len] = 0;
-
-        const file = c.fopen(&group_buf, "w");
-        if (file != null) {
-            var user_buf: [64]u8 = undefined;
-            @memcpy(user_buf[0..username.len], username);
-            user_buf[username.len] = 0;
-
-            _ = c.fprintf(file, "wheel:*:0:root\n");
-            _ = c.fprintf(file, "%s:*:%u:\n", &user_buf, target_gid);
-            _ = c.fclose(file);
-            stdout.print("Created minimal group file in jail\n", .{}) catch {};
-        }
-    }
+    // The jail's user database: root and the program's user. FreeBSD's libc
+    // does not read /etc/passwd; getpwuid() and friends read the hashed
+    // /etc/pwd.db, so that is generated too. Without it a program cannot
+    // look up its own user, and some (PostgreSQL) refuse to start.
+    writeUserDatabase(jail_path, username, target_uid, target_gid) catch {
+        stdout.print("Error: Failed to create the user database in the jail\n", .{}) catch {};
+        return error.FilesystemSetupFailed;
+    };
+    stdout.print("Created user database in jail (uid={d}, gid={d})\n", .{ target_uid, target_gid }) catch {};
 
     // Mount devfs and reduce it to what an unprivileged program needs
     stdout.print("Mounting system directories...\n", .{}) catch {};
@@ -1601,7 +1632,7 @@ pub fn createIsolation(io: std.Io, capability: *const caps.Capabilities, target_
     };
 
     // Create jail
-    const jid = createJail(io, jail_name, jail_path, capability.network_config) catch {
+    const jid = createJail(io, jail_name, jail_path, capability.network_config, capability.sysv_ipc) catch {
         cleanupIsolation(io);
         return error.JailCreateFailed;
     };

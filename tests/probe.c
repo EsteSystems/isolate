@@ -8,10 +8,14 @@
  *   probe args ...         report the number of arguments after "args"
  *   probe fds              list open file descriptors from 3 upwards
  *   probe ignore-term      ignore SIGTERM and SIGINT, sleep until killed
+ *   probe shm              create, attach and remove a System V shared memory segment
+ *   probe whoami           look the current uid up in the user database
  */
 
 #include <sys/types.h>
+#include <sys/ipc.h>
 #include <sys/select.h>
+#include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -19,6 +23,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,6 +163,40 @@ probe_ignore_term(void)
 		sleep(1);
 }
 
+static int
+probe_shm(void)
+{
+	int id = shmget(IPC_PRIVATE, 65536, IPC_CREAT | 0600);
+	char *p;
+
+	if (id < 0) {
+		printf("shm: shmget failed: %s\n", strerror(errno));
+		return (0);
+	}
+	p = shmat(id, NULL, 0);
+	if (p == (char *)-1) {
+		printf("shm: shmat failed: %s\n", strerror(errno));
+		return (0);
+	}
+	p[0] = 1;
+	printf("shm: segment created and attached\n");
+	if (getenv("PROBE_SHM_LEAK") == NULL)
+		shmctl(id, IPC_RMID, NULL);
+	return (0);
+}
+
+static int
+probe_whoami(void)
+{
+	struct passwd *pw = getpwuid(getuid());
+
+	if (pw == NULL)
+		printf("whoami: uid %d is not in the user database\n", (int)getuid());
+	else
+		printf("whoami: uid %d is %s\n", (int)getuid(), pw->pw_name);
+	return (0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -180,5 +219,9 @@ main(int argc, char **argv)
 		return (probe_fds());
 	if (strcmp(argv[1], "ignore-term") == 0)
 		return (probe_ignore_term());
+	if (strcmp(argv[1], "shm") == 0)
+		return (probe_shm());
+	if (strcmp(argv[1], "whoami") == 0)
+		return (probe_whoami());
 	return (2);
 }
