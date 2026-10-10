@@ -581,10 +581,16 @@ fn cmdList(io: std.Io, allocator: std.mem.Allocator) !u8 {
             break :blk binary_display[0..30];
         } else inst.binary_path;
 
-        try stdout.print("{s:<20} {d:<8} {d:<8} {s:<10} {s}\n", .{
+        // Format the numbers first: a width on {d} prints a leading '+'
+        var pid_buf: [12]u8 = undefined;
+        var jid_buf: [12]u8 = undefined;
+        const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{inst.pid}) catch "?";
+        const jid_str = std.fmt.bufPrint(&jid_buf, "{d}", .{inst.jail_id}) catch "?";
+
+        try stdout.print("{s:<20} {s:<8} {s:<8} {s:<10} {s}\n", .{
             inst.name,
-            inst.pid,
-            inst.jail_id,
+            pid_str,
+            jid_str,
             state_str,
             binary_path,
         });
