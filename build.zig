@@ -58,22 +58,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Integration tests (separate module)
-    const integration_tests = b.addTest(.{
-        .root_source_file = b.path("src/tests/integration.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    if (is_freebsd) {
-        integration_tests.linkSystemLibrary("jail");
-    }
-    integration_tests.linkLibC();
-
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    const integration_test_step = b.step("test-integration", "Run integration tests");
-    integration_test_step.dependOn(&run_integration_tests.step);
-
     // Build examples
     const hello_exe = b.addExecutable(.{
         .name = "hello",

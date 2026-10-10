@@ -47,7 +47,7 @@ src/
 ├── detect.zig      ELF binary analysis for capability detection
 ├── freebsd.zig     FreeBSD jail implementation
 ├── registry.zig    Instance tracking and persistence
-├── platform.zig    Platform detection and abstraction
+├── syscheck.zig    Kernel feature detection (racct, VNET)
 └── c_api.zig       C library bindings for system calls
 ```
 
@@ -59,18 +59,18 @@ main.zig
 ├── detect.zig
 ├── registry.zig
 ├── freebsd.zig (conditional: FreeBSD only)
-├── platform.zig
+├── syscheck.zig (conditional: FreeBSD only)
 └── c_api.zig
 
 freebsd.zig
 ├── caps.zig
-└── c_api.zig
+└── syscheck.zig
 
 detect.zig
 └── (standalone, uses std only)
 
 registry.zig
-└── c_api.zig (for process state checking)
+└── (standalone, uses std and libjail)
 
 caps.zig
 └── (standalone, uses std only)
@@ -461,7 +461,7 @@ Applications run with minimum required privileges:
 ### Interface Design
 
 ```zig
-// platform.zig defines the abstraction
+// Planned: a platform.zig module defining the abstraction
 pub const Platform = enum {
     freebsd,
     linux,      // Planned

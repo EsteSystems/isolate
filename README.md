@@ -355,7 +355,6 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 | `freebsd.zig` | FreeBSD jail implementation |
 | `syscheck.zig` | System capability detection (racct, VNET) |
 | `registry.zig` | Instance tracking and persistence |
-| `platform.zig` | Platform abstraction layer |
 | `c_api.zig` | C library bindings |
 
 ## Testing

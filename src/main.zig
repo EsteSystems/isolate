@@ -16,7 +16,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c_api = @import("c_api.zig");
-const platform = @import("platform.zig");
 const caps = @import("caps.zig");
 const detect = @import("detect.zig");
 const registry = @import("registry.zig");
