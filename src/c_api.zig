@@ -8,6 +8,10 @@ const builtin = @import("builtin");
 
 // Import system headers for libc functions
 pub const c = @cImport({
+    // Release builds define _FORTIFY_SOURCE, and the fortified libc wrappers do
+    // not survive translate-c; they add nothing for calls made from Zig.
+    @cUndef("_FORTIFY_SOURCE");
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("sys/types.h");
     @cInclude("sys/param.h");
     @cInclude("sys/wait.h");

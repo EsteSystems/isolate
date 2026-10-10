@@ -1,8 +1,8 @@
 # isolate
 
-Infrastructureless container runner using native OS primitives.
+Infrastructureless container runner for FreeBSD.
 
-isolate provides process isolation without requiring container runtimes, orchestration platforms, or image registries. It uses the operating system's native isolation mechanisms (FreeBSD jails, with Linux namespaces planned) to sandbox applications with minimal overhead.
+isolate provides process isolation without requiring container runtimes, orchestration platforms, or image registries. It runs a program from the host inside a FreeBSD jail built for that run, with only the access a capability file declares, and removes everything again when the program ends.
 
 ## Philosophy
 
@@ -12,15 +12,17 @@ Traditional containerization requires learning Docker, Kubernetes, registries, o
 
 ## Features
 
-- **Native OS Isolation**: Uses FreeBSD jails (Linux namespaces planned)
-- **VNET Network Isolation**: Isolated network stacks with user-provided interfaces
-- **Capability Detection**: Automatically analyzes binaries to determine required permissions
+- **Native OS Isolation**: Uses FreeBSD jails
+- **Capability Detection**: Analyzes a binary to draft a capability file for you to review
 - **Ephemeral Users**: Creates temporary users per instance for privilege separation
 - **Resource Limits**: Memory, process, and file descriptor limits via rctl
+- **Network Modes**: Host network, no network, or a VNET stack of its own
 - **Workspace Mounting**: Mount host directories for persistent application data
 - **Instance Management**: Track, list, stop, and clean up running instances
 - **System Capability Check**: Verify kernel features before deployment
-- **Zero Dependencies**: Single static binary, no runtime dependencies
+- **No Daemon, No Images**: One executable that uses only the FreeBSD base system (`libjail`, `pw`, `ifconfig`)
+
+Not everything in the capability file is enforced yet. `network:` rules in particular are parsed but not applied. The [design documents](docs/design/README.md) list what is guaranteed, what is out of scope, and every known gap.
 
 ## Quick Start
 
@@ -52,7 +54,8 @@ doas ./zig-out/bin/isolate clean
 ### Requirements
 
 - Zig 0.16.0 (pinned in `build.zig.zon`)
-- FreeBSD 13.0 or later (for jail support)
+- FreeBSD. Developed and tested on 15.1-RELEASE; earlier releases are untested
+- For resource limits: `kern.racct.enable=1`. For VNET: a kernel with `VIMAGE`. `isolate check` reports both
 - Root privileges for isolation (detection works without root)
 
 ### Building from Source
@@ -179,18 +182,25 @@ Check system capabilities for isolation features.
 ```sh
 isolate check
 # Output:
-# System Capabilities Check
-# ========================
-# racct/rctl (resource limits): available
-# VNET/VIMAGE (network isolation): available
-# Jails: available
-# Running as root: yes
-# FreeBSD version: 1500001
+# isolate System Check
+# ====================
+#
+# FreeBSD 15.1
+#
+# Kernel Features:
+#   [OK] FreeBSD jails        Supported
+#   [OK] racct/rctl           Enabled - resource limits available
+#   [OK] VNET/VIMAGE          Available - network isolation supported
+#   [OK] nullfs               Supported
+#   [OK] devfs                Supported
+#
+# Privileges:
+#   [OK] Running as root      Full isolation available
 ```
 
 ### Capability File Format
 
-Capability files (`.caps`) define the isolation parameters:
+Capability files (`.caps`) define the isolation parameters. The full specification, including keys that are accepted but not yet applied, is in [docs/design/02-capability-file.md](docs/design/02-capability-file.md).
 
 ```ini
 # User context
@@ -202,7 +212,7 @@ memory: 256M                  # Resident memory limit (K, M, G suffixes); the
                               # process is killed when it exceeds it. Usage is
                               # sampled about once a second.
 processes: 10                 # Maximum processes
-files: 512                    # File descriptor limit (minimum 512 for fork)
+files: 512                    # File descriptor limit
 
 # Network isolation mode
 network_mode: inherit         # Share host network (default)
@@ -215,6 +225,7 @@ filesystem: /lib:r            # Read-only access to /lib
 filesystem: /usr/lib:r        # Read-only access to /usr/lib
 filesystem: /tmp:rw           # Read-write access to /tmp
 filesystem: /data:rw          # Application data directory
+# Rules name directories. A rule for a single file is not applied.
 
 # Network access rules - parsed and listed, but NOT enforced (there is no
 # firewall integration yet). Use network_mode to control network access.
@@ -292,7 +303,7 @@ doas isolate run --caps tenant1.caps -w /data/tenant1 ./myapp  # 10.0.99.2
 doas isolate run --caps tenant2.caps -w /data/tenant2 ./myapp  # 10.0.100.2
 ```
 
-Tenants on different subnets cannot communicate with each other.
+Each jail can reach only the network its own interface is attached to. Tenants on different subnets cannot reach each other unless the host routes between them.
 
 ## Examples
 
@@ -347,7 +358,9 @@ doas isolate stop app-tenant-b
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design documentation.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes how the code is built.
+- [docs/design/](docs/design/README.md) specifies what isolate guarantees: scope, invariants, success and failure criteria, and known gaps.
+- [docs/nginx-guide.md](docs/nginx-guide.md) is a worked example.
 
 ### Module Overview
 
@@ -367,13 +380,16 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design documentati
 # Run all tests
 zig build test
 
-# Run specific test file
+# Run one module's tests (modules without C imports only)
 zig test src/caps.zig
 
 # Build and test examples
 zig build examples
+./zig-out/bin/isolate detect ./zig-out/examples/hello
 doas ./zig-out/bin/isolate run ./zig-out/examples/hello
 ```
+
+The unit tests cover parsing and validation. Nothing in the test suite creates a jail; behaviour that needs root has been checked by hand on FreeBSD 15.1.
 
 ## Troubleshooting
 
@@ -396,9 +412,9 @@ echo 'kern.racct.enable=1' >> /boot/loader.conf
 # Reboot required
 ```
 
-### "Could not load capabilities"
+### "No capability file at ..." / "ELF interpreter /libexec/ld-elf.so.1 not found"
 
-Generate a capability file first:
+Without a capability file nothing is mounted in the jail, so a dynamically linked program cannot start. Generate a capability file first:
 ```sh
 isolate detect ./myapp
 # Then run
@@ -407,7 +423,7 @@ doas isolate run ./myapp
 
 ### Instance shows as "orphaned"
 
-The process exited but cleanup didn't complete. Clean up with:
+The program is gone but its `isolate run` process did not clean up (it was killed, or the host crashed). Clean up with:
 ```sh
 doas isolate clean
 ```
@@ -431,18 +447,15 @@ Ports below 1024 require root privileges. Either:
 
 ## Platform Support
 
-| Platform | Status | Implementation |
-|----------|--------|----------------|
-| FreeBSD 13+ | ✅ Supported | Jails, rctl, nullfs |
-| FreeBSD 14+ | ✅ Supported | Jails, rctl, nullfs, VNET |
-| FreeBSD 15+ | ✅ Tested | Jails, rctl, nullfs, VNET |
-| Linux | 🚧 Planned | Namespaces, cgroups, seccomp |
-| macOS | ❌ Not planned | No native isolation primitives |
-| Windows | ❌ Not planned | No native isolation primitives |
+| Platform | Status |
+|----------|--------|
+| FreeBSD 15.1 | Tested |
+| FreeBSD 13 and 14 | Untested |
+| Linux, macOS, Windows | Not supported and not planned. isolate builds on Linux, where `detect` and the unit tests work, but it cannot run anything in isolation there. |
 
 ## Contributing
 
-Contributions are welcome! Please read the architecture documentation before submitting changes.
+Contributions are welcome! Please read the architecture and design documents before submitting changes. A change that affects an invariant should update the design document that states it.
 
 1. Fork the repository
 2. Create a feature branch
@@ -453,6 +466,9 @@ Contributions are welcome! Please read the architecture documentation before sub
 ## Security Considerations
 
 - **Review capability files**: Auto-detection is heuristic; always review generated `.caps` files
+- **Network rules are not enforced**: only `network_mode` restricts network access. The default, `inherit`, gives the program the host's network
+- **Capability-file mistakes are quiet**: a misspelled key is reported only with `-v` and does not stop the run. Check with `isolate run -n -v` before relying on a file
+- **Known gaps**: the [design documents](docs/design/README.md) list every invariant that does not hold yet
 - **Ephemeral users**: Use `user: auto` for privilege separation
 - **Minimal permissions**: Only grant necessary filesystem and network access
 - **Resource limits**: Set appropriate limits to prevent resource exhaustion

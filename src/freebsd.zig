@@ -22,6 +22,10 @@ comptime {
 // ============================================================================
 
 const c = @cImport({
+    // Release builds define _FORTIFY_SOURCE, and the fortified libc wrappers do
+    // not survive translate-c; they add nothing for calls made from Zig.
+    @cUndef("_FORTIFY_SOURCE");
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("sys/param.h");
     @cInclude("sys/jail.h");
     @cInclude("sys/mount.h");
@@ -50,6 +54,32 @@ const runtime_dir = registry.REGISTRY_DIR;
 /// The per-instance directory that contains the jail root (`<dir>/root`)
 fn instanceDir(jail_path: []const u8) []const u8 {
     return std.fs.path.dirname(jail_path) orelse jail_path;
+}
+
+/// The instance directory for a jail path read back from the registry, or
+/// null unless the path has exactly the shape createIsolation produces:
+/// <runtime_dir>/inst-XXXXXX/root. Teardown deletes this directory as root,
+/// so nothing else is ever accepted.
+fn trustedInstanceDir(jail_path: []const u8) ?[]const u8 {
+    const prefix = runtime_dir ++ "/inst-";
+    const suffix = "/root";
+    if (jail_path.len != prefix.len + 6 + suffix.len) return null;
+    if (!std.mem.startsWith(u8, jail_path, prefix)) return null;
+    if (!std.mem.endsWith(u8, jail_path, suffix)) return null;
+    for (jail_path[prefix.len..][0..6]) |ch| {
+        if (!std.ascii.isAlphanumeric(ch)) return null;
+    }
+    return jail_path[0 .. jail_path.len - suffix.len];
+}
+
+/// Whether `username` is one isolate creates itself: app-<digits>
+fn isEphemeralUsername(username: []const u8) bool {
+    const prefix = "app-";
+    if (username.len <= prefix.len or !std.mem.startsWith(u8, username, prefix)) return false;
+    for (username[prefix.len..]) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
 }
 
 // stat(2) against std.c.Stat; std.c.stat is missing its extern in Zig 0.16
@@ -863,14 +893,18 @@ pub fn removeJail(jid: i32) void {
     }
 }
 
-/// Whether a jail with this id exists (a read-only jail_get(2) lookup)
-pub fn jailExists(jid: i32) bool {
-    var jid_val: c_int = jid;
-    var iov = [_]c.struct_iovec{
-        .{ .iov_base = @ptrCast(@constCast("jid")), .iov_len = 4 },
-        .{ .iov_base = @ptrCast(&jid_val), .iov_len = @sizeOf(c_int) },
-    };
-    return c.jail_get(&iov, iov.len, 0) >= 0;
+/// Whether jail `jid` exists and is the one isolate created for the jailed
+/// process `pid` (its name is isolate-<pid>). Jail ids and PIDs read back
+/// from the registry are only acted on when they still describe that jail.
+pub fn jailBelongsTo(jid: i32, pid: i32) bool {
+    if (jid < 0) return false;
+    const name_ptr = c.jail_getname(jid);
+    if (name_ptr == null) return false;
+    defer c.free(name_ptr);
+
+    var expected_buf: [64]u8 = undefined;
+    const expected = std.fmt.bufPrint(&expected_buf, jail_name_prefix ++ "{d}", .{pid}) catch return false;
+    return std.mem.eql(u8, std.mem.span(name_ptr), expected);
 }
 
 /// Tear down what an instance left behind when the isolate process that
@@ -880,22 +914,25 @@ pub fn teardownInstance(io: std.Io, pid: i32, jail_id: i32, jail_path: []const u
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
 
-    if (jail_id >= 0 and jailExists(jail_id)) {
+    // Everything below acts as root on values read from a registry entry.
+    // Each is checked against what isolate itself would have created, so a
+    // stale or forged entry cannot point teardown at anything else.
+    if (jailBelongsTo(jail_id, pid)) {
         stdout.print("Removing jail JID {d}\n", .{jail_id}) catch {};
         removeJail(jail_id);
     }
     removeResourceLimitsForPid(pid);
 
-    if (jail_path.len > 0) {
-        const inst_dir = instanceDir(jail_path);
+    if (trustedInstanceDir(jail_path)) |inst_dir| {
         stdout.print("Removing instance directory {s}\n", .{inst_dir}) catch {};
         cleanupInstanceDir(inst_dir) catch {
             stdout.print("Warning: Could not fully remove {s}\n", .{inst_dir}) catch {};
         };
+    } else if (jail_path.len > 0) {
+        stdout.print("Warning: Not removing {s}: not an isolate instance directory\n", .{jail_path}) catch {};
     }
 
-    // Only users isolate created itself (app-<pid>) are deleted
-    if (std.mem.startsWith(u8, username, "app-")) {
+    if (isEphemeralUsername(username)) {
         stdout.print("Removing ephemeral user {s}\n", .{username}) catch {};
         deleteUser(username);
     }
@@ -1359,6 +1396,35 @@ test "copyFile copies file correctly" {
     // Cleanup
     _ = c.unlink(&src_buf);
     _ = c.unlink(&dst_buf);
+}
+
+test "trustedInstanceDir accepts only isolate's own layout" {
+    const ok = runtime_dir ++ "/inst-aB3dE9/root";
+    try std.testing.expectEqualStrings(runtime_dir ++ "/inst-aB3dE9", trustedInstanceDir(ok).?);
+
+    const bad = [_][]const u8{
+        "",
+        "/root/victim/root",
+        "/etc/root",
+        runtime_dir ++ "/root",
+        runtime_dir ++ "/inst-aB3dE9",
+        runtime_dir ++ "/inst-aB3dE9/tmp",
+        runtime_dir ++ "/inst-aB3dE/root",
+        runtime_dir ++ "/inst-../../x/root",
+        runtime_dir ++ "/inst-aB3dE9/root/",
+        "/tmp" ++ runtime_dir ++ "/inst-aB3dE9/root",
+    };
+    for (bad) |path| {
+        try std.testing.expect(trustedInstanceDir(path) == null);
+    }
+}
+
+test "isEphemeralUsername" {
+    try std.testing.expect(isEphemeralUsername("app-2947"));
+    try std.testing.expect(!isEphemeralUsername("app-"));
+    try std.testing.expect(!isEphemeralUsername("app-12x"));
+    try std.testing.expect(!isEphemeralUsername("root"));
+    try std.testing.expect(!isEphemeralUsername("application"));
 }
 
 test "isPathUnder" {

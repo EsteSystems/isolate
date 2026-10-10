@@ -2,6 +2,8 @@
 
 **isolate** is an infrastructureless container runner that provides process isolation using native FreeBSD primitives. This guide demonstrates isolating nginx as a practical use case.
 
+The step-by-step guide below was run as written on FreeBSD 15.1 with the nginx package and isolate 0.3.0. What isolate guarantees, and what it does not, is specified in the [design documents](design/README.md).
+
 ## Table of Contents
 
 - [What is isolate?](#what-is-isolate)
@@ -188,8 +190,8 @@ isolate run --caps nginx.caps -w /var/isolate/nginx /var/isolate/nginx/start.sh
 
 | Aspect | Traditional Tools | isolate |
 |--------|------------------|---------|
-| **Setup time** | Hours (base install, config, networking) | Minutes (write caps file) |
-| **Disk usage** | 150MB-500MB+ per jail | ~0 (uses host binaries) |
+| **Setup** | Base install, configuration, networking | A capability file and a workspace directory |
+| **Disk usage** | A base system per jail, or a shared one | None (uses host binaries) |
 | **Base system** | Required (base.txz extraction) | Not needed |
 | **IP addresses** | Manual planning required | Optional (inherit or VNET) |
 | **User management** | Manual inside jail | Automatic ephemeral users |
@@ -231,30 +233,20 @@ exit
 # - Clean up old jails manually
 ```
 
-**Total steps: 7+ | Time: 30+ minutes | Disk: ~200MB**
+**Seven or more steps, and a base system on disk.**
 
 ### isolate Workflow: Running nginx Isolated
 
 ```sh
-# Step 1: Create workspace and caps file
-mkdir -p /var/isolate/nginx
-cat > /var/isolate/nginx/nginx.caps << 'EOF'
-user: auto
-memory: 128M
-filesystem: /lib:r
-filesystem: /usr/lib:r
-filesystem: /usr/local/lib:r
-filesystem: /usr/local/sbin:r
-filesystem: /tmp:rw
-EOF
-
+# Step 1: Create a workspace holding the capability file, an nginx.conf
+#         that keeps all its paths under /workspace, and a start script
 # Step 2: Run
 isolate run --caps /var/isolate/nginx/nginx.caps \
     -w /var/isolate/nginx \
-    /usr/local/sbin/nginx -g 'daemon off;'
+    /var/isolate/nginx/start.sh
 ```
 
-**Total steps: 2 | Time: 2 minutes | Disk: ~0**
+**Two steps, and no base system.** The [step-by-step guide](#step-by-step-guide) gives the files in full. nginx needs its own configuration here: with its default one it tries to write to `/var/log/nginx` and `/var/tmp/nginx`, which do not exist in the jail.
 
 ### When to Use Each Approach
 
@@ -369,25 +361,27 @@ The jail provides process-level isolation. Processes inside cannot:
 - See or signal processes outside the jail
 - Access the host's filesystem directly
 - Modify system-wide settings
-- Access network interfaces (unless explicitly configured)
+- Create raw sockets or use System V IPC
+
+By default the jail shares the host's network (`network_mode: inherit`). Use `network_mode: none` or a VNET jail to change that.
 
 ### Layer 2: Ephemeral User
 
 Each instance runs as a unique, temporary user (e.g., `app-1316`):
 
-- Created on demand with random UID
-- Cannot login interactively
-- Has no home directory
+- Created on demand with the next free UID
+- Cannot login interactively (shell is `/usr/sbin/nologin`)
+- Home directory is the jail's `/tmp`
 - Deleted when the instance stops
-- Prevents privilege escalation attacks
+- Holds no group other than its own
 
 ### Layer 3: Resource Limits
 
-Using FreeBSD's `rctl`, hard limits are enforced:
+Using FreeBSD's `rctl`, limits are enforced for the jail as a whole:
 
-- **Memory**: Maximum RSS (e.g., 128MB)
-- **Processes**: Maximum concurrent processes
-- **File descriptors**: Maximum open files
+- **Memory**: resident memory (e.g., 128MB). A process that stays above it is killed; usage is sampled about once a second
+- **Processes**: Maximum concurrent processes; `fork` fails beyond it
+- **File descriptors**: Maximum open files; `open` fails beyond it
 
 ### Layer 4: Filesystem Isolation
 
@@ -396,7 +390,8 @@ The jail has a minimal filesystem constructed from:
 - **Read-only mounts**: System libraries (`/lib`, `/usr/lib`)
 - **Read-write workspace**: Application data (`/workspace`)
 - **Isolated /tmp**: Instance-specific temporary directory
-- **No access**: Everything else is invisible
+- **Devices**: devfs at `/dev`
+- **No access**: No other host directory exists in the jail
 
 ---
 
@@ -406,10 +401,10 @@ Running nginx in isolate provides:
 
 **Security Benefits:**
 
-- Even if nginx is compromised, attackers can't access the host
-- Resource exhaustion attacks are contained
-- No root privileges inside the jail
-- Minimal attack surface (only required libraries mounted)
+- A compromised nginx sees only the directories the capability file mounts, not the host's filesystem
+- Its memory, process count and open files are capped
+- It runs as an unprivileged user that exists only for this instance
+- It still has the host's network unless you choose another `network_mode`
 
 ---
 
@@ -418,12 +413,10 @@ Running nginx in isolate provides:
 ### 1. Install isolate
 
 ```sh
-# From package
-pkg add isolate-0.2.0.pkg
-
-# Or build from source
+# Build from source (needs Zig 0.16.0)
 git clone https://github.com/EsteSystems/isolate.git
-cd isolate && zig build -Doptimize=ReleaseFast
+cd isolate && zig build -Doptimize=ReleaseSafe
+# The executable is zig-out/bin/isolate
 ```
 
 ### 2. Create the Workspace Directory
@@ -542,6 +535,8 @@ chmod +x /var/isolate/nginx/start.sh
 
 ### 6. Run nginx with isolate
 
+As root. The command stays in the foreground for as long as nginx runs.
+
 ```sh
 isolate run \
     --caps /var/isolate/nginx/nginx.caps \
@@ -564,8 +559,8 @@ isolate list
 
 # Output:
 NAME                 PID      JAIL_ID  STATE      BINARY
--------------------- -------- -------- ---------- -------------------------
-nginx-63eca8b9       1316     2        running    /var/isolate/nginx/start.sh
+-------------------- -------- -------- ---------- ------------------------------
+nginx                1316     2        running    /var/isolate/nginx/start.sh
 
 # Test the server
 curl http://localhost:8080/
@@ -580,15 +575,14 @@ When you run the isolate command, here's exactly what happens:
 ### Phase 1: User Creation
 
 ```sh
-# isolate creates an ephemeral user
-pw useradd app-1316 -u 1001 -g 1001 -d /nonexistent -s /usr/sbin/nologin
+# isolate creates an ephemeral user, named after the jailed process's PID
+pw useradd -n app-1316 -s /usr/sbin/nologin -d /tmp -c "Isolate ephemeral user"
 ```
 
 This user:
 
-- Has a random UID (1001 in this case)
+- Gets the next free UID (1001 in this case)
 - Cannot login interactively
-- Has no home directory
 - Will be deleted when the instance stops
 
 ### Phase 2: Jail Filesystem Setup
@@ -608,7 +602,8 @@ Host Filesystem                              Jail Filesystem
 
                                              /etc/passwd (generated, minimal)
                                              /etc/group (generated, minimal)
-                                             /start.sh (copied binary)
+                                             /start.sh (copy of the program given on the command line)
+                                             /dev (devfs)
 ```
 
 > **Security Note:** Each instance gets its own isolated `/tmp` directory (`/var/run/isolate/inst-XXXXXX/tmp`, next to the jail root), preventing cross-instance information leakage through temporary files.
@@ -623,6 +618,7 @@ jail -c \
     persist \
     allow.raw_sockets=false \
     allow.socket_af=true \
+    allow.sysvipc=false \
     ip4=inherit \
     ip6=inherit
 ```
@@ -630,43 +626,42 @@ jail -c \
 ### Phase 4: Resource Limits (rctl)
 
 ```sh
-# Applied via rctl_add_rule()
-rctl -a jail:isolate-1316:memoryuse:deny=134217728  # 128MB
-rctl -a jail:isolate-1316:maxproc:deny=20           # 20 processes
-rctl -a jail:isolate-1316:openfiles:deny=1024       # 1024 file descriptors
+# Applied via rctl_add_rule(), removed again when the instance ends
+rctl -a jail:isolate-1316:memoryuse:sigkill=134217728  # 128MB
+rctl -a jail:isolate-1316:maxproc:deny=20              # 20 processes
+rctl -a jail:isolate-1316:openfiles:deny=1024          # 1024 file descriptors
 ```
 
 ### Phase 5: Process Execution
 
 ```c
-// isolate forks and:
-1. jail_attach(jid)           // Attach to jail
-2. setgid(1001), setuid(1001) // Drop to ephemeral user
-3. chdir("/")                 // Change to jail root
-4. execv("/start.sh", argv)   // Execute nginx
+// isolate forks and, in the child:
+1. jail_attach(jid)           // Enter the jail; the working directory becomes its root
+2. setgroups, setgid(1001), setuid(1001)  // Drop to the ephemeral user, with no other groups
+3. execv("/start.sh", argv)   // Execute the start script, which execs nginx
 ```
 
 ### What nginx Sees Inside the Jail
 
+Seen from the host while the instance runs:
+
 ```sh
-# Process list (from inside jail)
-$ ps aux
-USER    PID %CPU %MEM    VSZ   RSS TT  STAT STARTED    TIME COMMAND
-app-1316  1  0.0  0.1  24836 11412  -  IJ   06:56   0:00 nginx: master
-app-1316  2  0.0  0.1  24836 11440  -  IJ   06:56   0:00 nginx: worker
+# The jail's processes. PIDs are ordinary host PIDs; jails do not renumber them.
+$ ps -J isolate-1316 -o pid,user,command
+ PID USER     COMMAND
+1316 app-1316 nginx: master process /usr/local/sbin/nginx -g daemon off; -c /workspace/nginx.conf (nginx)
+1320 app-1316 nginx: worker process (nginx)
 
-# Filesystem view
-$ ls /
-bin/  etc/  lib/  libexec/  start.sh  tmp/  usr/  workspace/
+# The jail's root filesystem
+$ ls /var/run/isolate/inst-*/root
+bin  dev  etc  lib  libexec  start.sh  tmp  usr  var  workspace
 
-# Network (inherited from host)
+# The listening socket is on the host's network (network_mode: inherit)
 $ netstat -an | grep 8080
 tcp4  0  0  *.8080  *.*  LISTEN
-
-# Cannot see host processes
-$ ps aux | wc -l
-3  # Only nginx master + worker + ps itself
 ```
+
+From inside the jail, nginx can see only its own processes and the directories listed above.
 
 ---
 
@@ -678,21 +673,25 @@ $ ps aux | wc -l
 isolate list
 
 NAME                 PID      JAIL_ID  STATE      BINARY
--------------------- -------- -------- ---------- -------------------------
-nginx-63eca8b9       1316     2        running    /var/isolate/nginx/start.sh
+-------------------- -------- -------- ---------- ------------------------------
+nginx                1316     2        running    /var/isolate/nginx/start.sh
 ```
 
 ### Stop an Instance
 
 ```sh
-# Graceful stop (SIGTERM)
-isolate stop nginx-63eca8b9
+# Graceful stop: SIGTERM, then wait up to five seconds
+isolate stop nginx
 
-# Force stop (SIGKILL)
-isolate stop -f nginx-63eca8b9
+# If the program ignores SIGTERM: remove the jail, which kills everything in it
+isolate stop -f nginx
 ```
 
+Pressing Ctrl-C in the terminal running `isolate run` has the same effect as `isolate stop`; pressing it twice has the effect of `stop -f`. Either way the jail, its mounts, the ephemeral user and the limits are removed, and the workspace keeps its files.
+
 ### Clean Up Orphaned Instances
+
+If an `isolate run` process is killed outright or the host crashes, its jail and user are left behind. Remove them with:
 
 ```sh
 isolate clean
@@ -705,12 +704,12 @@ isolate check
 
 isolate System Check
 ====================
-FreeBSD 15.0
+FreeBSD 15.1
 
 Kernel Features:
   [OK] FreeBSD jails        Supported
-  [OK] racct/rctl           Enabled
-  [OK] VNET/VIMAGE          Available
+  [OK] racct/rctl           Enabled - resource limits available
+  [OK] VNET/VIMAGE          Available - network isolation supported
   [OK] nullfs               Supported
   [OK] devfs                Supported
 
@@ -729,7 +728,7 @@ Privileges:
 | Isolation mechanism | Linux namespaces/cgroups | FreeBSD jails/rctl |
 | User separation | Configurable | Automatic (ephemeral user) |
 | Filesystem | Layered images (overlay) | Selective mounts (nullfs) |
-| Overhead | ~50MB+ per container | ~0 (shared libraries) |
+| Disk per instance | Image layers | None (host directories are mounted) |
 
 ---
 
