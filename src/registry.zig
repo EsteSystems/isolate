@@ -56,6 +56,7 @@ pub const InstanceState = enum {
 pub const Instance = struct {
     name: []const u8,
     pid: i32,
+    manager_pid: i32, // The isolate process that waits for pid and cleans up
     jail_id: i32,
     jail_path: []const u8,
     username: []const u8,
@@ -128,7 +129,7 @@ pub const Registry = struct {
 
         try writer.writeAll("{\n  \"name\": ");
         try writeJsonString(writer, instance.name);
-        try writer.print(",\n  \"pid\": {d},\n  \"jail_id\": {d},\n  \"jail_path\": ", .{ instance.pid, instance.jail_id });
+        try writer.print(",\n  \"pid\": {d},\n  \"manager_pid\": {d},\n  \"jail_id\": {d},\n  \"jail_path\": ", .{ instance.pid, instance.manager_pid, instance.jail_id });
         try writeJsonString(writer, instance.jail_path);
         try writer.writeAll(",\n  \"username\": ");
         try writeJsonString(writer, instance.username);
@@ -180,8 +181,10 @@ pub const Registry = struct {
     pub const InstanceInfo = struct {
         name: []const u8,
         pid: i32,
+        manager_pid: i32,
         jail_id: i32,
         jail_path: []const u8,
+        username: []const u8,
         binary_path: []const u8,
         state: InstanceState,
         start_time: i64,
@@ -191,6 +194,7 @@ pub const Registry = struct {
         pub fn deinit(self: *InstanceInfo) void {
             self.allocator.free(self.name);
             self.allocator.free(self.jail_path);
+            self.allocator.free(self.username);
             self.allocator.free(self.binary_path);
         }
     };
@@ -211,9 +215,12 @@ pub const Registry = struct {
         const name = try extractJsonString(self.allocator, content, "name");
         errdefer self.allocator.free(name);
         const pid = try extractJsonInt(content, "pid");
+        const manager_pid = extractJsonInt(content, "manager_pid") catch 0;
         const jail_id = try extractJsonInt(content, "jail_id");
         const jail_path = try extractJsonString(self.allocator, content, "jail_path");
         errdefer self.allocator.free(jail_path);
+        const username = try extractJsonString(self.allocator, content, "username");
+        errdefer self.allocator.free(username);
         const binary_path = try extractJsonString(self.allocator, content, "binary_path");
         errdefer self.allocator.free(binary_path);
         const start_time = try extractJsonInt(content, "start_time");
@@ -224,8 +231,10 @@ pub const Registry = struct {
         return .{
             .name = name,
             .pid = @intCast(pid),
+            .manager_pid = @intCast(manager_pid),
             .jail_id = @intCast(jail_id),
             .jail_path = jail_path,
+            .username = username,
             .binary_path = binary_path,
             .state = state,
             .start_time = start_time,

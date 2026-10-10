@@ -87,27 +87,30 @@ pub const Capabilities = struct {
     allocator: Allocator,
 
     // User context
-    username: ?[]const u8,        // Specific user or null for auto
-    auto_user: bool,              // Create ephemeral user
-
-    // Resource limits
-    memory_limit: u64,            // Bytes (0 = unlimited)
-    process_limit: u32,           // Max processes
-    file_limit: u32,              // Max file descriptors
-
-    // Access rules
-    network_rules: ArrayList(NetworkRule),
-    file_rules: ArrayList(FileRule),
-    env_vars: ArrayList(EnvVar),
+    username: []const u8,         // "auto" or an existing user name
+    create_user: bool,            // Create ephemeral user (username == "auto")
 
     // Workspace
     workspace_path: ?[]const u8,  // Host path for /workspace mount
+
+    // Network isolation mode (inherit, none, vnet) and VNET settings
+    network_config: NetworkConfig,
+
+    // Access rules
+    network_rules: ArrayList(NetworkRule),  // Parsed and listed, not enforced
+    file_rules: ArrayList(FileRule),
+    env_vars: ArrayList(EnvVar),
+    env_clear: bool,              // Start from an empty environment
+
+    // Resource limits (null = unlimited)
+    limits: ResourceLimits,       // memory_bytes, max_processes, max_files
 };
 
 pub const NetworkRule = struct {
-    protocol: Protocol,           // tcp, udp, unix
-    port: u16,
-    direction: Direction,         // inbound, outbound
+    protocol: Protocol,           // tcp, udp, unix, none
+    address: []const u8,          // Optional address or socket path
+    port: ?u16,
+    direction: Direction,         // inbound, outbound, both
 };
 
 pub const FileRule = struct {
@@ -123,7 +126,8 @@ The registry tracks running instances for management:
 ```zig
 pub const Instance = struct {
     name: []const u8,             // Unique instance identifier
-    pid: i32,                     // Process ID
+    pid: i32,                     // Process ID (inside the jail)
+    manager_pid: i32,             // The isolate process waiting for it
     jail_id: i32,                 // FreeBSD jail ID
     jail_path: []const u8,        // Jail filesystem root
     username: []const u8,         // Ephemeral user (if created)

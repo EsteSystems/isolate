@@ -127,31 +127,32 @@ var jail_state = struct {
 
 }{};
 
-// Export functions for C interop (IPC between parent/child)
-pub export fn freebsd_get_jail_id() c_int {
+// Jail state accessors, used by the parent process once the child has
+// reported its state over the pipe
+pub fn freebsd_get_jail_id() c_int {
     return jail_state.jail_id;
 }
 
-pub export fn freebsd_set_jail_id(jid: c_int) void {
+pub fn freebsd_set_jail_id(jid: c_int) void {
     jail_state.setJailId(jid);
 }
 
-pub export fn freebsd_get_username() [*c]const u8 {
+pub fn freebsd_get_username() [*c]const u8 {
     return &jail_state.ephemeral_username;
 }
 
-pub export fn freebsd_set_username(name: [*c]const u8) void {
+pub fn freebsd_set_username(name: [*c]const u8) void {
     if (name != null) {
         const slice = std.mem.span(name);
         jail_state.setUsername(slice);
     }
 }
 
-pub export fn freebsd_get_jail_path() [*c]const u8 {
+pub fn freebsd_get_jail_path() [*c]const u8 {
     return &jail_state.jail_root_path;
 }
 
-pub export fn freebsd_set_jail_path(path: [*c]const u8) void {
+pub fn freebsd_set_jail_path(path: [*c]const u8) void {
     if (path != null) {
         const slice = std.mem.span(path);
         jail_state.setJailPath(slice);
@@ -793,6 +794,43 @@ pub fn attachToJail(io: std.Io, jid: i32) !void {
 pub fn removeJail(jid: i32) void {
     if (jid >= 0) {
         _ = c.jail_remove(jid);
+    }
+}
+
+/// Whether a jail with this id exists (a read-only jail_get(2) lookup)
+pub fn jailExists(jid: i32) bool {
+    var jid_val: c_int = jid;
+    var iov = [_]c.struct_iovec{
+        .{ .iov_base = @ptrCast(@constCast("jid")), .iov_len = 4 },
+        .{ .iov_base = @ptrCast(&jid_val), .iov_len = @sizeOf(c_int) },
+    };
+    return c.jail_get(&iov, iov.len, 0) >= 0;
+}
+
+/// Tear down what an instance left behind when the isolate process that
+/// managed it is gone: the jail (which kills anything still running in
+/// it), the instance directory, and the ephemeral user.
+pub fn teardownInstance(io: std.Io, jail_id: i32, jail_path: []const u8, username: []const u8) void {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+
+    if (jail_id >= 0 and jailExists(jail_id)) {
+        stdout.print("Removing jail JID {d}\n", .{jail_id}) catch {};
+        removeJail(jail_id);
+    }
+
+    if (jail_path.len > 0) {
+        const inst_dir = instanceDir(jail_path);
+        stdout.print("Removing instance directory {s}\n", .{inst_dir}) catch {};
+        cleanupInstanceDir(inst_dir) catch {
+            stdout.print("Warning: Could not fully remove {s}\n", .{inst_dir}) catch {};
+        };
+    }
+
+    // Only users isolate created itself (app-<pid>) are deleted
+    if (std.mem.startsWith(u8, username, "app-")) {
+        stdout.print("Removing ephemeral user {s}\n", .{username}) catch {};
+        deleteUser(username);
     }
 }
 

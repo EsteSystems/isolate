@@ -113,7 +113,7 @@ isolate run -n ./myapp
 Options:
 - `-c, --caps <file>`: Capability file (default: `<binary>.caps`)
 - `-w, --workspace <dir>`: Workspace directory mounted as `/workspace`
-- `-N, --name <name>`: Instance name (default: auto-generated)
+- `-N, --name <name>`: Instance name (default: auto-generated); letters, digits, `.`, `_`, `-`, at most 64 characters
 - `--vnet <interface>`: Use VNET isolation with specified interface
 - `-v, --verbose`: Verbose output
 - `-n, --dry-run`: Show configuration without executing
@@ -155,16 +155,16 @@ Stop a running instance.
 # Graceful stop (SIGTERM)
 doas isolate stop myapp-abc123
 
-# Force stop (SIGKILL if needed)
+# Force: if the process ignores SIGTERM, remove the jail (kills everything in it)
 doas isolate stop -f myapp-abc123
 ```
 
 Options:
-- `-f, --force`: Send SIGKILL if SIGTERM doesn't work
+- `-f, --force`: If the process ignores SIGTERM, remove the jail (which kills everything inside it) and clean up
 
 #### `isolate clean`
 
-Clean up orphaned instances and jail directories.
+Clean up after instances whose `isolate run` process has died: remove their jails (and anything still running in them), instance directories and ephemeral users, and drop stale registry entries.
 
 ```sh
 doas isolate clean

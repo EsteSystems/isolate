@@ -613,8 +613,6 @@ fn cmdList(io: std.Io, allocator: std.mem.Allocator) !u8 {
 
 /// Handle 'stop' command
 fn cmdStop(io: std.Io, allocator: std.mem.Allocator, opts: StopOptions) !u8 {
-    var stdout_file = stdoutWriter(io);
-    const stdout = &stdout_file.interface;
     var stderr_file = stderrWriter(io);
     const stderr = &stderr_file.interface;
 
@@ -632,56 +630,110 @@ fn cmdStop(io: std.Io, allocator: std.mem.Allocator, opts: StopOptions) !u8 {
         return 1;
     }
 
+    if (builtin.os.tag != .freebsd) {
+        try stderr.print("Error: Stopping instances is only supported on FreeBSD\n", .{});
+        return 1;
+    } else {
+        return stopInstance(io, allocator, opts.name.?, opts.force);
+    }
+}
+
+/// Stop a registered instance. Cleans up after it only if the isolate
+/// process that started it is no longer around to do so itself.
+fn stopInstance(io: std.Io, allocator: std.mem.Allocator, name: []const u8, force: bool) !u8 {
+    var stdout_file = stdoutWriter(io);
+    const stdout = &stdout_file.interface;
+    var stderr_file = stderrWriter(io);
+    const stderr = &stderr_file.interface;
+
     var reg = registry.Registry.init(io, allocator);
 
-    const inst_opt = try reg.get(opts.name.?);
+    const inst_opt = try reg.get(name);
     if (inst_opt == null) {
-        try stderr.print("Error: Instance '{s}' not found\n", .{opts.name.?});
+        try stderr.print("Error: Instance '{s}' not found\n", .{name});
         return 1;
     }
 
     var inst = inst_opt.?;
     defer inst.deinit();
 
-    if (inst.state != .running and !opts.force) {
-        try stderr.print("Instance '{s}' is not running (state: {s})\n", .{
-            opts.name.?,
-            @tagName(inst.state),
-        });
+    if (inst.state != .running and !force) {
+        try stderr.print("Instance '{s}' is not running (state: {s})\n", .{ name, @tagName(inst.state) });
         try stderr.print("Use -f/--force to clean up anyway.\n", .{});
         return 1;
     }
 
-    try stdout.print("Stopping instance '{s}'...\n", .{opts.name.?});
+    try stdout.print("Stopping instance '{s}'...\n", .{name});
 
-    // Send SIGTERM to the process
-    if (inst.state == .running) {
-        const kill_result = c.kill(inst.pid, c.SIGTERM);
-        if (kill_result < 0) {
+    // Signal the jailed process only while its jail still exists: once
+    // the jail is gone, the PID may already belong to another process
+    if (inst.state == .running and freebsd.jailExists(inst.jail_id)) {
+        if (c.kill(inst.pid, c.SIGTERM) < 0) {
             try stderr.print("Warning: Failed to send SIGTERM to PID {d}\n", .{inst.pid});
         } else {
-            try stdout.print("Sent SIGTERM to PID {d}\n", .{inst.pid});
-
-            // Wait a moment for graceful shutdown
-            io.sleep(.fromMilliseconds(500), .awake) catch {};
+            try stdout.print("Sent SIGTERM to PID {d}, waiting for it to exit...\n", .{inst.pid});
+            var waited: u32 = 0;
+            while (waited < 50 and c.kill(inst.pid, 0) == 0) : (waited += 1) {
+                io.sleep(.fromMilliseconds(100), .awake) catch {};
+            }
         }
 
-        // Check if still running
         if (c.kill(inst.pid, 0) == 0) {
-            if (opts.force) {
-                try stdout.print("Process still running, sending SIGKILL...\n", .{});
-                _ = c.kill(inst.pid, c.SIGKILL);
-            } else {
-                try stderr.print("Process still running. Use -f/--force for SIGKILL.\n", .{});
+            if (!force) {
+                try stderr.print("Process {d} is still running after 5 seconds.\n", .{inst.pid});
+                try stderr.print("Use -f/--force to remove the jail, which kills everything inside it.\n", .{});
+                return 1;
             }
+            try stdout.print("Process still running, removing jail JID {d}...\n", .{inst.jail_id});
+            freebsd.removeJail(inst.jail_id);
         }
     }
 
-    // Remove from registry
-    reg.unregister(opts.name.?);
-    try stdout.print("Instance '{s}' stopped and unregistered.\n", .{opts.name.?});
+    // The isolate process that started the instance cleans up and
+    // unregisters it when its child exits; only do that here if it is gone
+    if (inst.manager_pid > 0 and c.kill(inst.manager_pid, 0) == 0) {
+        try stdout.print("Instance '{s}' stopped; its isolate process (PID {d}) is cleaning up.\n", .{ name, inst.manager_pid });
+        return 0;
+    }
+
+    freebsd.teardownInstance(io, inst.jail_id, inst.jail_path, inst.username);
+    reg.unregister(name);
+    try stdout.print("Instance '{s}' stopped and unregistered.\n", .{name});
 
     return 0;
+}
+
+/// Clean up every registered instance whose isolate process has died:
+/// remove its jail (and whatever still runs in it), its directory and its
+/// ephemeral user, then unregister it. Returns the number cleaned.
+fn cleanOrphans(io: std.Io, allocator: std.mem.Allocator, reg: *registry.Registry) !u32 {
+    if (builtin.os.tag != .freebsd) {
+        // Without jail support there is only the registry entry to drop
+        return reg.cleanOrphaned();
+    } else {
+        var stdout_file = stdoutWriter(io);
+        const stdout = &stdout_file.interface;
+
+        var instances = try reg.list();
+        defer {
+            for (instances.items) |*inst| {
+                inst.deinit();
+            }
+            instances.deinit(allocator);
+        }
+
+        var cleaned: u32 = 0;
+        for (instances.items) |inst| {
+            // Still managed: its isolate process will clean up itself
+            if (inst.manager_pid > 0 and c.kill(inst.manager_pid, 0) == 0) continue;
+
+            try stdout.print("Instance '{s}' is orphaned (state: {s}, isolate process gone)\n", .{ inst.name, @tagName(inst.state) });
+            freebsd.teardownInstance(io, inst.jail_id, inst.jail_path, inst.username);
+            reg.unregister(inst.name);
+            cleaned += 1;
+        }
+        return cleaned;
+    }
 }
 
 /// Handle 'clean' command
@@ -700,7 +752,10 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
 
     try stdout.print("Cleaning orphaned instances...\n", .{});
 
-    const cleaned = try reg.cleanOrphaned();
+    const cleaned = if (c.geteuid() == 0)
+        try cleanOrphans(io, allocator, &reg)
+    else
+        try reg.cleanOrphaned();
 
     if (cleaned == 0) {
         try stdout.print("No orphaned instances found.\n", .{});
@@ -1020,6 +1075,7 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             var instance = registry.Instance{
                 .name = allocator.dupe(u8, name) catch name,
                 .pid = pid,
+                .manager_pid = c.getpid(),
                 .jail_id = jid,
                 .jail_path = allocator.dupe(u8, jailpath_slice) catch jailpath_slice,
                 .username = allocator.dupe(u8, username_slice) catch username_slice,
