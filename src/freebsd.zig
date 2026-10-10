@@ -92,7 +92,6 @@ var jail_state = struct {
     jail_id: i32 = -1,
     ephemeral_username: [64]u8 = [_]u8{0} ** 64,
     jail_root_path: [PATH_MAX]u8 = [_]u8{0} ** PATH_MAX,
-    instance_tmp_path: [PATH_MAX]u8 = [_]u8{0} ** PATH_MAX,
 
     pub fn setJailId(self: *@This(), jid: i32) void {
         self.jail_id = jid;
@@ -110,12 +109,6 @@ var jail_state = struct {
         self.jail_root_path[len] = 0;
     }
 
-    pub fn setInstanceTmpPath(self: *@This(), path: []const u8) void {
-        const len = @min(path.len, self.instance_tmp_path.len - 1);
-        @memcpy(self.instance_tmp_path[0..len], path[0..len]);
-        self.instance_tmp_path[len] = 0;
-    }
-
     pub fn getUsername(self: *const @This()) []const u8 {
         const len = std.mem.findScalar(u8, &self.ephemeral_username, 0) orelse self.ephemeral_username.len;
         return self.ephemeral_username[0..len];
@@ -126,10 +119,6 @@ var jail_state = struct {
         return self.jail_root_path[0..len];
     }
 
-    pub fn getInstanceTmpPath(self: *const @This()) []const u8 {
-        const len = std.mem.findScalar(u8, &self.instance_tmp_path, 0) orelse self.instance_tmp_path.len;
-        return self.instance_tmp_path[0..len];
-    }
 }{};
 
 // Export functions for C interop (IPC between parent/child)
@@ -234,7 +223,11 @@ pub fn copyFile(src: []const u8, dst: []const u8) !void {
     }
 }
 
-/// Recursively remove a directory tree
+/// Recursively remove a directory tree. Never descends into another
+/// filesystem (FTS_XDEV): a mount that is still in place under `path` - a
+/// nullfs mount of a host directory, the workspace, devfs - keeps its
+/// contents; only the mount point directory itself is attempted (and fails
+/// harmlessly with EBUSY).
 pub fn rmrf(path: []const u8) !void {
     var path_buf: [PATH_MAX]u8 = undefined;
     if (path.len >= PATH_MAX) return error.InvalidPath;
@@ -244,7 +237,7 @@ pub fn rmrf(path: []const u8) !void {
 
     var paths: [2][*c]u8 = .{ &path_buf, null };
 
-    const fts = c.fts_open(@ptrCast(&paths), c.FTS_PHYSICAL | c.FTS_NOCHDIR | c.FTS_NOSTAT, null);
+    const fts = c.fts_open(@ptrCast(&paths), c.FTS_PHYSICAL | c.FTS_NOCHDIR | c.FTS_NOSTAT | c.FTS_XDEV, null);
     if (fts == null) return error.FilesystemSetupFailed;
     defer _ = c.fts_close(fts);
 
@@ -353,6 +346,54 @@ pub fn unmount(path: []const u8) void {
         // Try force unmount
         _ = c.unmount(&path_buf, c.MNT_FORCE);
     }
+}
+
+/// Whether `path` is `root` itself or somewhere below it
+fn isPathUnder(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len == root.len or path[root.len] == '/';
+}
+
+/// Unmount every filesystem mounted at or below `root`, deepest first, so
+/// that nested mounts come off before the mounts they sit on. Uses the
+/// kernel's mount table rather than a fixed list of expected mount points:
+/// every `filesystem:` rule in the capability file adds a mount, and a
+/// mount that was missed here would otherwise have its host contents
+/// deleted by the following rmrf. Stops when nothing under `root` is
+/// mounted or when a mount cannot be removed even with MNT_FORCE.
+fn unmountAllUnder(root: []const u8) void {
+    var last_buf: [PATH_MAX]u8 = undefined;
+    var last: []const u8 = "";
+
+    while (true) {
+        var mounts: [*c]c.struct_statfs = null;
+        const count = c.getmntinfo(&mounts, c.MNT_NOWAIT);
+        if (count <= 0) return;
+
+        // Pick the deepest mount point under root
+        var deepest: ?[]const u8 = null;
+        for (mounts[0..@intCast(count)]) |*m| {
+            const mnt = std.mem.sliceTo(&m.f_mntonname, 0);
+            if (!isPathUnder(mnt, root)) continue;
+            if (deepest == null or mnt.len > deepest.?.len) deepest = mnt;
+        }
+        const target = deepest orelse return;
+
+        // No progress since the last attempt: give up rather than spin
+        if (std.mem.eql(u8, target, last)) return;
+        if (target.len >= last_buf.len) return;
+        @memcpy(last_buf[0..target.len], target);
+        last = last_buf[0..target.len];
+
+        unmount(target);
+    }
+}
+
+/// Tear down a per-instance directory: unmount everything mounted below
+/// it, then remove the tree (without crossing into anything still mounted).
+pub fn cleanupInstanceDir(inst_dir: []const u8) void {
+    unmountAllUnder(inst_dir);
+    rmrf(inst_dir) catch {};
 }
 
 // ============================================================================
@@ -950,9 +991,6 @@ pub fn setupFilesystemIsolation(
                     _ = std.c.chmod(@ptrCast(&tmp_buf), 0o1777);
                 }
 
-                // Store path for cleanup
-                jail_state.setInstanceTmpPath(instance_tmp);
-
                 // Mount instance-specific tmp as /tmp in jail
                 const mount_path = std.fmt.bufPrint(&path_buf, "{s}/tmp", .{jail_path}) catch continue;
                 mkdirp(mount_path) catch continue;
@@ -1008,7 +1046,6 @@ pub fn setupFilesystemIsolation(
 pub fn cleanupIsolation(io: std.Io) void {
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
-    var path_buf: [PATH_MAX]u8 = undefined;
 
     const jid = jail_state.jail_id;
     if (jid >= 0) {
@@ -1017,35 +1054,14 @@ pub fn cleanupIsolation(io: std.Io) void {
         jail_state.jail_id = -1;
     }
 
-    // Cleanup jail filesystem
+    // Cleanup jail filesystem: the whole per-instance directory (jail
+    // root, isolated tmp), after unmounting everything below it
     const jail_path = jail_state.getJailPath();
     if (jail_path.len > 0) {
-        stdout.print("Cleaning up jail filesystem: {s}\n", .{jail_path}) catch {};
-
-        // Unmount filesystems (best effort)
-        const mount_points = [_][]const u8{
-            "/tmp", "/workspace", "/dev", "/bin", "/lib",
-            "/libexec", "/usr/lib", "/usr/local/lib",
-        };
-
-        for (mount_points) |mp| {
-            if (std.fmt.bufPrint(&path_buf, "{s}{s}", .{ jail_path, mp })) |formatted| {
-                unmount(formatted);
-            } else |_| {}
-        }
-
-        // Remove jail directory tree
-        rmrf(jail_path) catch {};
-
+        const inst_dir = instanceDir(jail_path);
+        stdout.print("Cleaning up instance directory: {s}\n", .{inst_dir}) catch {};
+        cleanupInstanceDir(inst_dir);
         jail_state.jail_root_path[0] = 0;
-    }
-
-    // Cleanup instance-specific tmp directory
-    const instance_tmp = jail_state.getInstanceTmpPath();
-    if (instance_tmp.len > 0) {
-        stdout.print("Cleaning up instance tmp: {s}\n", .{instance_tmp}) catch {};
-        rmrf(instance_tmp) catch {};
-        jail_state.instance_tmp_path[0] = 0;
     }
 
     // Cleanup ephemeral user
@@ -1211,6 +1227,13 @@ test "copyFile copies file correctly" {
     _ = c.unlink(&dst_buf);
 }
 
+test "isPathUnder" {
+    try std.testing.expect(isPathUnder("/var/run/isolate/inst-abc", "/var/run/isolate/inst-abc"));
+    try std.testing.expect(isPathUnder("/var/run/isolate/inst-abc/root/lib", "/var/run/isolate/inst-abc"));
+    try std.testing.expect(!isPathUnder("/var/run/isolate/inst-abcdef", "/var/run/isolate/inst-abc"));
+    try std.testing.expect(!isPathUnder("/var/run", "/var/run/isolate/inst-abc"));
+}
+
 test "jail_state management" {
     jail_state.setJailId(42);
     try std.testing.expectEqual(@as(i32, 42), jail_state.jail_id);
@@ -1221,12 +1244,8 @@ test "jail_state management" {
     jail_state.setJailPath("/tmp/test-jail");
     try std.testing.expectEqualStrings("/tmp/test-jail", jail_state.getJailPath());
 
-    jail_state.setInstanceTmpPath("/tmp/isolate-test-tmp");
-    try std.testing.expectEqualStrings("/tmp/isolate-test-tmp", jail_state.getInstanceTmpPath());
-
     // Reset
     jail_state.jail_id = -1;
     jail_state.ephemeral_username = [_]u8{0} ** 64;
     jail_state.jail_root_path = [_]u8{0} ** PATH_MAX;
-    jail_state.instance_tmp_path = [_]u8{0} ** PATH_MAX;
 }

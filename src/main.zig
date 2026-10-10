@@ -687,12 +687,20 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
         try stdout.print("Cleaned {d} orphaned instance(s).\n", .{cleaned});
     }
 
-    // Also clean any orphaned jail directories
+    // Also clean any orphaned instance directories
     if (builtin.os.tag == .freebsd and c.geteuid() == 0) {
-        try stdout.print("Checking for orphaned jail directories...\n", .{});
+        try stdout.print("Checking for orphaned instance directories...\n", .{});
 
-        // Clean /tmp/isolate-* directories that don't have running jails
-        var dir = std.Io.Dir.openDirAbsolute(io, "/tmp", .{ .iterate = true }) catch {
+        // Instances that are still running keep their directories
+        var instances = try reg.list();
+        defer {
+            for (instances.items) |*inst| {
+                inst.deinit();
+            }
+            instances.deinit(allocator);
+        }
+
+        var dir = std.Io.Dir.openDirAbsolute(io, registry.REGISTRY_DIR, .{ .iterate = true }) catch {
             return 0;
         };
         defer dir.close(io);
@@ -700,27 +708,34 @@ fn cmdClean(io: std.Io, allocator: std.mem.Allocator) !u8 {
         var cleaned_dirs: u32 = 0;
         var iter = dir.iterate();
         while (try iter.next(io)) |entry| {
-            if (entry.kind == .directory and std.mem.startsWith(u8, entry.name, "isolate-")) {
-                // Check if there's a corresponding running instance
-                const inst_opt = try reg.get(entry.name["isolate-".len..]);
-                if (inst_opt == null) {
-                    // No instance, try to remove
-                    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                    const path = std.fmt.bufPrint(&path_buf, "/tmp/{s}", .{entry.name}) catch continue;
+            if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "inst-")) continue;
 
-                    if (builtin.os.tag == .freebsd) {
-                        freebsd.rmrf(path) catch {};
-                        cleaned_dirs += 1;
-                    }
-                } else {
-                    var inst = inst_opt.?;
-                    inst.deinit();
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ registry.REGISTRY_DIR, entry.name }) catch continue;
+
+            // A running instance's jail root is <path>/root
+            var in_use = false;
+            for (instances.items) |inst| {
+                if (inst.state != .running) continue;
+                if (inst.jail_path.len > path.len and
+                    std.mem.startsWith(u8, inst.jail_path, path) and
+                    inst.jail_path[path.len] == '/')
+                {
+                    in_use = true;
+                    break;
                 }
+            }
+            if (in_use) continue;
+
+            if (builtin.os.tag == .freebsd) {
+                try stdout.print("Removing orphaned instance directory {s}\n", .{path});
+                freebsd.cleanupInstanceDir(path);
+                cleaned_dirs += 1;
             }
         }
 
         if (cleaned_dirs > 0) {
-            try stdout.print("Removed {d} orphaned jail directory(s).\n", .{cleaned_dirs});
+            try stdout.print("Removed {d} orphaned instance directory(s).\n", .{cleaned_dirs});
         }
     }
 

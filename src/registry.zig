@@ -162,6 +162,7 @@ pub const Registry = struct {
         name: []const u8,
         pid: i32,
         jail_id: i32,
+        jail_path: []const u8,
         binary_path: []const u8,
         state: InstanceState,
         start_time: i64,
@@ -170,6 +171,7 @@ pub const Registry = struct {
 
         pub fn deinit(self: *InstanceInfo) void {
             self.allocator.free(self.name);
+            self.allocator.free(self.jail_path);
             self.allocator.free(self.binary_path);
         }
     };
@@ -191,6 +193,8 @@ pub const Registry = struct {
         errdefer self.allocator.free(name);
         const pid = try extractJsonInt(content, "pid");
         const jail_id = try extractJsonInt(content, "jail_id");
+        const jail_path = try extractJsonString(self.allocator, content, "jail_path");
+        errdefer self.allocator.free(jail_path);
         const binary_path = try extractJsonString(self.allocator, content, "binary_path");
         errdefer self.allocator.free(binary_path);
         const start_time = try extractJsonInt(content, "start_time");
@@ -202,6 +206,7 @@ pub const Registry = struct {
             .name = name,
             .pid = @intCast(pid),
             .jail_id = @intCast(jail_id),
+            .jail_path = jail_path,
             .binary_path = binary_path,
             .state = state,
             .start_time = start_time,
