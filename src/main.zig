@@ -806,6 +806,28 @@ fn childExitCode(status: c_int) u8 {
     return 1;
 }
 
+// The jailed child's PID and the number of termination signals the parent
+// has received so far, for forwardSignal()
+var child_pid: c.pid_t = 0;
+var signals_received: u32 = 0;
+
+/// SIGINT/SIGTERM/SIGHUP in the parent: pass the first one on to the child
+/// so it can shut down; on the second, remove the jail, which kills
+/// everything inside it. The parent itself keeps waiting, so that the
+/// jail, mounts, directory and user are cleaned up once the child is gone
+/// instead of being left behind when the parent dies first.
+fn forwardSignal(sig: c_int) callconv(.c) void {
+    signals_received += 1;
+    if (child_pid <= 0) return;
+    if (signals_received >= 2) {
+        if (builtin.os.tag == .freebsd) {
+            freebsd.removeJail(freebsd.freebsd_get_jail_id());
+        }
+    } else {
+        _ = c.kill(child_pid, sig);
+    }
+}
+
 /// Run isolation using native Zig implementation
 fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const caps.Capabilities, target_binary: []const u8, args: []const []const u8, instance_name: ?[]const u8, verbose: bool) u8 {
     var stdout_file = stdoutWriter(io);
@@ -955,6 +977,13 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
             // Parent process
             _ = c.close(pipefd[1]);
 
+            // From here on, termination signals go to the child first and
+            // the jail second; the parent stays alive to clean up
+            child_pid = pid;
+            _ = c.signal(c.SIGINT, &forwardSignal);
+            _ = c.signal(c.SIGTERM, &forwardSignal);
+            _ = c.signal(c.SIGHUP, &forwardSignal);
+
             // Read jail info from child
             var jid: c_int = undefined;
             var username: [64]u8 = undefined;
@@ -1011,9 +1040,12 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
                 stdout.print("Instance '{s}' registered.\n", .{name}) catch {};
             }
 
-            // Wait for child
+            // Wait for child; a forwarded signal may interrupt the wait
             var status: c_int = undefined;
-            _ = c.waitpid(pid, &status, 0);
+            while (c.waitpid(pid, &status, 0) < 0) {
+                if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) break;
+            }
+            child_pid = 0;
 
             if (verbose) {
                 stdout.print("\nChild process exited, performing cleanup...\n", .{}) catch {};
