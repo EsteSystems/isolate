@@ -118,6 +118,8 @@ Options:
 - `-v, --verbose`: Verbose output
 - `-n, --dry-run`: Show configuration without executing
 
+Options must come before the binary. Everything after it is passed to the binary unchanged, so `isolate run -v ./myapp -v --port 80` gives `-v --port 80` to `myapp`. Use `--` if the binary's own name starts with a dash.
+
 #### `isolate detect [options] <binary> [output.caps]`
 
 Analyze a binary and generate a capability file.
