@@ -36,6 +36,8 @@ isolate is a single command-line program for FreeBSD. It has no daemon and keeps
 | `src/registry.zig` | ~430 | The on-disk registry of running instances. |
 | `src/syscheck.zig` | ~240 | Kernel feature detection for `isolate check` and for warnings. |
 | `src/c_api.zig` | ~40 | A shared `@cImport` of the libc headers `main.zig` uses. |
+| `src/freebsd_proc.c` | ~25 | One function, the parent of a process, in C because `<sys/user.h>` cannot be imported into Zig 0.16. |
+| `tests/scenarios.sh`, `tests/probe.c` | | End-to-end checks that create real jails; see "Tests". |
 
 `freebsd.zig` and `syscheck.zig` compile only on FreeBSD. On other systems the program builds, and `detect`, `list` and the tests work, but `run` reports that it is not supported.
 
@@ -58,7 +60,8 @@ isolate is a dynamically linked executable. At run time it uses:
 |---|---|
 | `libc`, `libjail` (FreeBSD base) | System calls; `jailparam_*`, `jail_getid`, `jail_getname`. |
 | `/usr/sbin/pw` | Creating and deleting the ephemeral user. |
-| `/sbin/ifconfig` | Moving an interface into a VNET jail and configuring it. |
+| `/sbin/ifconfig` | Moving an interface into a VNET jail, configuring it, and taking it back. |
+| `/sbin/devfs` | Hiding device nodes in the jail's `/dev`. |
 | A kernel with jails, nullfs and devfs | Always. |
 | `kern.racct.enable=1` | Resource limits. |
 | A kernel with `VIMAGE` | `network_mode: vnet`. |
@@ -77,29 +80,25 @@ pub const Capabilities = struct {
 
     username: []const u8,              // "auto" or an existing user's name
     create_user: bool,                 // true for "auto"
-    target_uid: ?u32, target_gid: ?u32,// unused
 
     workspace_path: ?[]const u8,       // host directory mounted at /workspace
     network_config: NetworkConfig,     // mode, interface, ip_address
 
     network_rules: std.ArrayList(NetworkRule),  // parsed, not enforced
-    network_default_deny: bool,                 // parsed, unused
     file_rules: std.ArrayList(FileRule),
-    fs_default_deny: bool,                      // parsed, unused
 
     env_vars: std.ArrayList(EnvVar),
     env_clear: bool,
 
-    limits: ResourceLimits,            // memory_bytes, max_processes, max_files,
-                                       // max_cpu_percent (parsed, unused)
+    limits: ResourceLimits,            // memory_bytes, max_processes, max_files
 };
 
 pub const NetworkMode = enum { inherit, none, vnet };
-pub const FileRule = struct { path: []const u8, permissions: Permission };  // read, write, execute
+pub const FileRule = struct { path: []const u8, permissions: Permission };  // read, or read and write
 pub const NetworkRule = struct { protocol: Protocol, address: []const u8, port: ?u16, direction: Direction };
 ```
 
-`load()` returns a `ParseResult`: the capabilities and a list of warnings (line number and message) for lines that could not be used.
+`load()` returns a `ParseResult`: the capabilities and a list of problems (line number and message), one for every line that cannot be applied as written. `run` refuses a file with any.
 
 ### Jail state (`freebsd.zig`)
 
@@ -156,7 +155,7 @@ The jail root contains a copy of the program at `/<basename>`, a two-line `etc/p
 ```
 main: parse arguments (options only before the binary)
       load <binary>.caps or -c file; apply -w and --vnet
-      require root
+      require root; refuse a name that is already registered
       fork ───────────────────────────────────────────────┐
                                                            │
   CHILD (becomes the program)              PARENT (waits and cleans up)
@@ -168,29 +167,32 @@ main: parse arguments (options only before the binary)
   3 build the jail filesystem:               from the pipe; on a short read
       directories                            the child failed: report, exit
       nullfs  workspace → /workspace       c write the registry entry
-      copy the binary to /<basename>       d waitpid(child)
-      write etc/passwd, etc/group          e jail_remove
-      mount devfs                            unmount everything under the
-      nullfs  one mount per rule              instance directory, deepest first
-  4 jail_set (create)                        remove the directory tree
-      VNET: ifconfig <if> vnet <jid>         pw userdel app-<pid>
-            ifconfig -j <jid> ... up         remove the jail's rctl rules
-  5 rctl_add_rule per limit                f delete the registry entry
-  6 jail_attach                            g exit with the child's status
-    setgroups, setgid, setuid
+      copy the binary to /<basename>         (exclusive; on failure stop the child)
+      write etc/passwd, etc/group          d waitpid(child)
+      mount devfs; hide all but a          e VNET: ifconfig <if> -vnet <jid>
+        few nodes (devfs rule apply)         jail_remove
+      nullfs  one mount per rule             unmount everything under the
+  4 jail_set (create)                         instance directory, deepest first
+      VNET: ifconfig <if> vnet <jid>         remove the directory tree
+            ifconfig -j <jid> ... up         pw userdel app-<pid>
+  5 rctl_add_rule per limit                  remove the jail's rctl rules
+  6 jail_attach                            f delete the registry entry
+    setgroups, setgid, setuid              g exit with the child's status
     set environment
   7 write jail id, username, path
     to the pipe
-  8 execv /<basename>
+  8 closefrom(3); execv /<basename>
 ```
 
-If any of the child's steps 1–6 fails, the child removes what it created and exits; it never writes to the pipe.
+If any of the child's steps 1–6 fails, the child removes what it created and exits; it never writes to the pipe. That includes a rule whose path does not exist, a limit that cannot be applied, and a VNET interface that cannot be moved or configured: nothing asked for in the capability file is skipped.
 
 Cleanup removes mounts by reading the kernel's mount table (`getmntinfo`) rather than from a list of expected mount points, and the directory removal uses `fts(3)` with `FTS_XDEV`, so it cannot descend into a filesystem that is still mounted.
 
 ### `stop` and `clean`
 
-Both work from registry entries. Before acting on an entry they check that each value still describes something isolate created: the directory must be `/var/run/isolate/inst-XXXXXX`, the user must be named `app-<digits>`, and the jail's name must be `isolate-<pid>` for the recorded pid. The steps are listed in [design/03-lifecycle.md](design/03-lifecycle.md).
+Both work from registry entries. Before acting on an entry they check that each value still describes something isolate created: the directory must be `/var/run/isolate/inst-XXXXXX`, the user must be named `app-<digits>`, and the jail's name must be `isolate-<pid>` for the recorded pid.
+
+`clean` then looks past the registry: it walks the kernel's jail list, the instance directories and the password database for anything of isolate's that no entry accounts for. To tell an abandoned jail from one whose run is still setting up, it asks whether the jailed process still has a parent other than init. The steps are listed in [design/03-lifecycle.md](design/03-lifecycle.md).
 
 ### `list`
 
@@ -221,15 +223,18 @@ Reads `kern.racct.enable`, `kern.features.vimage`, `security.jail.jailed`, `kern
 | Create the jail | `jailparam_init/import/set` (libjail) with `JAIL_CREATE` |
 | Enter the jail | `jail_attach(2)` |
 | Remove the jail | `jail_remove(2)` |
-| Check a jail | `jail_get(2)`, `jail_getid`, `jail_getname` (libjail) |
+| Check and list jails | `jail_get(2)` (with `lastjid` to iterate), `jail_getid`, `jail_getname` (libjail) |
+| Restrict `/dev` | `fork` + `execv("/sbin/devfs")`: `rule apply hide`, then `unhide` per node |
+| Find a process's parent | `sysctl(3)` `kern.proc.pid`, in `freebsd_proc.c` |
+| Find isolate's users | `getpwent(3)` |
 | Mount nullfs and devfs | `nmount(2)` |
 | Unmount | `getmntinfo(3)`, `unmount(2)`, with `MNT_FORCE` as a fallback |
 | Remove a directory tree | `fts(3)` with `FTS_PHYSICAL | FTS_XDEV` |
 | Resource limits | `rctl_add_rule(2)`, `rctl_remove_rule(2)`, `rctl_get_rules(2)` |
 | Create and delete the user | `fork` + `execv("/usr/sbin/pw")` |
-| VNET interface | `fork` + `execv("/sbin/ifconfig")` |
+| VNET interface | `fork` + `execv("/sbin/ifconfig")`: `vnet`, `-j <jid> … up`, `-vnet` |
 | Drop privileges | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
-| Start the program | `execv(2)` |
+| Start the program | `closefrom(2)`, `execv(2)` |
 
 ### Jail parameters
 
@@ -266,15 +271,15 @@ pub const JailError = error{
 };
 ```
 
-Failures of the main setup steps abort the run. Several lesser failures only print a warning and continue: a devfs or rule mount that fails, a resource limit that cannot be added, an interface that cannot be moved or configured, and VNET being unavailable. The design documents record each of these as a defect (ISO-11, LIM-5, NET-5).
+Every failure during setup aborts the run and removes what was created; none is downgraded to a warning (design: ISO-11, LIM-5, NET-5). The capability file is checked the same way before anything is created: a file with a line that cannot be applied is refused (CAP-2).
 
 Output goes to stdout and stderr through unbuffered, streaming writers, so that nothing is lost across `fork` and `execv` and so that redirected output interleaves correctly with the program's own.
 
 ## Tests
 
-`zig build test` runs the unit tests of every module: 36 on FreeBSD, 28 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry's JSON handling, and small helpers.
+`zig build test` runs the unit tests of every module: 45 on FreeBSD, 35 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry, generated capability files, and small helpers. None of them creates a jail.
 
-No test creates a jail. Behaviour that needs root and a FreeBSD kernel has been checked with shell scripts run by hand; those scripts are not in the repository.
+`tests/scenarios.sh` does. It needs FreeBSD and root, creates real jails, users, mounts, limits and an epair interface, and makes about 70 checks, each labelled with the invariant it demonstrates. It refuses to start on a host that already has isolate leftovers, and its last check is that it left none. Run it with `doas sh tests/scenarios.sh` after `zig build`.
 
 ## Measurements
 
@@ -285,4 +290,4 @@ Taken on one FreeBSD 15.1 virtual machine; they are indications, not guarantees.
 | Executable size | 5.5 MB | 4.1 MB | 0.27 MB |
 | `isolate run` of a hello-world with five mounts, start to finish | 0.10–0.12 s | 0.06–0.08 s | not measured |
 
-Most of that time is the two `pw` invocations that create and delete the ephemeral user: with `user: nobody` instead of `user: auto`, the same debug run takes 0.02–0.04 s.
+These were measured before `/dev` was restricted, which adds about a dozen `devfs` invocations per start. Most of the measured time is the two `pw` invocations that create and delete the ephemeral user: with `user: nobody` instead of `user: auto`, the same debug run takes 0.02–0.04 s.

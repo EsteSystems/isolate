@@ -9,7 +9,7 @@ Everything isolate creates for a run is removed when the run ends, however it en
 - `isolate run`: setup order, what the parent process does while the program runs, exit status, signals.
 - The registry of running instances.
 - `isolate list`, `isolate stop`, `isolate clean`.
-- Cleanup, including after isolate itself is killed.
+- Cleanup, including after isolate itself is killed or the host reboots.
 
 ## Out of scope
 
@@ -20,7 +20,7 @@ Everything isolate creates for a run is removed when the run ends, however it en
 
 ## How a run proceeds
 
-`isolate run` forks. The **child** becomes the program; the **parent** waits and cleans up.
+`isolate run` refuses to start if an instance of the same name is registered. Otherwise it forks. The **child** becomes the program; the **parent** waits and cleans up.
 
 Child, in order:
 
@@ -31,16 +31,16 @@ Child, in order:
 5. Add resource limits.
 6. Attach to the jail, drop to the user, set the environment.
 7. Send the jail id, username and jail path to the parent over a pipe.
-8. `execv` the program.
+8. Close every descriptor above 2 and `execv` the program.
 
 If any of steps 1–6 fails, the child removes what it created and exits non-zero. The parent sees a short read on the pipe and reports the failure without touching anything.
 
 Parent:
 
 1. Install handlers for `SIGINT`, `SIGTERM` and `SIGHUP`.
-2. Read the child's state from the pipe and write the registry entry.
+2. Read the child's state from the pipe and write the registry entry. If the entry cannot be written, stop the program.
 3. Wait for the child.
-4. Remove the jail, unmount everything under the instance directory, remove the directory, delete the ephemeral user, remove the jail's resource limits.
+4. Return a VNET jail's interface to the host, remove the jail, unmount everything under the instance directory, remove the directory, delete the ephemeral user, remove the jail's resource limits.
 5. Delete the registry entry and exit with the child's status.
 
 ## The registry
@@ -63,6 +63,7 @@ One JSON file per instance, `/var/run/isolate/<name>.json`:
 
 - `pid` is the jailed program. `manager_pid` is the `isolate run` process waiting for it.
 - The name is the `-N` value, or `<workspace or binary basename>-<8 hex digits>`. It may contain letters, digits, `.`, `_` and `-`, must not start with `.`, and is at most 64 bytes.
+- An entry is written to a temporary file and hard-linked into place. It therefore appears complete or not at all, and a name that is already taken is refused.
 - The directory is created by root with mode 0755. `isolate list` works unprivileged.
 
 An instance is **running** if its jail exists or its `pid` exists, **orphaned** if neither does. Separately, an instance is **unmanaged** when its `manager_pid` no longer exists; that is what `stop` and `clean` act on.
@@ -78,37 +79,44 @@ An instance is **running** if its jail exists or its `pid` exists, **orphaned** 
 **`clean`**
 
 1. For every registered instance whose manager is gone: remove its jail, limits, instance directory and ephemeral user, and delete the entry.
-2. Remove resource limits belonging to `isolate-*` jails that no longer exist.
-3. Remove every `inst-*` directory that is not the jail root of a running instance.
+2. Remove every jail named `isolate-<pid>` that no registered instance owns, unless process `<pid>` still has a living parent other than init.
+3. Remove resource limits belonging to `isolate-*` jails that no longer exist.
+4. Remove every `inst-*` directory that no jail has its root in and that was last modified more than 60 seconds ago.
+5. Delete every user named `app-<pid>` that carries isolate's comment, unless a registered instance uses it, process `<pid>` exists, or jail `isolate-<pid>` exists.
+
+Steps 2 to 5 are what make `clean` work with an empty registry, which is the situation after a reboot.
 
 ## Invariants
 
+"Tested" names a check in `tests/scenarios.sh`, run on FreeBSD 15.1.
+
 | ID | Invariant | Status |
 |---|---|---|
-| LIF-1 | When `isolate run` returns, nothing of the instance remains: no jail, mount, instance directory, ephemeral user, resource limit or registry entry. This holds when the program exits, is killed, or isolate receives `SIGINT`, `SIGTERM` or `SIGHUP`. | Holds (tested) for normal exit, a killed program, and two `SIGTERM`s. `SIGINT` and `SIGHUP` by inspection. |
-| LIF-2 | Whatever an `isolate run` leaves when it cannot clean up (it was killed with `SIGKILL`, or the host crashed) is removed by one `isolate clean`. | **Violated**. Holds (tested) when the registry entry survives. A jail or an `app-*` user with no registry entry is never found. After a reboot `/var/run` is empty, so every ephemeral user that existed at the time stays in the password database. |
+| LIF-1 | When `isolate run` returns, nothing of the instance remains: no jail, mount, instance directory, ephemeral user, resource limit or registry entry. This holds when the program exits, is killed, or isolate receives `SIGINT`, `SIGTERM` or `SIGHUP`. | Holds (tested) for normal exit, a killed program, a failed setup, two `SIGTERM`s, `stop -f` and a VNET run. `SIGINT` and `SIGHUP` by inspection. |
+| LIF-2 | Whatever an `isolate run` leaves when it cannot clean up (it was killed with `SIGKILL`, or the host crashed or rebooted) is removed by one `isolate clean`, with or without a registry entry. | Holds (tested): a registered orphan is removed completely; so are a jail, a user and a directory that have no registry entry. A managed instance is left running. |
 | LIF-3 | Cleanup never deletes or changes host data outside the instance directory. Mounts are removed before the directory tree, and removal never crosses a mount point. | Holds (tested): a workspace and an extra read-write rule keep their files. |
-| LIF-4 | `stop` and `clean` act only on things isolate created: a directory of the form `/var/run/isolate/inst-XXXXXX`, a user named `app-<digits>`, and a jail whose name is still `isolate-<pid>` for the recorded pid. Anything else in a registry entry is reported and skipped. | Holds (tested; unit tests `trustedInstanceDir…`, `isEphemeralUsername`) |
-| LIF-5 | Only root can create or change registry entries. The registry is never read from a directory another user can write. | Holds (tested): an entry planted in `/tmp` is ignored, and a non-root user cannot write `/var/run/isolate`. |
+| LIF-4 | `stop` and `clean` act only on things isolate created: a directory of the form `/var/run/isolate/inst-XXXXXX`, a user named `app-<digits>` with isolate's comment, and a jail named `isolate-<pid>`. | Holds (tested; unit tests): a jail and a user that merely look similar are left alone. |
+| LIF-5 | Only root can create or change registry entries. The registry is never read from a directory another user can write. | Holds (tested) |
 | LIF-6 | `stop` never unregisters an instance whose program is still running, unless `-f` is given. | Holds (tested) |
 | LIF-7 | `isolate run` exits with the program's exit status, or 128 plus the signal number if a signal ended it. | Holds (tested): 7 for `exit 7`, 137 for `SIGKILL`. |
-| LIF-8 | The first termination signal to `isolate run` is passed to the program. The second removes the jail. In both cases isolate stays alive until it has cleaned up. | Holds (tested) with `SIGTERM` |
-| LIF-9 | Instance names are unique among running instances. | **Violated** (by inspection): a second run with the same `-N` overwrites the first's registry entry, and whichever exits first deletes it. |
-| LIF-10 | A registry entry is either absent or complete. | **Violated** (by inspection): the file is written in place, so a concurrent `list` can read a partial entry. It is then skipped, not misread. |
+| LIF-8 | The first termination signal to `isolate run` is passed to the program. The second kills it. In both cases isolate stays alive until it has cleaned up. | Holds (tested) with `SIGTERM` |
+| LIF-9 | Instance names are unique among registered instances. | Holds (tested; unit test): a second run with a name in use is refused before anything is created, and the first instance's entry is untouched. |
+| LIF-10 | A registry entry is either absent or complete. | Holds (unit test `register is exclusive and leaves no temporary file`) |
 
 ## Success criteria
 
-After each of the following, the host has no `isolate-*` jail, no mount under `/var/run/isolate`, no `inst-*` directory, no `app-*` user, no `jail:isolate-*` resource limit and no registry entry:
+After each of the following, the host has no `isolate-*` jail, no mount under `/var/run/isolate`, no `inst-*` directory, no `app-*` user of isolate's, no `jail:isolate-*` resource limit and no registry entry:
 
 1. A program that exits normally.
 2. A program that is killed.
 3. `SIGTERM` sent twice to `isolate run` while a program that ignores it is running.
 4. `isolate stop -f` on such a program.
 5. `kill -9` of the `isolate run` process, followed by `isolate clean`.
+6. A jail, a user and a directory of isolate's with no registry entry, followed by `isolate clean`.
 
-In every case, files in a mounted workspace and in a read-write rule directory are unchanged.
+In every case, files in a mounted workspace and in a read-write rule directory are unchanged, and a jail or user that isolate did not create is untouched.
 
-All five pass on FreeBSD 15.1.
+All six pass.
 
 ## Failure criteria
 
@@ -116,12 +124,14 @@ All five pass on FreeBSD 15.1.
 - A non-root user can cause `stop` or `clean` to remove or signal anything.
 - `stop` reports success while the program is still running.
 - A run leaves a jail, mount, user or limit behind and `clean` reports nothing to do.
-
-The last one occurs today in the situation described under LIF-2.
+- `clean` removes anything belonging to an instance whose `isolate run` process is alive.
 
 ## Known gaps
 
-- **The scenarios above are not automated.** They exist as shell scripts run by hand on a test machine. `zig build test` covers parsing and path validation only; nothing in the repository creates a jail.
+- **The scenarios need root and FreeBSD, and are not part of `zig build test`.** They are `tests/scenarios.sh`, run by hand.
+- **Removed jails can linger as "dying".** FreeBSD keeps a removed jail until its last kernel reference is gone; a TCP connection the program made is enough to hold one for some time. Such a jail has no processes, no mounts and no interfaces of isolate's left in it, and `jls` does not list it without `-d`.
+- `clean` decides that an unregistered jail is abandoned by looking at its process's parent. If the `isolate run` process died and something other than init adopted the program, the jail is treated as managed and left alone.
+- `clean` keeps an ephemeral user while any process has the pid in its name, so a reused pid can delay its removal until a later `clean`.
+- A directory newer than 60 seconds is never treated as orphaned, so `clean` run immediately after a crash may leave an unregistered directory for the next run of `clean`.
 - Ephemeral usernames are `app-<pid>`. If a user of that name already exists (left by a crash), it is reused and then deleted.
-- The jail is created with `persist`, so a jail outlives its last process until someone removes it. This is what makes LIF-2 matter.
 - `stop` waits a fixed five seconds. It is not configurable.
