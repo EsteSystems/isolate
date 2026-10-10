@@ -55,6 +55,12 @@ fn instanceDir(jail_path: []const u8) []const u8 {
 // stat(2) against std.c.Stat; std.c.stat is missing its extern in Zig 0.16
 extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
 
+// libc's environment pointer. FreeBSD has no clearenv(3); its setenv(3)
+// notices when `environ` has been replaced and continues from the new
+// array, so pointing it at an empty one clears the environment.
+extern var environ: [*c][*c]u8;
+var empty_environ = [_:null]?[*:0]u8{};
+
 /// Unbuffered stdout writer. Unbuffered so that nothing is left behind in a
 /// buffer across fork()/execv()/_exit() in the isolation path.
 fn stdoutWriter(io: std.Io) std.Io.File.Writer {
@@ -823,10 +829,11 @@ pub fn setupEnvironment(io: std.Io, capability: *const caps.Capabilities, userna
     var stdout_file = stdoutWriter(io);
     const stdout = &stdout_file.interface;
 
-    // Clear environment if requested
+    // Start from an empty environment if requested, so that nothing from
+    // the invoking root shell (doas/sudo) reaches the application
     if (capability.env_clear) {
         stdout.print("Clearing environment variables\n", .{}) catch {};
-        // In Zig we can't easily clear environ, so we'll set essential vars
+        environ = @ptrCast(&empty_environ);
     }
 
     // Set essential variables

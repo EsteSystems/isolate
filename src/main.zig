@@ -537,9 +537,6 @@ fn cmdRun(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions) !u8 {
         return 1;
     }
 
-    // Set environment variable for C code
-    _ = c.setenv("ISOLATE_TARGET_BINARY", @ptrCast(target_binary.ptr), 1);
-
     if (opts.verbose) {
         try stdout.print("Creating isolation context...\n", .{});
     }
