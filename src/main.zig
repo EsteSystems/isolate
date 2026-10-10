@@ -1,7 +1,7 @@
 //! isolate - Infrastructureless container runner
 //!
 //! This is the main entry point for the isolate tool. It provides process
-//! isolation using native OS primitives (FreeBSD jails, Linux namespaces).
+//! isolation using FreeBSD jails.
 //!
 //! Usage:
 //!   isolate <command> [options] [arguments]
@@ -1138,9 +1138,8 @@ fn runIsolation(io: std.Io, allocator: std.mem.Allocator, capability: *const cap
 
         return 0;
     } else {
-        // Linux and other platforms - not yet implemented in Zig
-        stderr.print("Error: Native Zig isolation not yet implemented for this platform\n", .{}) catch {};
-        stderr.print("Use the C version or wait for Phase 4 (Linux support)\n", .{}) catch {};
+        // Only FreeBSD is supported
+        stderr.print("Error: isolate can only run programs in isolation on FreeBSD\n", .{}) catch {};
         return 1;
     }
 }

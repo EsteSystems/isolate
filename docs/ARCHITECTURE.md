@@ -1,605 +1,288 @@
 # Architecture
 
-This document describes the architecture of isolate, a process isolation tool using native OS primitives.
+This document describes how isolate is built: its modules, the data it keeps, and what happens during each command. What isolate must guarantee, and what it deliberately leaves out, is specified in the [design documents](design/README.md).
+
+isolate is a single command-line program for FreeBSD. It has no daemon and keeps no state apart from one small file per running instance.
 
 ## Overview
 
-isolate provides container-like isolation without container infrastructure. Instead of images, layers, and runtimes, it uses the operating system's native isolation mechanisms directly.
-
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         User Interface                          │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-│  │   run   │ │ detect  │ │  list   │ │  stop   │ │  clean  │   │
-│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘   │
-└───────┼──────────┼──────────┼──────────┼──────────┼─────────────┘
-        │          │          │          │          │
-┌───────┼──────────┼──────────┼──────────┼──────────┼─────────────┐
-│       │          │          └──────────┴──────────┘             │
-│       │          │                     │                        │
-│  ┌────▼────┐ ┌───▼────┐         ┌─────▼─────┐                  │
-│  │  caps   │ │ detect │         │ registry  │                  │
-│  │ parser  │ │ (ELF)  │         │ (JSON)    │                  │
-│  └────┬────┘ └────────┘         └───────────┘                  │
-│       │                                                         │
-│  ┌────▼────────────────────────────────────────┐               │
-│  │              Platform Abstraction            │               │
-│  └────┬────────────────────────────────────────┘               │
-│       │                                                         │
-│  ┌────▼────────────────────────────────────────┐               │
-│  │              FreeBSD / Linux                 │               │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐    │               │
-│  │  │  Jails   │ │  Users   │ │  rctl    │    │               │
-│  │  └──────────┘ └──────────┘ └──────────┘    │               │
-│  └─────────────────────────────────────────────┘               │
-│                        Core Modules                             │
-└─────────────────────────────────────────────────────────────────┘
+                      isolate <command>
+   ┌────────┬─────────┬────────┬────────┬─────────┬─────────┐
+   │  run   │ detect  │  list  │  stop  │  clean  │  check  │   main.zig
+   └───┬────┴────┬────┴───┬────┴───┬────┴────┬────┴────┬────┘
+       │         │        │        │         │         │
+       ▼         ▼        └────────┼─────────┘         ▼
+   caps.zig   detect.zig           ▼              syscheck.zig
+   (parse     (ELF            registry.zig        (racct, VNET,
+    .caps)     analysis)      (/var/run/isolate)   jails, root)
+       │                           ▲
+       ▼                           │
+   freebsd.zig ────────────────────┘
+   jail, mounts, user, rctl, VNET, cleanup
+       │
+       ▼
+   FreeBSD: jail(2), nmount(2), rctl(2), libjail, pw(8), ifconfig(8)
 ```
 
-## Module Structure
+## Source files
 
-### Source Files
+| File | Lines | Responsibility |
+|---|---|---|
+| `src/main.zig` | ~1270 | Argument parsing, the six commands, the fork between the jailed program and the process that waits for it, signal forwarding. |
+| `src/freebsd.zig` | ~1450 | Everything that touches the system: instance directory, mounts, ephemeral user, jail creation, VNET, resource limits, privilege drop, cleanup and teardown. |
+| `src/caps.zig` | ~880 | The `Capabilities` structure and the capability-file parser. |
+| `src/detect.zig` | ~740 | ELF reading and the heuristics behind `isolate detect`. |
+| `src/registry.zig` | ~430 | The on-disk registry of running instances. |
+| `src/syscheck.zig` | ~240 | Kernel feature detection for `isolate check` and for warnings. |
+| `src/c_api.zig` | ~40 | A shared `@cImport` of the libc headers `main.zig` uses. |
+
+`freebsd.zig` and `syscheck.zig` compile only on FreeBSD. On other systems the program builds, and `detect`, `list` and the tests work, but `run` reports that it is not supported.
+
+### Dependencies between modules
 
 ```
-src/
-├── main.zig        Entry point, CLI parsing, command dispatch
-├── caps.zig        Capability file parser and data structures
-├── detect.zig      ELF binary analysis for capability detection
-├── freebsd.zig     FreeBSD jail implementation
-├── registry.zig    Instance tracking and persistence
-├── syscheck.zig    Kernel feature detection (racct, VNET)
-└── c_api.zig       C library bindings for system calls
+main.zig ──► caps.zig, detect.zig, registry.zig, c_api.zig
+         ──► freebsd.zig, syscheck.zig        (FreeBSD only)
+
+freebsd.zig ──► caps.zig, syscheck.zig, registry.zig (for the runtime directory path)
+
+caps.zig, detect.zig, registry.zig, syscheck.zig ──► standard library and libc only
 ```
 
-### Module Dependencies
+### External dependencies
 
-```
-main.zig
-├── caps.zig
-├── detect.zig
-├── registry.zig
-├── freebsd.zig (conditional: FreeBSD only)
-├── syscheck.zig (conditional: FreeBSD only)
-└── c_api.zig
+isolate is a dynamically linked executable. At run time it uses:
 
-freebsd.zig
-├── caps.zig
-└── syscheck.zig
+| Dependency | Used for |
+|---|---|
+| `libc`, `libjail` (FreeBSD base) | System calls; `jailparam_*`, `jail_getid`, `jail_getname`. |
+| `/usr/sbin/pw` | Creating and deleting the ephemeral user. |
+| `/sbin/ifconfig` | Moving an interface into a VNET jail and configuring it. |
+| A kernel with jails, nullfs and devfs | Always. |
+| `kern.racct.enable=1` | Resource limits. |
+| A kernel with `VIMAGE` | `network_mode: vnet`. |
 
-detect.zig
-└── (standalone, uses std only)
+Building needs Zig 0.16.0 and nothing else.
 
-registry.zig
-└── (standalone, uses std and libjail)
+## Data structures
 
-caps.zig
-└── (standalone, uses std only)
-```
+### `Capabilities` (`caps.zig`)
 
-## Data Structures
-
-### Capabilities (`caps.zig`)
-
-The `Capabilities` structure defines the complete isolation specification:
+The parsed capability file, plus command-line overrides.
 
 ```zig
 pub const Capabilities = struct {
     allocator: Allocator,
 
-    // User context
-    username: []const u8,         // "auto" or an existing user name
-    create_user: bool,            // Create ephemeral user (username == "auto")
+    username: []const u8,              // "auto" or an existing user's name
+    create_user: bool,                 // true for "auto"
+    target_uid: ?u32, target_gid: ?u32,// unused
 
-    // Workspace
-    workspace_path: ?[]const u8,  // Host path for /workspace mount
+    workspace_path: ?[]const u8,       // host directory mounted at /workspace
+    network_config: NetworkConfig,     // mode, interface, ip_address
 
-    // Network isolation mode (inherit, none, vnet) and VNET settings
-    network_config: NetworkConfig,
+    network_rules: std.ArrayList(NetworkRule),  // parsed, not enforced
+    network_default_deny: bool,                 // parsed, unused
+    file_rules: std.ArrayList(FileRule),
+    fs_default_deny: bool,                      // parsed, unused
 
-    // Access rules
-    network_rules: ArrayList(NetworkRule),  // Parsed and listed, not enforced
-    file_rules: ArrayList(FileRule),
-    env_vars: ArrayList(EnvVar),
-    env_clear: bool,              // Start from an empty environment
+    env_vars: std.ArrayList(EnvVar),
+    env_clear: bool,
 
-    // Resource limits (null = unlimited)
-    limits: ResourceLimits,       // memory_bytes, max_processes, max_files
+    limits: ResourceLimits,            // memory_bytes, max_processes, max_files,
+                                       // max_cpu_percent (parsed, unused)
 };
 
-pub const NetworkRule = struct {
-    protocol: Protocol,           // tcp, udp, unix, none
-    address: []const u8,          // Optional address or socket path
-    port: ?u16,
-    direction: Direction,         // inbound, outbound, both
-};
-
-pub const FileRule = struct {
-    path: []const u8,
-    permissions: Permissions,     // read, write, execute
-};
+pub const NetworkMode = enum { inherit, none, vnet };
+pub const FileRule = struct { path: []const u8, permissions: Permission };  // read, write, execute
+pub const NetworkRule = struct { protocol: Protocol, address: []const u8, port: ?u16, direction: Direction };
 ```
 
-### Instance Registry (`registry.zig`)
+`load()` returns a `ParseResult`: the capabilities and a list of warnings (line number and message) for lines that could not be used.
 
-The registry tracks running instances for management:
+### Jail state (`freebsd.zig`)
+
+A process-wide structure holding what cleanup needs: the jail id, the ephemeral username and the jail root path. The child fills it in while setting up. Because parent and child are separate processes after `fork`, the child sends these three values to the parent over a pipe, and the parent stores them in its own copy.
+
+### `Instance` (`registry.zig`)
 
 ```zig
 pub const Instance = struct {
-    name: []const u8,             // Unique instance identifier
-    pid: i32,                     // Process ID (inside the jail)
-    manager_pid: i32,             // The isolate process waiting for it
-    jail_id: i32,                 // FreeBSD jail ID
-    jail_path: []const u8,        // Jail filesystem root
-    username: []const u8,         // Ephemeral user (if created)
-    binary_path: []const u8,      // Original binary path
-    start_time: i64,              // Unix timestamp
-    workspace_path: ?[]const u8,  // Mounted workspace (if any)
+    name: []const u8,            // registry key; [A-Za-z0-9._-], at most 64 bytes
+    pid: i32,                    // the jailed program
+    manager_pid: i32,            // the `isolate run` process waiting for it
+    jail_id: i32,
+    jail_path: []const u8,       // /var/run/isolate/inst-XXXXXX/root
+    username: []const u8,        // app-<pid>, or the existing user's name
+    binary_path: []const u8,     // as given on the command line
+    start_time: i64,             // seconds since the epoch
+    workspace_path: ?[]const u8,
 };
 
-pub const InstanceState = enum {
-    running,                      // Process and jail active
-    stopped,                      // Clean shutdown
-    orphaned,                     // Process gone, cleanup needed
-};
+pub const InstanceState = enum { running, stopped, orphaned };
 ```
 
-### Detection Results (`detect.zig`)
+Reading an entry back yields an `InstanceInfo` with the same fields (minus the workspace) and a computed `state`.
 
-Binary analysis produces capability hints:
+### `CapabilityHint` (`detect.zig`)
 
 ```zig
 pub const CapabilityHint = struct {
-    capability_type: CapabilityType,
-    value: []const u8,
-    confidence: u8,               // 0-100
-    source: []const u8,           // What triggered this hint
-};
-
-pub const CapabilityType = enum {
-    filesystem,
-    network,
-    memory,
-    process,
-    environment,
+    description: []const u8,     // why: "Socket operations detected (server)"
+    capability: []const u8,      // one or more capability-file lines
+    confidence: u8,              // 0-100; used only to order the output
 };
 ```
 
-## Execution Flow
-
-### Run Command
+## On-disk layout
 
 ```
-1. Parse CLI arguments
-2. Load capability file (or use defaults)
-3. Validate workspace directory (if specified)
-4. Check root privileges
-5. Fork process
-   │
-   ├─ Child Process:
-   │   1. Create jail filesystem
-   │   2. Create ephemeral user (if auto)
-   │   3. Mount required directories (nullfs)
-   │   4. Create jail via jail_set()
-   │   5. Set resource limits (rctl)
-   │   6. Attach to jail
-   │   7. Switch to ephemeral user
-   │   8. Send jail info to parent (via pipe)
-   │   9. execv() target binary
-   │
-   └─ Parent Process:
-       1. Receive jail info from child
-       2. Register instance in registry
-       3. Wait for child (waitpid)
-       4. Cleanup:
-          - Remove jail (jail_remove)
-          - Unmount filesystems
-          - Remove jail directory
-          - Delete ephemeral user
-       5. Unregister instance
-       6. Return exit code
+/var/run/isolate/                      created by root, 0755
+├── <instance name>.json               registry entry, one per running instance
+└── inst-XXXXXX/                       one per run, from mkdtemp(3)
+    ├── root/                          the jail's root filesystem
+    └── tmp/                           backs the jail's /tmp when a /tmp rule exists
 ```
 
-### Detect Command
+Nothing is written anywhere else. In particular nothing is created under `/tmp`.
+
+The jail root contains a copy of the program at `/<basename>`, a two-line `etc/passwd` and `etc/group`, devfs at `dev`, and empty directories that the rules mount over. The full list is in [design/01-isolation.md](design/01-isolation.md).
+
+## Execution flow
+
+### `run`
 
 ```
-1. Parse CLI arguments
-2. Open and parse ELF binary
-3. Analysis phases:
-   │
-   ├─ Library Dependencies:
-   │   - Parse PT_DYNAMIC segment
-   │   - Extract DT_NEEDED entries
-   │   - Map libraries to capabilities
-   │
-   ├─ Symbol Analysis:
-   │   - Parse .dynsym section
-   │   - Find network/file symbols
-   │   - Infer required access
-   │
-   ├─ String Analysis:
-   │   - Scan .rodata section
-   │   - Find paths, URLs, ports
-   │   - Extract configuration hints
-   │
-   └─ Pattern Recognition:
-       - Match known application signatures
-       - Apply application-specific rules
-
-4. Merge hints with confidence scoring
-5. Generate capability file
+main: parse arguments (options only before the binary)
+      load <binary>.caps or -c file; apply -w and --vnet
+      require root
+      fork ───────────────────────────────────────────────┐
+                                                           │
+  CHILD (becomes the program)              PARENT (waits and cleans up)
+  ───────────────────────────              ────────────────────────────
+  1 create user app-<pid>, or look up      a handle SIGINT, SIGTERM, SIGHUP:
+    the named one                            first → signal the child
+  2 mkdtemp /var/run/isolate/inst-XXXXXX     second → remove the jail
+    mkdir root/                            b read jail id, username, path
+  3 build the jail filesystem:               from the pipe; on a short read
+      directories                            the child failed: report, exit
+      nullfs  workspace → /workspace       c write the registry entry
+      copy the binary to /<basename>       d waitpid(child)
+      write etc/passwd, etc/group          e jail_remove
+      mount devfs                            unmount everything under the
+      nullfs  one mount per rule              instance directory, deepest first
+  4 jail_set (create)                        remove the directory tree
+      VNET: ifconfig <if> vnet <jid>         pw userdel app-<pid>
+            ifconfig -j <jid> ... up         remove the jail's rctl rules
+  5 rctl_add_rule per limit                f delete the registry entry
+  6 jail_attach                            g exit with the child's status
+    setgroups, setgid, setuid
+    set environment
+  7 write jail id, username, path
+    to the pipe
+  8 execv /<basename>
 ```
 
-## FreeBSD Implementation
+If any of the child's steps 1–6 fails, the child removes what it created and exits; it never writes to the pipe.
 
-### Jail Lifecycle
+Cleanup removes mounts by reading the kernel's mount table (`getmntinfo`) rather than from a list of expected mount points, and the directory removal uses `fts(3)` with `FTS_XDEV`, so it cannot descend into a filesystem that is still mounted.
 
-```
-Creation:
-┌─────────────────────────────────────────────────────────────┐
-│ 1. Generate unique jail name (isolate-<pid>)                │
-│ 2. Create instance dir: /var/run/isolate/inst-XXXXXX/      │
-│    (mkdtemp; root-owned parent, unpredictable name)         │
-│ 3. Create jail root inside it:                              │
-│    /var/run/isolate/inst-XXXXXX/root/                       │
-│    ├── bin/           (empty or minimal)                    │
-│    ├── lib/           (nullfs mount)                        │
-│    ├── libexec/       (nullfs mount)                        │
-│    ├── usr/lib/       (nullfs mount)                        │
-│    ├── dev/           (devfs mount)                         │
-│    ├── etc/           (passwd, group files)                 │
-│    ├── tmp/           (writable)                            │
-│    └── workspace/     (nullfs mount if specified)           │
-│ 4. Create passwd/group with ephemeral user                  │
-│ 5. Call jail_set() with parameters                          │
-│ 6. Apply rctl rules for resource limits                     │
-└─────────────────────────────────────────────────────────────┘
+### `stop` and `clean`
 
-Attachment:
-┌─────────────────────────────────────────────────────────────┐
-│ 1. jail_attach(jid) - Enter jail context                    │
-│ 2. setgid(gid) - Set group                                  │
-│ 3. setuid(uid) - Drop to ephemeral user                     │
-│ 4. chdir("/") - Move to jail root                           │
-└─────────────────────────────────────────────────────────────┘
+Both work from registry entries. Before acting on an entry they check that each value still describes something isolate created: the directory must be `/var/run/isolate/inst-XXXXXX`, the user must be named `app-<digits>`, and the jail's name must be `isolate-<pid>` for the recorded pid. The steps are listed in [design/03-lifecycle.md](design/03-lifecycle.md).
 
-Cleanup:
-┌─────────────────────────────────────────────────────────────┐
-│ 1. jail_remove(jid) - Terminate jail and all processes      │
-│ 2. Unmount all nullfs/devfs mounts                          │
-│ 3. rmrf(jail_root) - Remove jail filesystem                 │
-│ 4. pw userdel <user> - Remove ephemeral user                │
-└─────────────────────────────────────────────────────────────┘
-```
+### `list`
 
-### System Calls Used
+Reads every `*.json` in the registry directory and computes each instance's state: **running** if a jail with the recorded id exists (`jail_get`) or the recorded pid exists (`kill(pid, 0)`), **orphaned** if the pid does not exist, **stopped** otherwise.
 
-| Operation | System Call | Purpose |
-|-----------|-------------|---------|
-| Jail creation | `jail_set()` | Create and configure jail |
-| Jail attachment | `jail_attach()` | Enter jail context |
-| Jail removal | `jail_remove()` | Destroy jail |
-| Filesystem mounting | `nmount()` | Mount nullfs/devfs |
-| User creation | `fork()`+`execv("pw")` | Create ephemeral user |
-| Resource limits | `fork()`+`execv("rctl")` | Apply rctl rules |
-| Process execution | `execv()` | Replace process image |
-| Privilege drop | `setuid()`/`setgid()` | Switch to unprivileged user |
-
-### Jail Parameters
-
-```c
-// Parameters passed to jail_set()
-struct jailparam params[] = {
-    { "name",           jail_name },
-    { "path",           jail_root },
-    { "host.hostname",  jail_name },
-    { "persist",        NULL },      // Keep jail after process exits
-    { "allow.raw_sockets", NULL },   // If network access needed
-    { "ip4.addr",       "inherit" }, // Inherit host networking
-};
-```
-
-### Resource Limits (rctl)
-
-```sh
-# Applied via rctl command
-rctl -a jail:<name>:memoryuse:deny=<bytes>
-rctl -a jail:<name>:maxproc:deny=<count>
-rctl -a jail:<name>:openfiles:deny=<count>
-```
-
-## Registry System
-
-### Storage Format
-
-Instance data is stored as JSON files in the registry directory:
+### `detect`
 
 ```
-/var/run/isolate/           (primary, requires root)
-/tmp/isolate-registry/      (fallback)
-├── myapp-abc123.json
-├── server-def456.json
-└── ...
+open the file; read the ELF header and section headers
+  ├─ .dynamic + .dynstr  → DT_NEEDED library names   → match against a table
+  ├─ .dynsym  + .dynstr  → imported symbol names     → socket/bind, fork, open, ...
+  ├─ .rodata, .data, .dynstr → printable strings     → /etc/..., /var/..., http://
+  └─ file name                                       → match against a table
+sort hints by confidence; drop exact duplicates
+write the capability file: fixed defaults, then one commented block per hint
 ```
 
-Each file contains:
+All reads are positional (`pread`). A file that is not ELF produces a warning and a file containing only the defaults. The tables and their limits are in [design/06-detection.md](design/06-detection.md).
 
-```json
-{
-  "name": "myapp-abc123",
-  "pid": 12345,
-  "jail_id": 5,
-  "jail_path": "/var/run/isolate/inst-a1B2c3/root",
-  "username": "app-12345",
-  "binary_path": "/usr/local/bin/myapp",
-  "start_time": 1699900000,
-  "workspace_path": "/data/tenant1"
-}
-```
+### `check`
 
-### State Detection
+Reads `kern.racct.enable`, `kern.features.vimage`, `security.jail.jailed`, `kern.osreldate` and the effective uid, and prints a report. Exits non-zero only when running inside a jail.
 
-Instance state is determined by checking process and jail existence:
+## FreeBSD interfaces used
 
-```
-┌─────────────────────────────────────────┐
-│           Check Instance State          │
-└─────────────────┬───────────────────────┘
-                  │
-                  ▼
-        ┌─────────────────┐
-        │ kill(pid, 0)    │
-        │ Process exists? │
-        └────────┬────────┘
-                 │
-         ┌───────┴───────┐
-         │               │
-         ▼               ▼
-       Yes              No
-         │               │
-         ▼               ▼
-    ┌─────────┐    ┌──────────┐
-    │ RUNNING │    │ ORPHANED │
-    └─────────┘    └──────────┘
-```
+| Purpose | Interface |
+|---|---|
+| Create the jail | `jailparam_init/import/set` (libjail) with `JAIL_CREATE` |
+| Enter the jail | `jail_attach(2)` |
+| Remove the jail | `jail_remove(2)` |
+| Check a jail | `jail_get(2)`, `jail_getid`, `jail_getname` (libjail) |
+| Mount nullfs and devfs | `nmount(2)` |
+| Unmount | `getmntinfo(3)`, `unmount(2)`, with `MNT_FORCE` as a fallback |
+| Remove a directory tree | `fts(3)` with `FTS_PHYSICAL | FTS_XDEV` |
+| Resource limits | `rctl_add_rule(2)`, `rctl_remove_rule(2)`, `rctl_get_rules(2)` |
+| Create and delete the user | `fork` + `execv("/usr/sbin/pw")` |
+| VNET interface | `fork` + `execv("/sbin/ifconfig")` |
+| Drop privileges | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
+| Start the program | `execv(2)` |
 
-## Capability Detection
+### Jail parameters
 
-### ELF Analysis
+| Parameter | Value |
+|---|---|
+| `name` | `isolate-<pid>` |
+| `path` | the jail root |
+| `persist` | set |
+| `allow.raw_sockets` | false |
+| `allow.socket_af` | true |
+| `allow.sysvipc` | false |
+| `ip4`, `ip6` | `inherit` or `disable`, by network mode |
+| `vnet` | `new`, in VNET mode (instead of `ip4`/`ip6`) |
 
-The detector performs native ELF parsing without external tools:
+### Resource limit rules
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    ELF File Structure                        │
-├─────────────────────────────────────────────────────────────┤
-│  ELF Header                                                  │
-│  ├── e_phoff → Program Headers                              │
-│  └── e_shoff → Section Headers                              │
-│                                                              │
-│  Program Headers (for dynamic linking info)                  │
-│  └── PT_DYNAMIC → Dynamic segment                           │
-│      ├── DT_NEEDED → Required libraries                     │
-│      ├── DT_STRTAB → String table                           │
-│      └── DT_SYMTAB → Symbol table                           │
-│                                                              │
-│  Section Headers (for detailed analysis)                     │
-│  ├── .dynsym → Dynamic symbols                              │
-│  ├── .dynstr → Dynamic string table                         │
-│  ├── .rodata → Read-only data (strings)                     │
-│  └── .data   → Initialized data                             │
-└─────────────────────────────────────────────────────────────┘
+jail:isolate-<pid>:memoryuse:sigkill=<bytes>
+jail:isolate-<pid>:maxproc:deny=<count>
+jail:isolate-<pid>:openfiles:deny=<count>
 ```
 
-### Detection Heuristics
+## Errors
 
-| Signal | Interpretation | Confidence |
-|--------|----------------|------------|
-| Links `libc.so` | Standard C library needed | 95% |
-| Links `libssl.so` | TLS/network access | 85% |
-| Links `libpq.so` | PostgreSQL access | 90% |
-| Symbol `socket` | Network operations | 80% |
-| Symbol `open` | File operations | 70% |
-| String `/etc/` | Config file access | 60% |
-| String `:8080` | Port binding | 75% |
-| String `http://` | Outbound HTTP | 70% |
-
-### Confidence Merging
-
-When multiple signals indicate the same capability, confidence is combined:
-
-```
-combined = 100 - ((100 - conf1) * (100 - conf2) / 100)
-
-Example:
-- Signal A: 70% confidence for network access
-- Signal B: 60% confidence for network access
-- Combined: 100 - (30 * 40 / 100) = 88% confidence
-```
-
-## Security Model
-
-### Threat Model
-
-isolate protects against:
-
-1. **Filesystem escape**: Jail root is isolated, only explicit mounts accessible
-2. **Privilege escalation**: Ephemeral unprivileged users, no setuid binaries
-3. **Resource exhaustion**: rctl limits on memory, processes, file descriptors
-4. **Network abuse**: `network_mode: none` or an isolated VNET stack; `network:` rules are not enforced yet
-5. **Cross-tenant access**: Separate jails, users, and workspaces per instance
-
-### Trust Boundaries
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Host System (Trusted)                    │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │                    isolate (root)                    │    │
-│  │  - Creates/destroys jails                           │    │
-│  │  - Manages ephemeral users                          │    │
-│  │  - Sets resource limits                             │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                           │                                  │
-│                    Trust Boundary                            │
-│                           │                                  │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │                  Jail (Untrusted)                    │    │
-│  │  - Limited filesystem view                          │    │
-│  │  - Unprivileged user                                │    │
-│  │  - Resource-constrained                             │    │
-│  │  - No raw network access (unless granted)           │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Capability Principle
-
-Applications run with minimum required privileges:
-
-1. **Explicit grants**: Only capabilities in `.caps` file are available
-2. **Nothing mounted by default**: only `filesystem:` rules expose host directories; the network is inherited from the host unless `network_mode` is `none` or `vnet`
-3. **Ephemeral identity**: New user per instance, deleted on exit
-4. **Resource bounds**: Hard limits prevent exhaustion attacks
-
-## Platform Abstraction
-
-### Interface Design
+`freebsd.zig` reports failures with one error set:
 
 ```zig
-// Planned: a platform.zig module defining the abstraction
-pub const Platform = enum {
-    freebsd,
-    linux,      // Planned
-    unknown,
-};
-
-pub fn detect() Platform {
-    return switch (builtin.os.tag) {
-        .freebsd => .freebsd,
-        .linux => .linux,
-        else => .unknown,
-    };
-}
-
-// Each platform implements:
-// - createIsolation(caps, binary) - Set up isolation context
-// - cleanupIsolation() - Tear down and cleanup
-// - Jail/namespace management
-// - User management
-// - Filesystem isolation
-// - Resource limits
-```
-
-### Linux Implementation (Planned)
-
-```
-FreeBSD              Linux
-────────             ─────
-jail_set()      →    clone(CLONE_NEW*)
-jail_attach()   →    setns()
-jail_remove()   →    Process termination
-rctl            →    cgroups v2
-nullfs          →    bind mounts
-                →    seccomp-bpf (syscall filtering)
-```
-
-## Error Handling
-
-### Error Categories
-
-```zig
-pub const IsolationError = error{
-    // Jail operations
-    JailCreateFailed,
-    JailAttachFailed,
-    JailRemoveFailed,
-
-    // Filesystem operations
-    MountFailed,
-    UnmountFailed,
-    DirectoryCreateFailed,
-
-    // User operations
-    UserCreateFailed,
-    UserDeleteFailed,
-    PrivilegeDropFailed,
-
-    // Resource limits
-    RctlFailed,
-
-    // General
-    OutOfMemory,
-    PermissionDenied,
+pub const JailError = error{
+    JailCreateFailed, JailAttachFailed, JailRemoveFailed, JailParamFailed,
+    UserCreateFailed, UserDeleteFailed, UserNotFound,
+    MountFailed, UnmountFailed, FilesystemSetupFailed,
+    ResourceLimitFailed, ForkFailed, ExecFailed,
+    PermissionDenied, OutOfMemory, InvalidPath,
 };
 ```
 
-### Cleanup Guarantees
+Failures of the main setup steps abort the run. Several lesser failures only print a warning and continue: a devfs or rule mount that fails, a resource limit that cannot be added, an interface that cannot be moved or configured, and VNET being unavailable. The design documents record each of these as a defect (ISO-11, LIM-5, NET-5).
 
-Cleanup is performed in reverse order of setup, with best-effort continuation:
+Output goes to stdout and stderr through unbuffered, streaming writers, so that nothing is lost across `fork` and `execv` and so that redirected output interleaves correctly with the program's own.
 
-```zig
-pub fn cleanupIsolation() void {
-    // Each step continues even if previous fails
+## Tests
 
-    // 1. Remove jail (kills all processes)
-    if (jail_state.jail_id > 0) {
-        jail_remove(jail_state.jail_id);
-    }
+`zig build test` runs the unit tests of every module: 36 on FreeBSD, 28 elsewhere (the FreeBSD-only modules are skipped). They cover parsing of capability files and command lines, path and name validation, the registry's JSON handling, and small helpers.
 
-    // 2. Unmount filesystems
-    unmountAll(jail_state.jail_root_path);
+No test creates a jail. Behaviour that needs root and a FreeBSD kernel has been checked with shell scripts run by hand; those scripts are not in the repository.
 
-    // 3. Remove jail directory
-    rmrf(jail_state.jail_root_path);
+## Measurements
 
-    // 4. Delete ephemeral user
-    if (jail_state.ephemeral_username[0] != 0) {
-        deleteUser(jail_state.ephemeral_username);
-    }
-}
-```
+Taken on one FreeBSD 15.1 virtual machine; they are indications, not guarantees.
 
-## Performance Considerations
+| | Debug | ReleaseSafe | ReleaseSmall |
+|---|---|---|---|
+| Executable size | 5.5 MB | 4.1 MB | 0.27 MB |
+| `isolate run` of a hello-world with five mounts, start to finish | 0.10–0.12 s | 0.06–0.08 s | not measured |
 
-### Startup Overhead
-
-| Operation | Typical Time |
-|-----------|--------------|
-| Capability parsing | < 1ms |
-| User creation | ~50ms |
-| Directory setup | ~10ms |
-| Mounts (per mount) | ~5ms |
-| Jail creation | ~10ms |
-| Total overhead | ~100-200ms |
-
-### Memory Overhead
-
-- isolate binary: ~2MB
-- Per-instance overhead: ~1MB (jail metadata, registry entry)
-- Jail filesystem: Minimal (nullfs mounts share pages with host)
-
-### Comparison with Containers
-
-| Metric | isolate | Docker |
-|--------|---------|--------|
-| Startup time | ~200ms | ~500ms-2s |
-| Memory overhead | ~1MB | ~50-100MB |
-| Disk overhead | ~0 (nullfs) | Image layers |
-| Dependencies | None | dockerd, containerd |
-
-## Future Directions
-
-### Planned Features
-
-1. **Linux Support**: Namespaces, cgroups v2, seccomp-bpf
-2. **Network Policies**: More granular network rules, DNS filtering
-3. **Capability Profiles**: Pre-defined profiles for common applications
-4. **Remote Management**: API for orchestration integration
-5. **Metrics Export**: Prometheus-compatible metrics endpoint
-
-### Extension Points
-
-- Custom mount types (beyond nullfs/devfs)
-- Plugin system for capability detection
-- Alternative registry backends (etcd, consul)
-- Audit logging integration
+Most of that time is the two `pw` invocations that create and delete the ephemeral user: with `user: nobody` instead of `user: auto`, the same debug run takes 0.02–0.04 s.
