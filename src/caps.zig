@@ -442,12 +442,26 @@ pub fn parseFileRule(allocator: Allocator, rule_str: []const u8) ParseError!File
         path = rule_str;
     }
 
-    if (path.len == 0) return ParseError.InvalidFileRule;
+    if (!isSafeMountPath(path)) return ParseError.InvalidFileRule;
 
     return .{
         .path = try allocator.dupe(u8, path),
         .permissions = permissions,
     };
+}
+
+/// Filesystem rules name host directories that are nullfs-mounted into the
+/// jail at the same path. Only absolute, normalized paths below the root
+/// are accepted: "/" would mount the whole host over the jail root, and
+/// "." or ".." segments make a rule mean something other than it reads.
+pub fn isSafeMountPath(path: []const u8) bool {
+    if (path.len < 2 or path[0] != '/') return false;
+    var it = std.mem.splitScalar(u8, path[1..], '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0) return false;
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    }
+    return true;
 }
 
 /// Parse an environment variable (e.g., "MY_VAR=value")
@@ -747,6 +761,16 @@ test "parseFileRule" {
         try std.testing.expect(rule.permissions.execute);
         try std.testing.expect(!rule.permissions.write);
     }
+}
+
+test "parseFileRule rejects unsafe paths" {
+    const allocator = std.testing.allocator;
+    const bad = [_][]const u8{ "/", "/:rw", "relative/path", "../etc:r", "/a/../etc:r", "/a/./b", "/a//b", "/etc/:r" };
+    for (bad) |rule| {
+        try std.testing.expectError(ParseError.InvalidFileRule, parseFileRule(allocator, rule));
+    }
+    try std.testing.expect(isSafeMountPath("/var/lib/app.d"));
+    try std.testing.expect(isSafeMountPath("/tmp"));
 }
 
 test "parseEnvVar" {

@@ -520,7 +520,7 @@ pub fn generateCapabilityFile(
     try writer.writeAll("# Default resource limits (adjust based on application needs)\n");
     try writer.writeAll("memory: 128M    # Adjust based on application requirements\n");
     try writer.writeAll("processes: 5    # Adjust if application spawns child processes\n");
-    try writer.writeAll("files: 256      # File descriptor limit\n\n");
+    try writer.writeAll("files: 512      # File descriptor limit (512 is the minimum for fork)\n\n");
 
     // Sort hints by confidence
     result.sortByConfidence();

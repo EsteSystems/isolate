@@ -343,7 +343,7 @@ doas isolate stop app-tenant-b
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design documentation.
 
 ### Module Overview
 

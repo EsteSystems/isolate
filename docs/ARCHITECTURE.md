@@ -453,7 +453,7 @@ isolate protects against:
 Applications run with minimum required privileges:
 
 1. **Explicit grants**: Only capabilities in `.caps` file are available
-2. **Default deny**: No network, limited filesystem by default
+2. **Nothing mounted by default**: only `filesystem:` rules expose host directories; the network is inherited from the host unless `network_mode` is `none` or `vnet`
 3. **Ephemeral identity**: New user per instance, deleted on exit
 4. **Resource bounds**: Hard limits prevent exhaustion attacks
 
